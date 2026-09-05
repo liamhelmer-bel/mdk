@@ -323,6 +323,11 @@ pub enum AgentControlRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relays: Option<Vec<String>>,
     },
+    /// Leave a group using the account runtime; returns Ack after success.
+    GroupLeave {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
@@ -1027,6 +1032,24 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn group_leave_request_round_trips() {
+        let request = AgentControlEnvelope::new(
+            Some("leave-1".into()),
+            AgentControlRequest::GroupLeave {
+                account_id_hex: "ab".repeat(32),
+                group_id_hex: "cd".repeat(16),
+            },
+        );
+        let encoded = encode_frame(&request).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_leave");
+        assert_eq!(
+            decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
+            request
+        );
     }
 
     #[test]
