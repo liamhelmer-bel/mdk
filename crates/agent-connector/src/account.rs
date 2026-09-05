@@ -69,6 +69,24 @@ impl AgentConnector {
             )
             .await?;
         let group_id_hex = hex::encode(group_id.as_slice());
+        // Provenance is activation metadata only; it never changes sender authorization.
+        // Preserve the canonical create result on persistence failure so clients
+        // do not create a duplicate. False disables automatic activation until repaired.
+        let agent_created = match self
+            .agent_created_groups
+            .add(&account_id_hex, &group_id_hex)
+        {
+            Ok(()) => true,
+            Err(_) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "create_group_response",
+                    error_code = "agent_created_groups_write_failed",
+                    "group created but activation provenance could not be persisted"
+                );
+                false
+            }
+        };
         // Creation is already canonical. A failed status read must not invite
         // a retry of the non-idempotent create operation.
         let pending_welcome_count = self
@@ -85,6 +103,7 @@ impl AgentConnector {
         Ok(AgentControlResponse::GroupCreated {
             group_id_hex,
             pending_welcome_count,
+            agent_created,
         })
     }
 

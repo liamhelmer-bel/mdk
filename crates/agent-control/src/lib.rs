@@ -499,6 +499,11 @@ pub enum AgentControlResponse {
     },
     GroupCreated {
         group_id_hex: String,
+        /// Whether this account's connector recorded creating the group. Defaults
+        /// to false when provenance is unavailable. Activation metadata only;
+        /// this grants no sender or approval authorization.
+        #[serde(default)]
+        agent_created: bool,
         /// Snapshot of undelivered Welcomes for this group. Omitted when the
         /// status query failed; zero does not imply recipients accepted invites.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -507,6 +512,11 @@ pub enum AgentControlResponse {
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
+        /// Whether this account's connector recorded creating the group. Defaults
+        /// to false when provenance is unavailable. Activation metadata only;
+        /// this grants no sender or approval authorization.
+        #[serde(default)]
+        agent_created: bool,
         member_count: u32,
         /// True when the group has exactly two members (the agent + one peer),
         /// i.e. an effective direct conversation where the agent always replies.
@@ -991,6 +1001,7 @@ mod tests {
                 Some("create-1".into()),
                 AgentControlResponse::GroupCreated {
                     group_id_hex: "ab".repeat(16),
+                    agent_created: true,
                     pending_welcome_count: count,
                 },
             );
@@ -1002,6 +1013,42 @@ mod tests {
                 decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
                 response
             );
+        }
+    }
+
+    #[test]
+    fn group_activation_metadata_round_trips_and_defaults_to_false() {
+        for agent_created in [false, true] {
+            for body in [
+                AgentControlResponse::GroupCreated {
+                    group_id_hex: "ab".repeat(16),
+                    agent_created,
+                    pending_welcome_count: None,
+                },
+                AgentControlResponse::GroupInfo {
+                    account_id_hex: "11".repeat(32),
+                    group_id_hex: "ab".repeat(16),
+                    agent_created,
+                    member_count: 3,
+                    is_direct: false,
+                    subject: None,
+                },
+            ] {
+                let response = AgentControlEnvelope::new(Some("group-1".into()), body);
+                let encoded = encode_frame(&response).unwrap();
+                let mut json: Value = serde_json::from_slice(&encoded).unwrap();
+                assert_eq!(json["agent_created"], agent_created);
+                assert_eq!(
+                    decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+                    response
+                );
+
+                json.as_object_mut().unwrap().remove("agent_created");
+                let legacy = serde_json::to_vec(&json).unwrap();
+                let decoded = decode_envelope::<AgentControlResponse>(&legacy).unwrap();
+                let restored: Value = serde_json::to_value(decoded).unwrap();
+                assert_eq!(restored["agent_created"], false);
+            }
         }
     }
 

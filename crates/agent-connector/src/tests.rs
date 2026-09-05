@@ -6519,12 +6519,25 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
         let AgentControlResponse::GroupCreated {
             group_id_hex,
             pending_welcome_count,
+            agent_created,
         } = response.payload
         else {
             panic!("expected group_created, got {:?}", response.payload);
         };
+        assert!(
+            crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path())
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        assert!(
+            !connector
+                .allowlists
+                .contains(&agent.account_id_hex, &peer.account_id_hex)
+                .unwrap()
+        );
         assert_eq!(hex::decode(&group_id_hex).unwrap().len(), 16);
         assert_eq!(pending_welcome_count, Some(0));
+        assert!(agent_created);
         let groups = connector.app.groups(&agent.label).unwrap();
         let group = groups
             .iter()
@@ -6551,10 +6564,66 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             info,
             AgentControlResponse::GroupInfo {
                 member_count: 2,
+                agent_created: true,
                 ..
             }
         ));
     }
+    // A group created outside the control op has no activation provenance.
+    let other = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "External group",
+            std::slice::from_ref(&peer.label),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &hex::encode(other.as_slice()))
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
+    // Persistence failure must not disguise a canonical create as a retryable
+    // failure or enable activation without a durable provenance record.
+    std::fs::rename(
+        &connector.agent_created_groups.dir,
+        dir.path().join("saved-provenance"),
+    )
+    .unwrap();
+    std::fs::write(&connector.agent_created_groups.dir, b"blocked directory").unwrap();
+    let response = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Untracked group".into(),
+            vec![peer.label.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupCreated {
+        group_id_hex,
+        agent_created: false,
+        ..
+    } = response
+    else {
+        panic!("expected canonical create with unavailable provenance");
+    };
+    assert!(
+        connector
+            .app
+            .groups(&agent.label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
     connector.runtime.shutdown().await;
 }
 
@@ -6683,4 +6752,47 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
         assert!(connector.app.groups(&agent.label).unwrap().is_empty());
     }
     connector.runtime.shutdown().await;
+}
+
+#[test]
+fn agent_created_groups_store_round_trip_is_private_and_account_scoped() {
+    use crate::agent_created_groups::AgentCreatedGroupsStore;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentCreatedGroupsStore::new(dir.path());
+    let account = "ab".repeat(32);
+    let other_account = "cd".repeat(32);
+    let group = "ef".repeat(16);
+    assert!(!store.contains(&account, &group).unwrap());
+    store
+        .add(&account.to_uppercase(), &group.to_uppercase())
+        .unwrap();
+    store.add(&account, &group).unwrap();
+    // MLS group ids are variable length, not Nostr routing handles.
+    store.add(&account, "123456").unwrap();
+    let reopened = AgentCreatedGroupsStore::new(dir.path());
+    assert!(reopened.contains(&account, &group).unwrap());
+    assert!(reopened.contains(&account, "123456").unwrap());
+    assert!(!reopened.contains(&other_account, &group).unwrap());
+    let path = store.dir.join(format!("{account}.json"));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["group_ids_hex"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::metadata(&store.dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1);
+    assert!(store.add("../escape", &group).is_err());
+    // A relocated record cannot activate a different account or redirect writes.
+    let other_path = store.dir.join(format!("{other_account}.json"));
+    std::fs::copy(&path, &other_path).unwrap();
+    assert!(!store.contains(&other_account, &group).unwrap());
+    std::fs::write(&path, b"invalid json").unwrap();
+    assert!(!store.contains(&account, &group).unwrap());
+    store.add(&account, &group).unwrap();
+    assert!(reopened.contains(&account, &group).unwrap());
 }
