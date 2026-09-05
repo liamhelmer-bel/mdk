@@ -280,6 +280,16 @@ impl AgentConnector {
                 )
                 .await
             }
+            AgentControlRequest::GroupCreate {
+                account_id_hex,
+                name,
+                members,
+                description,
+                relays,
+            } => {
+                self.create_group_response(&account_id_hex, name, members, description, relays)
+                    .await
+            }
             AgentControlRequest::GroupInfo {
                 account_id_hex,
                 group_id_hex,
