@@ -162,6 +162,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
         AgentControlRequest::GroupCreate { .. } => "group_create",
         AgentControlRequest::GroupInfo { .. } => "group_info",
+        AgentControlRequest::GroupLeave { .. } => "group_leave",
         AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
         AgentControlRequest::MaintenanceScheduleSelfUpdate { .. } => {

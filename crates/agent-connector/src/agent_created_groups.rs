@@ -53,7 +53,27 @@ impl AgentCreatedGroupsStore {
         let _guard = crate::lock_recover(&self.lock);
         let mut record = self.read_record(&account_id_hex)?;
         record.group_ids_hex.insert(group_id_hex);
-        let bytes = serde_json::to_vec_pretty(&record)?;
+        self.write_record(&record)
+    }
+
+    pub(crate) fn remove(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<(), ConnectorError> {
+        let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let _guard = crate::lock_recover(&self.lock);
+        let mut record = self.read_record(&account_id_hex)?;
+        if record.group_ids_hex.remove(&group_id_hex) {
+            self.write_record(&record)?;
+        }
+        Ok(())
+    }
+
+    fn write_record(&self, record: &AgentCreatedGroupsRecord) -> Result<(), ConnectorError> {
+        let account_id_hex = &record.account_id_hex;
+        let bytes = serde_json::to_vec_pretty(record)?;
         fs_private::create_dir_all_private(&self.dir)?;
         let path = self.dir.join(format!("{account_id_hex}.json"));
         let temp_path = self.dir.join(format!(".{account_id_hex}.json.tmp"));
