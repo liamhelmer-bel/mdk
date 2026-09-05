@@ -1,4 +1,4 @@
-//! Account and group creation, profile publishing, and welcomer-allowlist operations.
+//! Account and group membership, profile publishing, and welcomer-allowlist operations.
 
 use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
@@ -105,6 +105,23 @@ impl AgentConnector {
             pending_welcome_count,
             agent_created,
         })
+    }
+
+    pub(crate) async fn leave_group_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account_id_hex = crate::validation::normalize_hex(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let account = self.local_account_for_account_id(&account_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group_id_hex)?);
+        // Runtime errors (including failed publication) use the existing App
+        // projections. Never remove provenance or acknowledge a failed leave.
+        self.runtime.leave_group(&account.label, &group_id).await?;
+        self.agent_created_groups
+            .remove(&account_id_hex, &group_id_hex)?;
+        Ok(AgentControlResponse::Ack)
     }
 
     pub(crate) async fn publish_profile_response(
