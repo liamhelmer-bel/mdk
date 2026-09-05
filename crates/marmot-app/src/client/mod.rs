@@ -1629,6 +1629,17 @@ impl AppClient {
             );
         }
         let members = resolved.key_packages;
+        // Resolution still validates every requested package and inbox route.
+        // Reject an explicit creator before MLS mutation instead of surfacing
+        // OpenMLS's opaque DuplicateSignatureKey error from add_members.
+        let creator = self.app.account_home().account(&self.state.label)?;
+        for member in &members {
+            let metadata = cgka_engine::key_package::key_package_metadata(member)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            if metadata.credential_identity_hex == creator.account_id_hex {
+                return Err(AppError::GroupCreateIncludesCreator);
+            }
+        }
         self.refresh_routing()?;
         let constructable = self.runtime.constructable_capabilities(&members)?;
         require_initial_group_component_support(&constructable, &request.app_components)?;
