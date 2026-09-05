@@ -6469,3 +6469,218 @@ async fn bench_idle_reconciliation_scaling() {
     invite_worker.abort();
     connector.runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let alternate = MockRelay::run().await.unwrap();
+    let alternate_url = alternate.url().await.to_string();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let member_refs = [
+        peer.label.clone(),
+        peer.account_id_hex.clone(),
+        marmot_app::npub_for_account_id(&peer.account_id_hex).unwrap(),
+    ];
+    for (index, member_ref) in member_refs.into_iter().enumerate() {
+        let relays = (index == 1).then(|| vec![alternate_url.clone()]);
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "create-group",
+            AgentControlRequest::GroupCreate {
+                account_id_hex: agent.account_id_hex.to_uppercase(),
+                name: "Agent group".into(),
+                members: vec![member_ref],
+                description: Some("Created through the control socket".into()),
+                relays,
+            },
+        )
+        .await;
+        assert_eq!(response.id.as_deref(), Some("create-group"));
+        let AgentControlResponse::GroupCreated {
+            group_id_hex,
+            pending_welcome_count,
+        } = response.payload
+        else {
+            panic!("expected group_created, got {:?}", response.payload);
+        };
+        assert_eq!(hex::decode(&group_id_hex).unwrap().len(), 16);
+        assert_eq!(pending_welcome_count, Some(0));
+        let groups = connector.app.groups(&agent.label).unwrap();
+        let group = groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .unwrap();
+        assert_eq!(group.profile.name, "Agent group");
+        assert_eq!(
+            group.profile.description,
+            "Created through the control socket"
+        );
+        assert_eq!(
+            group.nostr_routing.relays,
+            vec![if index == 1 {
+                alternate_url.clone()
+            } else {
+                relay_url.clone()
+            }]
+        );
+        let info = connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap();
+        assert!(matches!(
+            info,
+            AgentControlResponse::GroupInfo {
+                member_count: 2,
+                ..
+            }
+        ));
+    }
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec!["wss://relay.example.com".into()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let cases = [
+        (
+            "not-hex".into(),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "invalid_hex",
+        ),
+        (
+            "11".repeat(32),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "account_home_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            " ".into(),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "é".repeat(129),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![" ".into()],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            Some("x".repeat(4097)),
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec!["invalid-member".into()],
+            None,
+            None,
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec![]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["https://relay.example.com".into()]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["wss://192.168.1.1".into()]),
+            "app_error",
+        ),
+    ];
+    for (account_id_hex, name, members, description, relays, expected_code) in cases {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "invalid-create",
+            AgentControlRequest::GroupCreate {
+                account_id_hex,
+                name,
+                members,
+                description,
+                relays,
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code,
+            message,
+            retryable,
+        } = response.payload
+        else {
+            panic!("expected error");
+        };
+        assert_eq!(code, expected_code);
+        assert!(!retryable);
+        assert!(!message.contains(&agent.account_id_hex));
+        assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+    }
+    connector.runtime.shutdown().await;
+}

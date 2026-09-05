@@ -160,6 +160,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::SendAgentActivity { .. } => "send_agent_activity",
         AgentControlRequest::SendAgentOperationEvent { .. } => "send_agent_operation_event",
         AgentControlRequest::SendGroupSystemEvent { .. } => "send_group_system_event",
+        AgentControlRequest::GroupCreate { .. } => "group_create",
         AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
@@ -286,4 +287,21 @@ pub(crate) fn unix_now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+pub(crate) fn validate_group_create(
+    name: &str,
+    members: &[String],
+    description: Option<&str>,
+) -> Result<(), ConnectorError> {
+    if name.trim().is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return Err(ConnectorError::InvalidGroupCreate("invalid name"));
+    }
+    if description.is_some_and(|value| value.len() > 4096) {
+        return Err(ConnectorError::InvalidGroupCreate("description too long"));
+    }
+    if members.iter().any(|member| member.trim().is_empty()) {
+        return Err(ConnectorError::InvalidGroupCreate("empty member reference"));
+    }
+    Ok(())
 }

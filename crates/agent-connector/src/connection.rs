@@ -215,6 +215,16 @@ impl AgentConnector {
                 account_id_hex,
                 policy,
             } => self.invite_policy_set_response(&account_id_hex, policy),
+            AgentControlRequest::GroupCreate {
+                account_id_hex,
+                name,
+                members,
+                description,
+                relays,
+            } => {
+                self.create_group_response(&account_id_hex, name, members, description, relays)
+                    .await
+            }
             AgentControlRequest::GroupInfo {
                 account_id_hex,
                 group_id_hex,

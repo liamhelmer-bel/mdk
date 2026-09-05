@@ -1214,12 +1214,7 @@ impl AppClient {
             });
         }
 
-        let AppCreateGroupOptions {
-            description,
-            initial_image,
-            disappearing_message_secs,
-        } = options;
-        if initial_image.is_some() {
+        if options.initial_image.is_some() {
             return Err(AppError::InvalidEncryptedMedia(
                 "group creation accepts either inline or prepared image input".into(),
             ));
@@ -1227,13 +1222,12 @@ impl AppClient {
 
         self.create_group_with_initial_source_and_optional_telemetry(
             name,
-            description,
             member_refs,
+            options,
             Some(InitialGroupImageSource::Prepared {
                 upload_id: upload_id.to_owned(),
                 component_data: record.component_data,
             }),
-            disappearing_message_secs,
             Some(telemetry),
         )
         .await
@@ -1246,17 +1240,13 @@ impl AppClient {
         options: AppCreateGroupOptions,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
-        let AppCreateGroupOptions {
-            description,
-            initial_image,
-            disappearing_message_secs,
-        } = options;
+        let mut options = options;
+        let initial_image = options.initial_image.take();
         self.create_group_with_initial_source_and_optional_telemetry(
             name,
-            description,
             member_refs,
+            options,
             initial_image.map(InitialGroupImageSource::Inline),
-            disappearing_message_secs,
             telemetry,
         )
         .await
@@ -1265,13 +1255,19 @@ impl AppClient {
     pub(crate) async fn create_group_with_initial_source_and_optional_telemetry(
         &mut self,
         name: &str,
-        description: String,
         member_refs: &[&str],
+        options: AppCreateGroupOptions,
         initial_image: Option<InitialGroupImageSource>,
-        disappearing_message_secs: u64,
         telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<CanonicalCreatedGroup, AppError> {
+        let AppCreateGroupOptions {
+            description,
+            disappearing_message_secs,
+            relays,
+            ..
+        } = options;
         validate_group_profile(name, &description)?;
+        let nostr_routing = self.app.new_nostr_routing(relays)?;
         let key_package_started_at = Instant::now();
         let key_packages = self
             .app
@@ -1302,7 +1298,6 @@ impl AppClient {
         );
         let members = resolved.key_packages;
         self.refresh_routing()?;
-        let nostr_routing = self.app.new_nostr_routing()?;
         let nostr_routing_bytes =
             encode_nostr_routing_v1(&nostr_routing).map_err(AppError::InvalidNostrRouting)?;
         let mut app_components = vec![AppComponentData {
