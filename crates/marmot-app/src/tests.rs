@@ -7497,6 +7497,104 @@ async fn member_resolution_fixture(
 }
 
 #[tokio::test]
+async fn runtime_group_create_resolves_local_member_aliases_without_relay_packages() {
+    let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let member = &accounts[0];
+    let key_package = fresh_key_package_for_account(&app, member, false).await;
+    write_json(
+        app.key_package_record_path(&member.label),
+        &KeyPackageRecord {
+            account_label: member.label.clone(),
+            account_id_hex: member.account_id_hex.clone(),
+            key_package_id: "local-slot".into(),
+            key_package_ref_hex: String::new(),
+            key_package_event_id: "ab".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(key_package.bytes()),
+        },
+    )
+    .unwrap();
+    remember_test_member_inbox(&app, &member.account_id_hex, "wss://shared.example");
+    // Local public packages are available even when no relay serves kind 30443.
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    app.account_home().create_account("creator").unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    for reference in [
+        npub_for_account_id_lossy(&member.account_id_hex),
+        member.account_id_hex.clone(),
+        member.label.clone(),
+    ] {
+        let group = runtime
+            .create_group_with_options(
+                "creator",
+                "Resolution regression",
+                &[reference],
+                AppCreateGroupOptions::default(),
+            )
+            .await
+            .unwrap();
+        let roster = runtime.group_members("creator", &group).await.unwrap();
+        assert_eq!(roster.len(), 2);
+        assert!(
+            roster
+                .iter()
+                .any(|entry| entry.member_id_hex == member.account_id_hex)
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+    drop(directory);
+}
+
+#[tokio::test]
+async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
+    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let creator = &accounts[0];
+    let runtime = MarmotAppRuntime::new(app.clone());
+    for reference in [
+        creator.label.clone(),
+        creator.account_id_hex.clone(),
+        npub_for_account_id_lossy(&creator.account_id_hex),
+    ] {
+        let result = runtime
+            .create_group_with_options(
+                &creator.label,
+                "Self invite",
+                &[reference],
+                AppCreateGroupOptions::default(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::GroupCreateIncludesCreator)),
+            "{result:?}"
+        );
+        assert!(app.groups(&creator.label).unwrap().is_empty());
+    }
+    // Empty rosters remain valid: the creator is included implicitly by MLS.
+    let group = runtime
+        .create_group_with_options(
+            &creator.label,
+            "Solo",
+            &[],
+            AppCreateGroupOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime
+            .group_members(&creator.label, &group)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
 /// A cached NIP-65 list must not suppress independent kind-10050 discovery.
 async fn missing_inbox_is_discovered_when_nip65_is_cached() {
     let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
