@@ -380,12 +380,16 @@ impl AgentConnector {
                 .chat_list_row(&account.label, &group_id_hex)
                 .map(|row| row.map(|row| row.group_name)),
         );
+        let agent_created = self
+            .agent_created_groups
+            .contains(&account.account_id_hex, &group_id_hex)?;
         Ok(AgentControlResponse::GroupInfo {
             account_id_hex: account.account_id_hex,
             group_id_hex: hex::encode(group_id.as_slice()),
             member_count,
             is_direct: state.member_count == 2,
             subject,
+            agent_created,
         })
     }
 
