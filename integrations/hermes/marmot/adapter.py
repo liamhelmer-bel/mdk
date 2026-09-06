@@ -3769,9 +3769,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if not command or command[0].lower() not in {"/approve", "/deny"}:
             await self.handle_message(event)
             return
-        # Retire before dispatch, including no-pending/expired replies and
-        # exceptions. A later approval must never inherit this prompt's consent.
-        self._invalidate_approval_prompts(event.source.chat_id)
+        # Dispatch may reject authorization or syntax without resolving anything.
+        # Only resume_typing_for_chat's successful-resolution callback retires
+        # typed-command prompts; rejected commands must leave consent available.
         token = _APPROVAL_REPLY_CONTEXT.set((self, event.source.chat_id))
         try:
             await self.handle_message(event)

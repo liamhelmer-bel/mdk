@@ -6246,6 +6246,12 @@ class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
                 event = self.module.MessageEvent(text=command, source=adapter.build_source(
                     chat_id=self.GROUP, user_id=self.SENDER,
                 ))
+                async def successful_gateway(command_event):
+                    # Match Hermes: only a successful decision resumes typing.
+                    adapter.resume_typing_for_chat(command_event.source.chat_id)
+                    adapter.events.append(command_event)
+
+                adapter.handle_message = successful_gateway
                 await adapter._handle_gateway_message(event)
                 adapter.client.send_final = unittest.mock.AsyncMock(return_value={
                     "type": "final_sent", "message_ids_hex": ["dd" * 32],
@@ -6256,6 +6262,40 @@ class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(adapter.events, [], "A must never resolve B")
                 await adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
                 self.assertEqual([event.text for event in adapter.events], ["/approve"])
+
+    async def test_rejected_typed_command_preserves_authorized_reaction_consent(self):
+        for command in ["/approve", "/deny", "/approve invalid"]:
+            for raises in [False, True]:
+                with self.subTest(command=command, raises=raises):
+                    adapter = self.make_adapter(True)
+                    await self.send_prompt(adapter)
+                    rejected = self.module.MessageEvent(
+                        text=command, source=adapter.build_source(
+                            chat_id=self.GROUP, user_id="77" * 32,
+                        ),
+                    )
+
+                    async def gateway(event):
+                        if event is rejected:
+                            if raises:
+                                raise ValueError("command rejected")
+                            return  # Rejected by gateway validation; no decision.
+                        adapter.resume_typing_for_chat(event.source.chat_id)
+                        adapter.events.append(event)
+
+                    adapter.handle_message = gateway
+                    if raises:
+                        with self.assertRaises(ValueError):
+                            await adapter._handle_gateway_message(rejected)
+                    else:
+                        await adapter._handle_gateway_message(rejected)
+                    self.assertIsNone(self.module._APPROVAL_REPLY_CONTEXT.get())
+                    await adapter._handle_control_event(self.reaction())
+                    self.assertEqual([event.text for event in adapter.events], ["/approve"])
+                    self.assertEqual(adapter.events[0].source.user_id, self.SENDER)
+                    # Success still consumes the prompt exactly once.
+                    await adapter._handle_control_event(self.reaction())
+                    self.assertEqual(len(adapter.events), 1)
 
     async def test_expiry_and_replacement_retire_stale_prompts(self):
         with unittest.mock.patch.object(self.module, "approval_prompt_timeout", return_value=43200):
