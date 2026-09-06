@@ -119,8 +119,20 @@ impl AgentConnector {
         // Runtime errors (including failed publication) use the existing App
         // projections. Never remove provenance or acknowledge a failed leave.
         self.runtime.leave_group(&account.label, &group_id).await?;
-        self.agent_created_groups
-            .remove(&account_id_hex, &group_id_hex)?;
+        // Leave is already canonical. Metadata cleanup must not turn success
+        // into an error that invites a duplicate LeaveAlreadyRequested retry.
+        if self
+            .agent_created_groups
+            .remove(&account_id_hex, &group_id_hex)
+            .is_err()
+        {
+            tracing::warn!(
+                target: "agent_connector",
+                method = "leave_group_response",
+                error_code = "agent_created_groups_cleanup_failed",
+                "group left but activation provenance cleanup failed"
+            );
+        }
         Ok(AgentControlResponse::Ack)
     }
 
