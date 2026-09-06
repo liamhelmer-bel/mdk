@@ -6054,5 +6054,181 @@ class KeyedAsyncQueueDepthTests(unittest.IsolatedAsyncioTestCase):
         await queue.join()
 
 
+class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
+    ACCOUNT = "11" * 32
+    GROUP = "22" * 16
+    SENDER = "44" * 32
+    PROMPT = "cc" * 32
+
+    async def asyncSetUp(self):
+        self.module = load_adapter_module()
+        self.env = unittest.mock.patch.dict(
+            self.module.os.environ, {"MARMOT_ALLOWED_USERS": self.SENDER}, clear=True
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.adapter = self.make_adapter(True)
+
+    def make_adapter(self, enabled=None):
+        extra = {"account_id_hex": self.ACCOUNT}
+        if enabled is not None:
+            extra["approval_reactions"] = enabled
+        return self.module.MarmotPlatformAdapter(
+            sys.modules["gateway.config"].PlatformConfig(extra=extra),
+            client=_DeliveryRoutingFakeClient(),
+        )
+
+    async def send_prompt(self, adapter=None):
+        adapter = adapter or self.adapter
+        return await adapter.send(
+            self.GROUP, "Approval required", metadata={"is_approval_prompt": True,
+                                                       "is_turn_final": False,
+                                                       "delivery_class": "commentary",
+                                                       "_interim_send": True}
+        )
+
+    def reaction(self, **overrides):
+        return {
+            "type": "reaction_added", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "target_message_id_hex": self.PROMPT,
+            "event_id_hex": "ee" * 32, "emoji": "👍",
+            "actor": {"account_id_hex": self.SENDER, "is_self": False},
+            **overrides,
+        }
+
+    async def test_mapping_through_send_and_mutation_hook(self):
+        for emoji, slash in [("👍", "/approve"), ("👎", "/deny"),
+                             ("❤️", "/approve always"), ("❤", "/approve always")]:
+            with self.subTest(emoji=emoji):
+                adapter = self.make_adapter(True)
+                result = await self.send_prompt(adapter)
+                self.assertTrue(result.success)
+                await adapter._handle_control_event(self.reaction(emoji=emoji))
+                self.assertEqual([event.text for event in adapter.events], [slash])
+                source = adapter.events[0].source
+                self.assertEqual(source.user_id, self.SENDER)
+                self.assertEqual(source.chat_id, self.GROUP)
+                self.assertEqual(source.message_id, self.PROMPT)
+                self.assertEqual(adapter._pending_ambient_context, {})
+
+    async def test_flag_off_preserves_ambient_mutation_behavior(self):
+        for flag in [None, False, "false", "true"]:
+            adapter = self.make_adapter(flag)
+            ambient = unittest.mock.AsyncMock()
+            adapter._surface_ambient_context = ambient
+            await self.send_prompt(adapter)
+            await adapter._handle_control_event(self.reaction())
+            self.assertEqual(adapter._approval_prompt_messages, {})
+            self.assertEqual(adapter.events, [])
+            ambient.assert_awaited_once()
+
+    async def test_allowlist_is_fail_closed_even_with_allow_all(self):
+        await self.send_prompt()
+        for value in ["", "  ", "*", "npub1invalid", "33" * 32]:
+            with self.subTest(value=value), unittest.mock.patch.dict(
+                self.module.os.environ,
+                {"MARMOT_ALLOWED_USERS": value, "MARMOT_ALLOW_ALL_USERS": "true"},
+            ):
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+        with unittest.mock.patch.dict(self.module.os.environ, {}, clear=True):
+            self.assertEqual(self.module.resolve_allowed_message_senders(), set())
+            await self.adapter._handle_control_event(self.reaction())
+            self.assertEqual(self.adapter.events, [])
+        # Unauthorized attempts never consume the pending prompt.
+        await self.adapter._handle_control_event(self.reaction())
+        self.assertEqual(len(self.adapter.events), 1)
+
+    def test_allowlist_normalizes_hex_and_npub_and_discards_invalid_entries(self):
+        npub = "npub14f8usejl26twx0dhuxjh9cas7keav9vr0v8nvtwtrjqx3vycc76qqh9nsy"
+        with unittest.mock.patch.dict(self.module.os.environ, {
+            "MARMOT_ALLOWED_USERS": f" 0x{'AB' * 32}, {npub}, *, invalid, npub1invalid",
+        }):
+            self.assertEqual(self.module.resolve_allowed_message_senders(), {
+                "ab" * 32,
+                "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4",
+            })
+
+    async def test_own_and_malformed_actors_never_consent(self):
+        await self.send_prompt()
+        with unittest.mock.patch.dict(self.module.os.environ, {
+            "MARMOT_ALLOWED_USERS": f"{self.SENDER},{self.ACCOUNT}",
+        }):
+            for actor in [self.SENDER, None, {}, {"account_id_hex": self.SENDER},
+                          {"account_id_hex": self.SENDER, "is_self": True},
+                          {"account_id_hex": self.ACCOUNT, "is_self": False}]:
+                await self.adapter._handle_control_event(self.reaction(actor=actor))
+                self.assertEqual(self.adapter.events, [])
+
+    async def test_untracked_wrong_scope_and_nondecision_mutations_stay_ambient(self):
+        await self.send_prompt()
+        ambient = unittest.mock.AsyncMock()
+        self.adapter._surface_ambient_context = ambient
+        for override in [
+            {"target_message_id_hex": "dd" * 32}, {"group_id_hex": "33" * 16},
+            {"account_id_hex": "55" * 32}, {"emoji": "👀"}, {"emoji": []},
+            {"type": "reaction_removed"}, {"type": "message_edited"},
+        ]:
+            await self.adapter._handle_control_event(self.reaction(**override))
+        self.assertEqual(self.adapter.events, [])
+        self.assertEqual(ambient.await_count, 7)
+
+    async def test_one_decision_even_for_concurrent_reactions_and_repeated_send(self):
+        await self.send_prompt()
+        handler = unittest.mock.AsyncMock()
+        self.adapter.handle_message = handler
+        await asyncio.gather(*[
+            self.adapter._handle_control_event(self.reaction(emoji=emoji))
+            for emoji in ["👍", "👎", "❤️"]
+        ])
+        handler.assert_awaited_once()
+        # An idempotent resend result cannot rearm a consumed prompt.
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction())
+        handler.assert_awaited_once()
+
+    async def test_failed_dispatch_consumes_prompt_and_logs_no_private_data(self):
+        await self.send_prompt()
+        self.adapter.handle_message = unittest.mock.AsyncMock(
+            side_effect=RuntimeError(f"private payload {self.SENDER}")
+        )
+        with self.assertLogs(self.module.logger, level="WARNING") as logs:
+            await self.adapter._handle_control_event(self.reaction())
+        self.assertNotIn(self.SENDER, str(logs.output))
+        self.assertNotIn("private payload", str(logs.output))
+        await self.adapter._handle_control_event(self.reaction())
+        self.adapter.handle_message.assert_awaited_once()
+
+    async def test_only_durable_marked_successful_sends_are_tracked(self):
+        await self.adapter.send(self.GROUP, "ordinary message")
+        self.assertEqual(self.adapter._approval_prompt_messages, {})
+        for result in [
+            self.module.SendResult(success=False, message_id=self.PROMPT),
+            self.module.SendResult(success=True),
+            self.module.SendResult(success=True, message_id="marmot-stream:abcd"),
+            self.module.SendResult(success=True, message_id=self.PROMPT,
+                                   raw_response={"type": "app_event_sent"}),
+        ]:
+            self.adapter._record_approval_prompt(self.GROUP, {"is_approval_prompt": True}, result)
+        self.assertEqual(self.adapter._approval_prompt_messages, {})
+        await self.send_prompt()
+        self.assertEqual(len(self.adapter._approval_prompt_messages), 1)
+
+    async def test_fifo_bound_and_chunked_prompt_share_one_decision(self):
+        for index in range(33):
+            primary = f"{index:064x}"
+            continuation = f"{index + 100:064x}"
+            self.adapter._record_approval_prompt(self.GROUP, {"is_approval_prompt": True},
+                self.module.SendResult(success=True, message_id=primary, raw_response={
+                    "type": "stream_finalized", "message_ids_hex": [continuation, primary],
+                }))
+        self.assertEqual(len(self.adapter._approval_prompt_messages), 32)
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="00" * 32))
+        self.assertEqual(self.adapter.events, [])
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex=f"{132:064x}"))
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex=f"{32:064x}"))
+        self.assertEqual(len(self.adapter.events), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
