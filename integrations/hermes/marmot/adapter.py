@@ -80,6 +80,11 @@ _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
     "marmot_turn_parent_message_id_hex",
     default=None,
 )
+# Scope reply-anchor recovery to sends made while dispatching an approval
+# command. ContextVar keeps concurrent groups and ordinary sends isolated.
+_APPROVAL_REPLY_CONTEXT: ContextVar[Optional[tuple[object, str]]] = ContextVar(
+    "marmot_approval_reply_context", default=None,
+)
 TOOL_EVENT_PREFIX = "\x1fMARMOT_TOOL_EVENT:"
 # Bounded backoff (seconds) for durable send_final retries. One idempotency key
 # is reused across these attempts so a retry after a post-write timeout dedups at
@@ -1763,6 +1768,14 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     ) -> SendResult:
         self._capture_loop()
         chat_id = _normalize_hex(chat_id, "chat_id")
+        if _APPROVAL_REPLY_CONTEXT.get() == (self, chat_id):
+            try:
+                reply_to = _optional_hex(reply_to)
+            except AgentControlError:
+                # Only the reply anchor is optional. Retry its send preparation
+                # unthreaded; invalid destination/account ids remain errors.
+                logger.debug("Marmot approval confirmation dropping invalid reply anchor")
+                reply_to = None
         if self.approval_reactions and (metadata or {}).get("is_approval_prompt") is True:
             # Hermes marks approval prompts as interim commentary. Consent needs
             # a durable chat message, never an activity event or live preview.
@@ -3345,7 +3358,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     "host_handoff_started",
                 )
                 spool_state = "handed"
-            await self.handle_message(hermes_event)
+            await self._handle_gateway_message(hermes_event)
             host_accepted = True
             if ambient_claim is not None and ambient_claim.facts:
                 self._ambient_context.remember_accepted(ambient_claim.token)
@@ -3638,6 +3651,17 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         while len(self._approval_prompt_messages) > MAX_PENDING_APPROVAL_PROMPTS:
             self._approval_prompt_messages.popitem(last=False)
 
+    async def _handle_gateway_message(self, event: MessageEvent) -> None:
+        command = str(event.text or "").strip().split(maxsplit=1)
+        if not command or command[0].lower() not in {"/approve", "/deny"}:
+            await self.handle_message(event)
+            return
+        token = _APPROVAL_REPLY_CONTEXT.set((self, event.source.chat_id))
+        try:
+            await self.handle_message(event)
+        finally:
+            _APPROVAL_REPLY_CONTEXT.reset(token)
+
     async def _handle_approval_reaction(self, event: Dict[str, Any]) -> bool:
         if not self.approval_reactions or event.get("type") != "reaction_added":
             return False
@@ -3649,6 +3673,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             account = _normalize_hex(event.get("account_id_hex"))
             group = _normalize_hex(event.get("group_id_hex"))
             target = _normalize_hex(event.get("target_message_id_hex"))
+            reaction_id = _normalize_hex(event.get("event_id_hex"))
         except AgentControlError:
             return False
         if account != self.account_id_hex:
@@ -3677,18 +3702,21 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             chat_type="group",
             user_id=sender,
             user_name="Marmot sender",
-            message_id=target,
+            message_id=reaction_id,
         )
         hermes_event = MessageEvent(
             text=choice,
             message_type=MessageType.TEXT,
             source=source,
             raw_message={"via": "approval_reaction"},
-            message_id=f"approval-reaction-{uuid.uuid4().hex}",
+            # Hermes uses event.message_id (not source.message_id) as the
+            # confirmation reply anchor. Preserve the durable reaction id;
+            # a synthetic "approval-reaction-..." token cannot be a Marmot id.
+            message_id=reaction_id,
             timestamp=datetime.now(timezone.utc),
         )
         try:
-            await self.handle_message(hermes_event)
+            await self._handle_gateway_message(hermes_event)
         except Exception:
             # Exception messages and tracebacks may contain private event data.
             logger.warning("Marmot approval reaction dispatch failed")
