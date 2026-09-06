@@ -6827,6 +6827,15 @@ fn agent_created_groups_store_removal_is_durable_and_scoped() {
 
 #[tokio::test]
 async fn connector_socket_leaves_group_and_removes_activation_provenance() {
+    connector_leave_group_case(false).await;
+}
+
+#[tokio::test]
+async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
+    connector_leave_group_case(true).await;
+}
+
+async fn connector_leave_group_case(block_cleanup: bool) {
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -6928,6 +6937,15 @@ async fn connector_socket_leaves_group_and_removes_activation_provenance() {
         .self_demote_admin(&agent.label, &group_id)
         .await
         .unwrap();
+    // A directory at the atomic-write staging path reliably fails writes,
+    // including when tests run as root, without damaging the durable record.
+    let blocked_temp = connector
+        .agent_created_groups
+        .dir
+        .join(format!(".{}.json.tmp", agent.account_id_hex));
+    if block_cleanup {
+        std::fs::create_dir(&blocked_temp).unwrap();
+    }
     let response = serve_control_request_once(
         &connector,
         &listener,
@@ -6942,11 +6960,36 @@ async fn connector_socket_leaves_group_and_removes_activation_provenance() {
     assert_eq!(response.id.as_deref(), Some("leave-1"));
     assert_eq!(response.payload, AgentControlResponse::Ack);
     let reopened = crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path());
+    if block_cleanup {
+        assert!(
+            reopened
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        std::fs::remove_dir(&blocked_temp).unwrap();
+        // Repair only the idempotent metadata operation, never repeat the leave.
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+    }
     assert!(
         !reopened
             .contains(&agent.account_id_hex, &group_id_hex)
             .unwrap()
     );
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
     assert!(reopened.contains(&agent.account_id_hex, &missing).unwrap());
     connector.runtime.shutdown().await;
 }
