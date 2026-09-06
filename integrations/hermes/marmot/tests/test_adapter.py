@@ -6108,8 +6108,132 @@ class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
                 source = adapter.events[0].source
                 self.assertEqual(source.user_id, self.SENDER)
                 self.assertEqual(source.chat_id, self.GROUP)
-                self.assertEqual(source.message_id, self.PROMPT)
+                self.assertEqual(source.message_id, "ee" * 32)
                 self.assertEqual(adapter._pending_ambient_context, {})
+
+    async def test_connector_wire_heart_on_own_prompt_delivers_confirmation(self):
+        # Exercise the real NDJSON client and subscription dispatcher. This is
+        # the connector's ReactionAdded DTO: actor is the reactor, while the
+        # referenced target's sender is the agent (not a self-reaction).
+        for emoji in ["\u2764\ufe0f", "\u2764"]:
+            with self.subTest(emoji=emoji), tempfile.TemporaryDirectory() as home:
+                socket = str(Path(home) / "agent.sock")
+                sends = []
+                server_errors = []
+                reaction_id = "ee" * 32
+
+                async def serve(reader, writer):
+                    try:
+                        request = json.loads(await reader.readline())
+                        if request["type"] == "send_final":
+                            sends.append(request)
+                            payload = {"type": "final_sent", "message_ids_hex": [self.PROMPT]}
+                        else:
+                            self.assertEqual(request["type"], "subscribe_inbound")
+                            self.assertEqual(request["account_id_hex"], self.ACCOUNT)
+                            writer.write((json.dumps({
+                                "marmot_agent_control": self.module.PROTOCOL,
+                                "id": request["id"], "type": "ack",
+                            }) + "\n").encode())
+                            payload = self.reaction(emoji=emoji, target={
+                                "message_id_hex": self.PROMPT,
+                                "availability": "available", "text_excerpt": "Approval required",
+                                "sender": {"account_id_hex": self.ACCOUNT, "is_self": True},
+                                "media": [],
+                            })
+                        writer.write((json.dumps({
+                            "marmot_agent_control": self.module.PROTOCOL,
+                            "id": request["id"], **payload,
+                        }) + "\n").encode())
+                        await writer.drain()
+                    except Exception as exc:
+                        server_errors.append(exc)
+                    finally:
+                        writer.close()
+                        await writer.wait_closed()
+
+                server = await asyncio.start_unix_server(serve, path=socket)
+                async with server:
+                    adapter = self.module.MarmotPlatformAdapter(
+                        sys.modules["gateway.config"].PlatformConfig(extra={
+                            "account_id_hex": self.ACCOUNT, "approval_reactions": True,
+                        }), client=self.module.MarmotAgentControlClient(socket),
+                    )
+                    received = []
+
+                    async def gateway(event):
+                        received.append(event)
+                        # Mirrors Hermes _reply_anchor_for_event and its
+                        # slash-command confirmation send, not just synthesis.
+                        result = await adapter.send(
+                            event.source.chat_id, "Approved always",
+                            reply_to=event.message_id, metadata={"delivery_class": "notify"},
+                        )
+                        self.assertTrue(result.success)
+
+                    adapter.handle_message = gateway
+                    await self.send_prompt(adapter)
+                    await asyncio.wait_for(adapter._consume_inbound_once(drain=True), timeout=5)
+                self.assertEqual(server_errors, [])
+                self.assertEqual([event.text for event in received], ["/approve always"])
+                self.assertEqual(received[0].message_id, reaction_id)
+                self.assertEqual(received[0].source.message_id, reaction_id)
+                self.assertEqual(len(sends), 2)
+                self.assertEqual(sends[1]["reply_to_message_id_hex"], reaction_id)
+
+    async def test_typed_approval_keeps_own_message_id_not_reply_target(self):
+        self.adapter.group_activation = "always"
+        received = []
+
+        async def gateway(event):
+            received.append(event)
+            await self.adapter.send(self.GROUP, "Approved always", reply_to=event.message_id)
+
+        self.adapter.handle_message = gateway
+        event = wire_event({
+            "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "message_id_hex": "ab" * 32,
+            "sender_account_id_hex": self.SENDER, "text": "/approve always",
+            "reply_to_message_id_hex": self.PROMPT,
+        })
+        await self.adapter._handle_control_event(event)
+        await self.adapter._inbound_queue.join()
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].message_id, "ab" * 32)
+        self.assertEqual(received[0].reply_to_message_id, self.PROMPT)
+        self.assertEqual(self.adapter.client.final_sends[-1][3], "ab" * 32)
+
+    async def test_bad_approval_anchor_degrades_but_other_ids_stay_strict(self):
+        bad_anchor = "approval-reaction-private-test-token"
+        event = self.module.MessageEvent(
+            text="/approve always", message_id=bad_anchor,
+            source=self.adapter.build_source(chat_id=self.GROUP, user_id=self.SENDER),
+        )
+        outcomes = []
+
+        async def gateway(inbound):
+            outcomes.append(await self.adapter.send(
+                self.GROUP, "Approved always", reply_to=inbound.message_id,
+            ))
+            with self.assertRaises(self.module.AgentControlError):
+                await self.adapter.send("bad-group", "Approved always", reply_to=bad_anchor)
+            with self.assertRaises(self.module.AgentControlError):
+                await self.adapter.send("33" * 16, "Different group", reply_to=bad_anchor)
+
+        self.adapter.handle_message = gateway
+        with self.assertLogs(self.module.logger, level="DEBUG") as logs:
+            await self.adapter._handle_gateway_message(event)
+        self.assertTrue(outcomes[0].success)
+        self.assertIsNone(self.adapter.client.final_sends[-1][3])
+        diagnostic = "\n".join(logs.output)
+        self.assertIn(f"length={len(bad_anchor)}, prefix='ap'", diagnostic)
+        self.assertNotIn(bad_anchor, diagnostic)
+        # Recovery scope is reset after command dispatch, and the shared parser
+        # remains strict for normal sends and unrelated ids.
+        with self.assertRaises(self.module.AgentControlError):
+            await self.adapter.send(self.GROUP, "ordinary message", reply_to=bad_anchor)
+        with self.assertRaises(self.module.AgentControlError):
+            self.module._optional_hex(bad_anchor)
 
     async def test_flag_off_preserves_ambient_mutation_behavior(self):
         for flag in [None, False, "false", "true"]:
