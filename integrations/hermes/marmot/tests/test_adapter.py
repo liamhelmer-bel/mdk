@@ -134,6 +134,9 @@ def install_fake_hermes_modules():
         async def remove_reaction(self, chat_id, message_id=None):
             raise NotImplementedError
 
+        def resume_typing_for_chat(self, chat_id):
+            pass
+
         def build_source(self, **kwargs):
             return SessionSource(platform=self.platform, **kwargs)
 
@@ -6234,6 +6237,71 @@ class ApprovalReactionTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.send(self.GROUP, "ordinary message", reply_to=bad_anchor)
         with self.assertRaises(self.module.AgentControlError):
             self.module._optional_hex(bad_anchor)
+
+    async def test_stale_prompt_cannot_resolve_new_approval_after_typed_resolution(self):
+        for command in ["/approve", "/approve always", "/deny"]:
+            with self.subTest(command=command):
+                adapter = self.make_adapter(True)
+                await self.send_prompt(adapter)
+                event = self.module.MessageEvent(text=command, source=adapter.build_source(
+                    chat_id=self.GROUP, user_id=self.SENDER,
+                ))
+                await adapter._handle_gateway_message(event)
+                adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+                    "type": "final_sent", "message_ids_hex": ["dd" * 32],
+                })
+                await self.send_prompt(adapter)
+                adapter.events.clear()
+                await adapter._handle_control_event(self.reaction())
+                self.assertEqual(adapter.events, [], "A must never resolve B")
+                await adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+                self.assertEqual([event.text for event in adapter.events], ["/approve"])
+
+    async def test_expiry_and_replacement_retire_stale_prompts(self):
+        with unittest.mock.patch.object(self.module, "approval_prompt_timeout", return_value=43200):
+            with unittest.mock.patch.object(self.module.time, "monotonic", return_value=100):
+                await self.send_prompt()
+            with unittest.mock.patch.object(self.module.time, "monotonic", return_value=43300):
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+                self.adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+                    "type": "final_sent", "message_ids_hex": ["dd" * 32],
+                })
+                await self.send_prompt()
+                await self.adapter._handle_control_event(self.reaction())
+                self.assertEqual(self.adapter.events, [])
+                await self.adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+                self.assertEqual(len(self.adapter.events), 1)
+
+    async def test_unobserved_resolution_new_prompt_disables_ambiguous_consent(self):
+        await self.send_prompt()
+        # B arrives without an observable typed decision or an elapsed timeout.
+        # It may be replacement or parallel work: unscoped consent is unsafe.
+        self.adapter.client.send_final = unittest.mock.AsyncMock(return_value={
+            "type": "final_sent", "message_ids_hex": ["dd" * 32],
+        })
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction())
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="dd" * 32))
+        self.assertEqual(self.adapter.events, [])
+        self.adapter.client.send_final.return_value = {
+            "type": "final_sent", "message_ids_hex": ["ab" * 32],
+        }
+        await self.send_prompt()
+        await self.adapter._handle_control_event(self.reaction(target_message_id_hex="ab" * 32))
+        self.assertEqual(self.adapter.events, [], "a third prompt must not bypass ambiguity")
+
+    async def test_gateway_resolution_callback_retires_prompt(self):
+        await self.send_prompt()
+        self.adapter.resume_typing_for_chat(self.GROUP)
+        await self.adapter._handle_control_event(self.reaction())
+        self.assertEqual(self.adapter.events, [])
+
+    def test_timeout_uses_gateway_configured_value(self):
+        approval = types.ModuleType("tools.approval")
+        approval._get_approval_timeout = lambda: 43200
+        with unittest.mock.patch.dict(sys.modules, {"tools.approval": approval}):
+            self.assertEqual(self.module.approval_prompt_timeout(), 43200)
 
     async def test_flag_off_preserves_ambient_mutation_behavior(self):
         for flag in [None, False, "false", "true"]:

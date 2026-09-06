@@ -100,6 +100,16 @@ APPROVAL_REACTION_CHOICES = {
 MAX_PENDING_APPROVAL_PROMPTS = 32
 
 
+def approval_prompt_timeout() -> float:
+    # Use the gateway's configured approvals.timeout (300 seconds by default).
+    # Older hosts without this API get the conservative gateway default.
+    try:
+        from tools.approval import _get_approval_timeout
+        return max(0, float(_get_approval_timeout()))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return 300.0
+
+
 def resolve_allowed_message_senders() -> set[str]:
     """Explicit Marmot sender allowlist, normalized to hex; empty denies all.
 
@@ -1988,6 +1998,9 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._approval_prompt_messages: OrderedDict[
             tuple[str, str, str], Optional[tuple[str, ...]]
         ] = OrderedDict()
+        self._approval_prompt_deadlines: Dict[tuple[str, str, str], float] = {}
+        self._approval_prompt_sends: Dict[str, object] = {}
+        self._approval_ambiguous_until: Dict[str, float] = {}
         self.mention_patterns = resolve_mention_patterns(extra)
         self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
         self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
@@ -2124,11 +2137,32 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if self.approval_reactions and (metadata or {}).get("is_approval_prompt") is True:
             # Hermes marks approval prompts as interim commentary. Consent needs
             # a durable chat message, never an activity event or live preview.
-            result = await self._send_final_direct(
-                chat_id, content, reply_to_message_id_hex=_optional_hex(reply_to)
+            started = time.monotonic()
+            self._sweep_approval_prompts()
+            # The gateway slash command resolves FIFO, not a message id. If
+            # another prompt is still eligible, neither prompt is safe to use.
+            inflight = chat_id in self._approval_prompt_sends
+            ambiguous = (
+                self._invalidate_approval_prompts(chat_id) or inflight
+                or self._approval_ambiguous_until.get(chat_id, 0) > started
             )
-            self._record_approval_prompt(chat_id, metadata, result)
-            return result
+            if ambiguous:
+                # A later prompt must not re-enable consent while an older
+                # parallel request might still occupy the gateway's FIFO head.
+                self._approval_ambiguous_until[chat_id] = started + approval_prompt_timeout()
+            ticket = object()
+            self._approval_prompt_sends[chat_id] = ticket
+            try:
+                result = await self._send_final_direct(
+                    chat_id, content, reply_to_message_id_hex=_optional_hex(reply_to)
+                )
+                eligible = not ambiguous and self._approval_prompt_sends.get(chat_id) is ticket
+                self._record_approval_prompt(chat_id, metadata, result,
+                                             eligible=eligible, started=started)
+                return result
+            finally:
+                if self._approval_prompt_sends.get(chat_id) is ticket:
+                    self._approval_prompt_sends.pop(chat_id, None)
         visible_content, is_preview = self._split_stream_preview(content)
 
         tool_events = _tool_events_from_progress_text(visible_content)
@@ -3671,7 +3705,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 self._pending_inbound_ids.discard(message_id_hex)
 
     def _record_approval_prompt(
-        self, chat_id: str, metadata: Optional[Dict[str, Any]], result: SendResult
+        self, chat_id: str, metadata: Optional[Dict[str, Any]], result: SendResult,
+        *, eligible: bool = True, started: Optional[float] = None,
     ) -> None:
         if not self.approval_reactions or (metadata or {}).get("is_approval_prompt") is not True:
             return
@@ -3694,15 +3729,49 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             return
         key = (account, group, primary)
         if key not in self._approval_prompt_messages:
-            self._approval_prompt_messages[key] = message_ids
+            self._approval_prompt_messages[key] = message_ids if eligible else None
+            self._approval_prompt_deadlines[key] = (
+                time.monotonic() if started is None else started
+            ) + approval_prompt_timeout()
         while len(self._approval_prompt_messages) > MAX_PENDING_APPROVAL_PROMPTS:
-            self._approval_prompt_messages.popitem(last=False)
+            evicted, _ = self._approval_prompt_messages.popitem(last=False)
+            self._approval_prompt_deadlines.pop(evicted, None)
+            if not any(key[1] == evicted[1] for key in self._approval_prompt_messages):
+                self._approval_ambiguous_until.pop(evicted[1], None)
+
+    def _sweep_approval_prompts(self) -> None:
+        now = time.monotonic()
+        self._approval_ambiguous_until = {
+            group: deadline for group, deadline in self._approval_ambiguous_until.items()
+            if deadline > now
+        }
+        for key, deadline in self._approval_prompt_deadlines.items():
+            if deadline <= now:
+                self._approval_prompt_messages[key] = None
+
+    def _invalidate_approval_prompts(self, chat_id: str) -> bool:
+        had_pending = False
+        for key, ids in self._approval_prompt_messages.items():
+            if key[:2] == (self.account_id_hex, chat_id) and ids is not None:
+                had_pending = True
+                self._approval_prompt_messages[key] = None
+        # Retire any send receipt still in flight during a resolution.
+        self._approval_prompt_sends.pop(chat_id, None)
+        return had_pending
+
+    def resume_typing_for_chat(self, chat_id: str) -> None:
+        # Hermes invokes this on successful typed /approve and /deny decisions.
+        self._invalidate_approval_prompts(chat_id)
+        super().resume_typing_for_chat(chat_id)
 
     async def _handle_gateway_message(self, event: MessageEvent) -> None:
         command = str(event.text or "").strip().split(maxsplit=1)
         if not command or command[0].lower() not in {"/approve", "/deny"}:
             await self.handle_message(event)
             return
+        # Retire before dispatch, including no-pending/expired replies and
+        # exceptions. A later approval must never inherit this prompt's consent.
+        self._invalidate_approval_prompts(event.source.chat_id)
         token = _APPROVAL_REPLY_CONTEXT.set((self, event.source.chat_id))
         try:
             await self.handle_message(event)
@@ -3712,6 +3781,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
     async def _handle_approval_reaction(self, event: Dict[str, Any]) -> bool:
         if not self.approval_reactions or event.get("type") != "reaction_added":
             return False
+        self._sweep_approval_prompts()
         emoji = event.get("emoji")
         choice = APPROVAL_REACTION_CHOICES.get(emoji) if isinstance(emoji, str) else None
         if choice is None:
