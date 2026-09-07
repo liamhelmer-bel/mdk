@@ -62,11 +62,14 @@ Eyes appear when processing begins. Hermes' live-status callback maps tool
 start to the construction cycle and tool completion to the between-tools
 hourglass. Leave Hermes' `display.live_status` enabled (its default is `full`)
 to receive tool lifecycle signals, even with tool-progress messages disabled.
-Streaming text also switches to thinking when no tool is active.
+Streaming text also switches to thinking when no tool is active. Callbacks carry
+the originating processing task identity through Hermes’ context-copying agent
+executor; stale or uncorrelated callbacks cannot change the current indicator.
 
 While a tool runs, the construction emoji advances after 120, 240, 480, then
 600 seconds, remaining capped at 600 seconds. Every new tool start resets the
-cycle and timer. New inbound messages retarget the active indicator; successful
+cycle and timer. Only queued inbound messages that pass activation and are not
+consumed by onboarding retarget the active indicator; successful
 completion marks the original reply anchor with a checkmark. Failed turns get
 a cross, superseded turns get an arrow, and cancellation removes the temporary
 indicator. Terminal reactions are preserved.
