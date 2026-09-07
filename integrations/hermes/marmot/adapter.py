@@ -49,6 +49,9 @@ _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
     "marmot_turn_parent_message_id_hex",
     default=None,
 )
+_PRESENCE_TURN_CONTEXT: ContextVar[Optional[tuple[object, object]]] = ContextVar(
+    "marmot_presence_turn_context", default=None,
+)
 # Scope reply-anchor recovery to sends made while dispatching an approval
 # command. ContextVar keeps concurrent groups and ordinary sends isolated.
 _APPROVAL_REPLY_CONTEXT: ContextVar[Optional[tuple[object, str]]] = ContextVar(
@@ -2540,18 +2543,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         loop = self._loop
-        state = self._presence.groups.get(chat_id)
-        if not self._presence.enabled or loop is None or not loop.is_running() or state is None:
+        turn = _PRESENCE_TURN_CONTEXT.get()
+        if (not self._presence.enabled or loop is None or not loop.is_running()
+                or turn is None or turn[0] is not self
+                or turn[1].source.chat_id != chat_id):
             return
         # The gateway calls this from its agent thread. Never retain or log the
         # status phrase; only its presence (tool active vs between tools) matters.
         try:
-            loop.call_soon_threadsafe(self._presence.status, chat_id, text is not None, state.owner)
+            loop.call_soon_threadsafe(self._presence.status, chat_id, text is not None, turn[1])
         except RuntimeError:
             logger.debug("Marmot presence scheduling skipped during shutdown")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         self._capture_loop()
+        # Hermes copies task context into its agent executor. Late callbacks keep
+        # their originating event identity instead of borrowing the current turn.
+        _PRESENCE_TURN_CONTEXT.set((self, event))
         self._presence.start(event.source.chat_id, event.message_id, event)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
@@ -3672,9 +3680,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         ):
             return
         self._pending_inbound_ids.add(message_id_hex)
-        if (self._presence.enabled and event.get("account_id_hex") == self.account_id_hex
-                and event.get("sender_account_id_hex") != self.account_id_hex):
-            self._presence.retarget(event["group_id_hex"], message_id_hex)
 
         if self.debounce_ms > 0:
             try:
@@ -3728,6 +3733,11 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             # the claim falls through to a normal turn instead of double-prompting.
             if await self._maybe_handle_profile_name_onboarding(event):
                 return
+
+            # Only queued, activated turn input may take over the indicator.
+            if (self._presence.enabled and event.get("account_id_hex") == self.account_id_hex
+                    and event.get("sender_account_id_hex") != self.account_id_hex):
+                self._presence.retarget(event["group_id_hex"], message_id_hex)
 
             sender_display_name = str(event.get("sender_display_name") or "").strip()
             user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"

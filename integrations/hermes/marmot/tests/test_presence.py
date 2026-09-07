@@ -253,6 +253,88 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deltas, ["answer"])
         self.assertEqual(self.ops()[-1], ("send_reaction", self.MESSAGE, "⏳"))
 
+    async def test_rejected_activation_does_not_retarget_through_admission(self):
+        await self.adapter.on_processing_start(self.event())
+        await self.flush()
+        self.adapter.group_activation = "mention"
+        self.adapter._activation_cache.set(self.ACCOUNT, self.GROUP, False)
+        await self.adapter._handle_control_event(wire_event({
+            "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "message_id_hex": "55" * 32,
+            "sender_account_id_hex": "44" * 32, "text": "unaddressed chatter",
+        }))
+        await self.adapter._inbound_queue.join()
+        await self.flush()
+        self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
+        self.assertEqual(self.ops(), [("send_reaction", self.MESSAGE, "👀")])
+        self.assertFalse(self.adapter.events)
+
+    async def test_shed_message_does_not_retarget(self):
+        await self.adapter.on_processing_start(self.event())
+        await self.flush()
+        with patch.object(self.adapter._inbound_queue, "enqueue", return_value=None):
+            await self.adapter._handle_control_event(wire_event({
+                "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP, "message_id_hex": "55" * 32,
+                "sender_account_id_hex": "44" * 32, "text": "eligible but shed",
+            }))
+        await self.flush()
+        self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
+        self.assertEqual(self.ops(), [("send_reaction", self.MESSAGE, "👀")])
+        self.assertFalse(self.adapter.events)
+
+    async def test_host_thread_callbacks_keep_originating_turn(self):
+        old, new = self.event(), self.event(message="66" * 32)
+        commands = {old.message_id: asyncio.Queue(), new.message_id: asyncio.Queue()}
+        started = asyncio.Queue()
+
+        async def host_processing(event):
+            await self.adapter.on_processing_start(event)
+            await started.put(event)
+            while True:
+                text = await commands[event.message_id].get()
+                try:
+                    # Hermes' executor copies the processing task context, as
+                    # asyncio.to_thread does. Exercise the public host callback.
+                    await asyncio.to_thread(self.adapter.set_status_text, self.GROUP, text)
+                finally:
+                    commands[event.message_id].task_done()
+
+        self.adapter._message_handler = host_processing
+        tasks = []
+        try:
+            for event in (old, new):
+                self.assertTrue(self.adapter._start_session_processing(event, event.message_id))
+                tasks.append(self.adapter._session_tasks[event.message_id])
+                self.assertIs(await started.get(), event)
+                await self.flush()
+            await commands[new.message_id].put("tool.started")
+            await commands[new.message_id].join()
+            _, timer = await self.clock.next()
+            await self.flush()
+            before = list(self.ops())
+            for text in (None, "late tool.started"):
+                await commands[old.message_id].put(text)
+                await commands[old.message_id].join()
+                await self.flush()
+            # An uncorrelated host callback must also be ignored.
+            await asyncio.to_thread(self.adapter.set_status_text, self.GROUP, None)
+            await self.flush()
+            self.assertEqual(self.ops(), before)
+            self.assertFalse(timer.cancelled())
+            state = self.adapter._presence.groups[self.GROUP]
+            self.assertIs(state.owner, new)
+            self.assertEqual(state.active_tools, 1)
+            await commands[new.message_id].put(None)
+            await commands[new.message_id].join()
+            await self.flush()
+            self.assertTrue(timer.cancelled())
+            self.assertEqual(self.ops()[-1], ("send_reaction", new.message_id, "⏳"))
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def test_configuration_and_group_bound(self):
         custom = self.make_adapter(True, {"thinking": "🤔", "construction": ["🔧", "🔩"],
                                           "failed": "invalid\nemoji"})
