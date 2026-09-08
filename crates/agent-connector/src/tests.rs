@@ -6715,6 +6715,18 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
     else {
         panic!("expected canonical create with unavailable provenance");
     };
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .expect("unavailable provenance must not suppress valid group info"),
+        AgentControlResponse::GroupInfo {
+            member_count: 2,
+            is_direct: true,
+            agent_created: false,
+            ..
+        }
+    ));
     assert!(
         connector
             .app
