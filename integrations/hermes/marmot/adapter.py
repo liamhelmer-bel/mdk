@@ -1582,7 +1582,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self.streaming_cursor = str(extra.get("streaming_cursor") or os.getenv("MARMOT_STREAMING_CURSOR") or DEFAULT_STREAMING_CURSOR)
         self.debounce_ms = resolve_debounce_ms(extra)
         self.group_activation = resolve_group_activation(extra)
-        self._presence = PresenceReactions(self, extra)
         self.mention_patterns = resolve_mention_patterns(extra)
         self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
         self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
@@ -1650,6 +1649,7 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._last_chat_stream: Dict[str, MarmotLiveStream] = {}
         self._tool_progress_events: OrderedDict[str, set[str]] = OrderedDict()
         self._tool_progress_replies: Dict[str, Optional[str]] = {}
+        self._presence = PresenceReactions(self, extra)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Client-side inbound dedupe: wn-agent can re-emit the same inbound
         # message (rapid catch-up after subscribe, or across a reconnect); drop
