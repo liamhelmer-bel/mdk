@@ -8924,30 +8924,9 @@ async fn future_dated_inbox_is_unknown_for_account_and_member_resolution() {
 }
 
 #[tokio::test]
-async fn runtime_group_create_resolves_local_member_aliases_without_relay_packages() {
-    let (directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_packages() {
+    let (directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
     let member = &accounts[0];
-    let key_package = fresh_key_package_for_account(&app, member, false).await;
-    write_json(
-        app.key_package_record_path(&member.label),
-        &KeyPackageRecord {
-            account_label: member.label.clone(),
-            account_id_hex: member.account_id_hex.clone(),
-            key_package_id: "local-slot".into(),
-            key_package_ref_hex: String::new(),
-            key_package_event_id: "ab".repeat(32),
-            published_at: 1,
-            key_package_hex: hex::encode(key_package.bytes()),
-        },
-    )
-    .unwrap();
-    remember_test_member_inbox(&app, &member.account_id_hex, "wss://shared.example");
-    // Local public packages are available even when no relay serves kind 30443.
-    fetcher
-        .events
-        .lock()
-        .unwrap()
-        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
     app.account_home().create_account("creator").unwrap();
     let runtime = MarmotAppRuntime::new(app.clone());
     for reference in [
