@@ -133,6 +133,24 @@ APPROVAL_REACTION_CHOICES = {
 MAX_PENDING_APPROVAL_PROMPTS = 32
 
 
+def _resolve_bound_approval(approval: Any, session_key: str, entry: Any, choice: str) -> bool:
+    """Consume an exact entry under pinned Hermes' typed-resolver lock."""
+    with approval._lock:
+        queue = approval._gateway_queues.get(session_key, [])
+        if entry not in queue or entry.event.is_set():
+            return False
+        if choice == "always" and (
+            not entry.data.get("allow_permanent", True) or entry.data.get("smart_denied", False)
+        ):
+            return False
+        queue.remove(entry)
+        if not queue:
+            approval._gateway_queues.pop(session_key, None)
+        entry.result = choice
+        entry.event.set()
+    return True
+
+
 def approval_prompt_timeout() -> float:
     # Use the gateway's configured approvals.timeout (300 seconds by default).
     # Older hosts without this API get the conservative gateway default.
@@ -1410,9 +1428,8 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         self._approval_prompt_messages: OrderedDict[
             tuple[str, str, str], Optional[tuple[str, ...]]
         ] = OrderedDict()
+        self._approval_prompt_bindings: Dict[tuple[str, str, str], tuple[Any, str, Any]] = {}
         self._approval_prompt_deadlines: Dict[tuple[str, str, str], float] = {}
-        self._approval_prompt_sends: Dict[str, object] = {}
-        self._approval_ambiguous_until: Dict[str, float] = {}
         self.mention_patterns = resolve_mention_patterns(extra)
         self.agent_name = _first_config_value(extra, "agent_name", "agentName", env="MARMOT_AGENT_NAME")
         self.welcomer_allowlist = resolve_welcomer_allowlist(extra)
@@ -1789,35 +1806,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # unthreaded; invalid destination/account ids remain errors.
                 logger.debug("Marmot approval confirmation dropping invalid reply anchor")
                 reply_to = None
-        if self.approval_reactions and (metadata or {}).get("is_approval_prompt") is True:
-            # Hermes marks approval prompts as interim commentary. Consent needs
-            # a durable chat message, never an activity event or live preview.
-            started = time.monotonic()
-            self._sweep_approval_prompts()
-            # The gateway slash command resolves FIFO, not a message id. If
-            # another prompt is still eligible, neither prompt is safe to use.
-            inflight = chat_id in self._approval_prompt_sends
-            ambiguous = (
-                self._invalidate_approval_prompts(chat_id) or inflight
-                or self._approval_ambiguous_until.get(chat_id, 0) > started
-            )
-            if ambiguous:
-                # A later prompt must not re-enable consent while an older
-                # parallel request might still occupy the gateway's FIFO head.
-                self._approval_ambiguous_until[chat_id] = started + approval_prompt_timeout()
-            ticket = object()
-            self._approval_prompt_sends[chat_id] = ticket
-            try:
-                result = await self._send_final_direct(
-                    chat_id, content, reply_to_message_id_hex=_optional_hex(reply_to)
-                )
-                eligible = not ambiguous and self._approval_prompt_sends.get(chat_id) is ticket
-                self._record_approval_prompt(chat_id, metadata, result,
-                                             eligible=eligible, started=started)
-                return result
-            finally:
-                if self._approval_prompt_sends.get(chat_id) is ticket:
-                    self._approval_prompt_sends.pop(chat_id, None)
         visible_content, is_preview = self._split_stream_preview(content)
 
         tool_events = _tool_events_from_progress_text(visible_content)
@@ -3657,6 +3645,47 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 if self._debounce_release_pending.get(message_id) == reason:
                     self._debounce_release_pending.pop(message_id, None)
 
+    async def send_exec_approval(
+        self, chat_id: str, *, command: str, session_key: str,
+        description: str = "", metadata: Optional[Dict[str, Any]] = None,
+        allow_permanent: bool = True, smart_denied: bool = False,
+    ) -> SendResult:
+        """Pinned Hermes 0.19.0 notification hook; bind before any send await."""
+        from tools import approval
+        from gateway.run import _format_exec_approval_fallback, _redact_approval_command
+
+        chat_id = _normalize_hex(chat_id, "chat_id")
+        # The host supplies no request id. Snapshot its actual pending entry and
+        # render THAT entry, never attach a callback's possibly stale text to a
+        # newer request. Parallel queues stay typed-only.
+        with approval._lock:
+            queue = approval._gateway_queues.get(session_key, [])
+            entry = queue[0] if len(queue) == 1 else None
+            data = dict(entry.data) if entry is not None else None
+        if data is not None:
+            command = _redact_approval_command(data.get("command", ""))
+            description = str(data.get("description", ""))
+            allow_permanent = data.get("allow_permanent", True)
+            smart_denied = data.get("smart_denied", False)
+        content = _format_exec_approval_fallback(
+            command, description, "/", allow_permanent=allow_permanent,
+            smart_denied=smart_denied,
+        )
+        if self.approval_reactions and entry is not None:
+            content += "\nReact 👍 to approve once or 👎 to deny."
+            if allow_permanent and not smart_denied:
+                content += " React ❤️ to approve permanently."
+        started = time.monotonic()
+        result = await self._send_final_direct(chat_id, content)
+        if self.approval_reactions and entry is not None:
+            self._record_approval_prompt(
+                chat_id, {"is_approval_prompt": True}, result, started=started,
+            )
+            key = (self.account_id_hex, chat_id, result.message_id)
+            if self._approval_prompt_messages.get(key) is not None:
+                self._approval_prompt_bindings[key] = (approval, session_key, entry)
+        return result
+
     def _record_approval_prompt(
         self, chat_id: str, metadata: Optional[Dict[str, Any]], result: SendResult,
         *, eligible: bool = True, started: Optional[float] = None,
@@ -3689,15 +3718,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         while len(self._approval_prompt_messages) > MAX_PENDING_APPROVAL_PROMPTS:
             evicted, _ = self._approval_prompt_messages.popitem(last=False)
             self._approval_prompt_deadlines.pop(evicted, None)
-            if not any(key[1] == evicted[1] for key in self._approval_prompt_messages):
-                self._approval_ambiguous_until.pop(evicted[1], None)
+            self._approval_prompt_bindings.pop(evicted, None)
 
     def _sweep_approval_prompts(self) -> None:
         now = time.monotonic()
-        self._approval_ambiguous_until = {
-            group: deadline for group, deadline in self._approval_ambiguous_until.items()
-            if deadline > now
-        }
         for key, deadline in self._approval_prompt_deadlines.items():
             if deadline <= now:
                 self._approval_prompt_messages[key] = None
@@ -3708,8 +3732,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
             if key[:2] == (self.account_id_hex, chat_id) and ids is not None:
                 had_pending = True
                 self._approval_prompt_messages[key] = None
-        # Retire any send receipt still in flight during a resolution.
-        self._approval_prompt_sends.pop(chat_id, None)
         return had_pending
 
     def resume_typing_for_chat(self, chat_id: str) -> None:
@@ -3763,33 +3785,23 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         if sender == account or not allowed or sender not in allowed:
             logger.debug("Marmot approval reaction rejected by sender policy")
             return True
-        # Consume before awaiting the gateway so concurrent reactions, failed
-        # dispatches and replayed events cannot decide this prompt twice.
+        binding = self._approval_prompt_bindings.get(key)
+        if binding is None:
+            return True
+        approval, session_key, entry = binding
+        decision = {"/approve": "once", "/deny": "deny", "/approve always": "always"}[choice]
+        if not _resolve_bound_approval(approval, session_key, entry, decision):
+            return True
         self._approval_prompt_messages[key] = None
-        source = self.build_source(
-            chat_id=group,
-            chat_name=f"Marmot {group[:12]}",
-            chat_type="group",
-            user_id=sender,
-            user_name="Marmot sender",
-            message_id=reaction_id,
-        )
-        hermes_event = MessageEvent(
-            text=choice,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message={"via": "approval_reaction"},
-            # Hermes uses event.message_id (not source.message_id) as the
-            # confirmation reply anchor. Preserve the durable reaction id;
-            # a synthetic "approval-reaction-..." token cannot be a Marmot id.
-            message_id=reaction_id,
-            timestamp=datetime.now(timezone.utc),
-        )
+        self._approval_prompt_bindings.pop(key, None)
+        self.resume_typing_for_chat(group)
         try:
-            await self._handle_gateway_message(hermes_event)
+            await self._send_final_direct(
+                group, "Approval denied." if decision == "deny" else "Approval accepted.",
+                reply_to_message_id_hex=reaction_id,
+            )
         except Exception:
-            # Exception messages and tracebacks may contain private event data.
-            logger.warning("Marmot approval reaction dispatch failed")
+            logger.warning("Marmot approval confirmation failed")
         return True
 
     async def _handle_mutation(self, event: Dict[str, Any]) -> None:
