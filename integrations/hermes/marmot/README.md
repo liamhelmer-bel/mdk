@@ -242,10 +242,16 @@ Streaming text also switches to thinking when no tool is active.
 
 While a tool runs, the construction emoji advances after 120, 240, 480, then
 600 seconds, remaining capped at 600 seconds. Every new tool start resets the
-cycle and timer. New inbound messages retarget the active indicator; successful
+cycle and timer. Inbound messages retarget the active indicator only after queue admission,
+activation, and onboarding checks; successful
 completion marks the original reply anchor with a checkmark. Failed turns get
 a cross, superseded turns get an arrow, and cancellation removes the temporary
 indicator. Terminal reactions are preserved.
+
+Tool status uses the originating processing turn's context, which pinned Hermes
+0.19.0 (`3ef6bbd201263d354fd83ec55b3c306ded2eb72a`) copies into its agent
+executor. Late callbacks from a replaced turn are ignored. Callbacks without
+turn context are ignored rather than assigned to the current owner.
 
 Presence is cosmetic: hooks enqueue work without awaiting daemon requests.
 Each group has at most one cycle timer and one serialized reaction worker;

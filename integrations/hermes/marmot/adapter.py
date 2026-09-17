@@ -76,6 +76,8 @@ def _live_adapter() -> Optional["MarmotPlatformAdapter"]:
 DEFAULT_SOCKET_HOME = "~/.marmot"
 STREAM_MESSAGE_PREFIX = "marmot-stream:"
 TOOL_PROGRESS_MESSAGE_PREFIX = "marmot-tool-progress:"
+_PRESENCE_OWNER: ContextVar[Optional[object]] = ContextVar("marmot_presence_owner", default=None)
+
 _TURN_PARENT_MESSAGE_ID_HEX: ContextVar[Optional[str]] = ContextVar(
     "marmot_turn_parent_message_id_hex",
     default=None,
@@ -2107,18 +2109,19 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         loop = self._loop
-        state = self._presence.groups.get(chat_id)
-        if not self._presence.enabled or loop is None or not loop.is_running() or state is None:
+        owner = _PRESENCE_OWNER.get()
+        if not self._presence.enabled or loop is None or not loop.is_running() or owner is None:
             return
         # The gateway calls this from its agent thread. Never retain or log the
         # status phrase; only its presence (tool active vs between tools) matters.
         try:
-            loop.call_soon_threadsafe(self._presence.status, chat_id, text is not None, state.owner)
+            loop.call_soon_threadsafe(self._presence.status, chat_id, text is not None, owner)
         except RuntimeError:
             logger.debug("Marmot presence scheduling skipped during shutdown")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         self._capture_loop()
+        _PRESENCE_OWNER.set(event)
         self._presence.start(event.source.chat_id, event.message_id, event)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
@@ -3354,9 +3357,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 await self._try_admit_spooled(message_id_hex, ignore_backoff=True)
             return
         self._pending_inbound_ids.add(message_id_hex)
-        if (self._presence.enabled and event.get("account_id_hex") == self.account_id_hex
-                and event.get("sender_account_id_hex") != self.account_id_hex):
-            self._presence.retarget(event["group_id_hex"], message_id_hex)
 
         if self.debounce_ms > 0:
             try:
@@ -3434,6 +3434,10 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     )
                     spool_state = "intentionally_skipped"
                 return
+
+            # This unit was admitted by the per-group queue and passed activation
+            # and onboarding. Rejected/ambient inbound events cannot move presence.
+            self._presence.retarget(group_id_hex, message_id_hex)
 
             sender_display_name = str(event.get("sender_display_name") or "").strip()
             user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"

@@ -57,7 +57,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
             payload = ({"type": "error", "code": "unavailable", "message": "unavailable",
                         "retryable": True} if self.fail else
                        {"type": "app_event_sent", "message_ids_hex": ["ee" * 32]})
-            writer.write((json.dumps({"marmot_agent_control": self.module.PROTOCOL,
+            writer.write((json.dumps({"marmot_agent_control": "marmot.agent-control.v2",
                                       "id": request["id"], **payload}) + "\n").encode())
             await writer.drain()
         except (ConnectionError, asyncio.CancelledError):
@@ -266,6 +266,39 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
             await self.flush()
             self.assertEqual(len(self.adapter._presence.groups), 2)
             self.assertEqual(len(self.requests), 2)
+
+
+
+    async def test_unactivated_inbound_cannot_retarget(self):
+        from unittest.mock import AsyncMock
+        event = self.event()
+        await self.adapter.on_processing_start(event)
+        self.adapter._should_run_turn = AsyncMock(return_value=False)
+        await self.adapter._handle_control_event(wire_event({
+            "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+            "group_id_hex": self.GROUP, "message_id_hex": "66" * 32,
+            "sender_account_id_hex": "44" * 32, "text": "ambient",
+        }))
+        await self.adapter._inbound_queue.join()
+        self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
+        await self.adapter.disconnect()
+
+    async def test_queue_rejection_cannot_retarget(self):
+        event = self.event()
+        await self.adapter.on_processing_start(event)
+        self.adapter._inbound_queue = self.module.KeyedAsyncQueue(max_depth_per_key=1)
+        release = asyncio.Event()
+        self.adapter._inbound_queue.enqueue(self.GROUP, release.wait)
+        try:
+            await self.adapter._handle_control_event(wire_event({
+                "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP, "message_id_hex": "66" * 32,
+                "sender_account_id_hex": "44" * 32, "text": "shed",
+            }))
+            self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
+        finally:
+            release.set()
+            await self.adapter.disconnect()
 
 
 if __name__ == "__main__":
