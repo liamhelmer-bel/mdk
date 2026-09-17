@@ -3328,6 +3328,7 @@ fn assert_group_info(
         member_count: got_members,
         is_direct: got_direct,
         subject: got_subject,
+        ..
     } = response
     else {
         panic!("expected group_info response, got {response:?}");
@@ -3378,6 +3379,7 @@ fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
         member_count: 3,
         is_direct: false,
         subject: Some("Café ☕".to_owned()),
+        agent_created: false,
     };
     let decoded = round_trip_group_info(named.clone());
     assert_eq!(decoded, named);
@@ -3390,6 +3392,7 @@ fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
         member_count: 2,
         is_direct: true,
         subject: None,
+        agent_created: false,
     };
     let absent_json = String::from_utf8(encode_frame(&absent).unwrap()).unwrap();
     assert!(
