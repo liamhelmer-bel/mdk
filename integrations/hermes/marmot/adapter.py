@@ -3654,6 +3654,13 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
         from tools import approval
         from gateway.run import _format_exec_approval_fallback, _redact_approval_command
 
+        if not self.approval_reactions:
+            content = _format_exec_approval_fallback(
+                command, description, getattr(self, "typed_command_prefix", "/"),
+                allow_permanent=allow_permanent, smart_denied=smart_denied,
+            )
+            return await self.send(chat_id, content, metadata=metadata)
+
         chat_id = _normalize_hex(chat_id, "chat_id")
         # The host supplies no request id. Snapshot its actual pending entry and
         # render THAT entry, never attach a callback's possibly stale text to a
