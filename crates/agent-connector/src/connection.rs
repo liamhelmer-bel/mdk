@@ -297,7 +297,6 @@ impl AgentConnector {
                 self.leave_group_response(&account_id_hex, &group_id_hex)
                     .await
             }
-            }
             AgentControlRequest::GroupInfo {
                 account_id_hex,
                 group_id_hex,
