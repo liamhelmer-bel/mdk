@@ -294,9 +294,13 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
 
     // Socket clients use the daemon's ownership. Direct execution, including
     // fallback after a stale socket, must not bypass another host's root lease.
-    let _root_lease = match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
-        Ok(lease) => lease,
-        Err(error) => return command_output_result(cli.json, Err(error.into())),
+    let _root_lease = if stateless_stream_command(&cli.command).is_some() {
+        None
+    } else {
+        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            Ok(lease) => Some(lease),
+            Err(error) => return command_output_result(cli.json, Err(error.into())),
+        }
     };
     run_cli_local(cli, import_nsec).await
 }
@@ -554,6 +558,21 @@ async fn execute(
         .map_err(|err| (json_output, err))
 }
 
+/// These raw transport commands never open account storage.
+fn stateless_stream_command(command: &Command) -> Option<&StreamCommand> {
+    match command {
+        Command::Stream {
+            command:
+                stream @ (StreamCommand::Receive { .. }
+                | StreamCommand::Send {
+                    start_event_id: None,
+                    ..
+                }),
+        } => Some(stream),
+        _ => None,
+    }
+}
+
 async fn execute_inner(
     cli: Cli,
     mut import_nsec: Option<ImportNsec>,
@@ -561,19 +580,7 @@ async fn execute_inner(
     let home = resolve_home(cli.home.clone());
     let account_flag = cli.account.clone();
     let command = cli.command.clone();
-    if let Command::Stream { command } = &command
-        && matches!(command, StreamCommand::Receive { .. })
-    {
-        return commands::stream::stream_command_local(command.clone()).await;
-    }
-    if let Command::Stream {
-        command:
-            stream_command @ StreamCommand::Send {
-                start_event_id: None,
-                ..
-            },
-    } = &command
-    {
+    if let Some(stream_command) = stateless_stream_command(&command) {
         return commands::stream::stream_command_local(stream_command.clone()).await;
     }
     let secret_store = resolve_secret_store(cli.secret_store)?;
