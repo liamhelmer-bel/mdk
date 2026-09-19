@@ -3435,10 +3435,6 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                     spool_state = "intentionally_skipped"
                 return
 
-            # This unit was admitted by the per-group queue and passed activation
-            # and onboarding. Rejected/ambient inbound events cannot move presence.
-            self._presence.retarget(group_id_hex, message_id_hex)
-
             sender_display_name = str(event.get("sender_display_name") or "").strip()
             user_name = sender_display_name or f"Marmot {sender_account_id_hex[:12]}"
             event_account = str(event.get("account_id_hex") or "").strip() or self.account_id_hex
@@ -3458,6 +3454,12 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
                 # replying to (mirrors dispatch.ts replyToMessageIdHex = inbound id).
                 message_id=message_id_hex,
             )
+            # Activation is not authorization. Use the host's full authorization
+            # callback; absent/unknown decisions must not move an active indicator.
+            authorization_check = getattr(self, "_is_sender_authorized", None)
+            if (self._presence.enabled and authorization_check is not None
+                    and authorization_check(source.user_id, source.chat_type, source.chat_id) is True):
+                self._presence.retarget(group_id_hex, message_id_hex)
             hermes_event = MessageEvent(
                 text=str(event.get("text") or ""),
                 message_type=MessageType.TEXT,

@@ -42,6 +42,7 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
         self.server = await asyncio.start_unix_server(self.serve, path=self.socket)
         self.addAsyncCleanup(self.stop_server)
         self.adapter = self.make_adapter(True)
+        self.adapter._is_sender_authorized = lambda user, chat_type, chat: True
         self.addAsyncCleanup(self.adapter._presence.close)
         self.clock = FakeClock()
         self.adapter._presence.sleep = self.clock.sleep
@@ -299,6 +300,28 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             release.set()
             await self.adapter.disconnect()
+
+    async def test_activated_unauthorized_sender_cannot_retarget(self):
+        from unittest.mock import AsyncMock, Mock
+        await self.adapter.on_processing_start(self.event())
+        await self.flush()
+        initial_ops = self.ops()
+        self.adapter._should_run_turn = AsyncMock(return_value=True)
+        for index, decision in enumerate((False, None)):
+            check = Mock(return_value=decision)
+            self.adapter._is_sender_authorized = check
+            await self.adapter._handle_control_event(wire_event({
+                "type": "inbound_message", "account_id_hex": self.ACCOUNT,
+                "group_id_hex": self.GROUP, "message_id_hex": f"{index + 100:064x}",
+                "sender_account_id_hex": "55" * 32, "text": "activated but unauthorized",
+            }))
+            await self.adapter._inbound_queue.join()
+            await self.flush()
+            check.assert_called_once_with("55" * 32, "group", self.GROUP)
+            self.assertEqual(self.adapter._presence.groups[self.GROUP].target, self.MESSAGE)
+            self.assertEqual(self.ops(), initial_ops)
+        self.adapter._should_run_turn.assert_awaited()
+        await self.adapter.disconnect()
 
 
 if __name__ == "__main__":
