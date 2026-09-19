@@ -6609,7 +6609,7 @@ fn daemon_refuses_reset_over_socket() {
 }
 
 #[test]
-fn daemon_running_does_not_auto_forward_logout() {
+fn daemon_running_blocks_local_logout_until_ownership_is_released() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
     let account = create_local_account_id(home.path());
@@ -6642,11 +6642,24 @@ fn daemon_running_does_not_auto_forward_logout() {
     stop_daemon(&socket, &mut child);
 
     assert!(
-        logout.status.success(),
-        "implicit logout should run locally while daemon is running\n{}",
+        !logout.status.success(),
+        "implicit logout must not mutate a daemon-owned home\n{}",
         command_output_summary(&logout)
     );
-    let logout_json: Value = serde_json::from_slice(&logout.stdout).expect("logout stdout JSON");
+    assert!(String::from_utf8_lossy(&logout.stdout).contains("already in use"));
+    let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
+    assert_eq!(accounts.len(), 1);
+
+    let released_logout = logout_command
+        .output()
+        .expect("wn logout should start after daemon stops");
+    assert!(
+        released_logout.status.success(),
+        "logout should succeed after ownership is released\n{}",
+        command_output_summary(&released_logout)
+    );
+    let logout_json: Value =
+        serde_json::from_slice(&released_logout.stdout).expect("logout stdout JSON");
     assert_eq!(logout_json["result"]["logged_out"], true);
     assert_eq!(logout_json["result"]["account_id"], account);
 
