@@ -3770,6 +3770,8 @@ fn group_create_includes_agent_text_streams_by_default() {
 #[test]
 fn stream_send_and_receive_show_quic_text_content() {
     let home = tempfile::tempdir().expect("tempdir");
+    // Raw QUIC transport never opens account storage, even in an owned home.
+    let _lease = marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
     let bind = free_udp_addr();
     let mut receiver = wn(home.path());
     receiver
@@ -3907,17 +3909,18 @@ fn stream_send_rejects_non_public_endpoints_without_insecure_local() {
 #[test]
 fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     let home = tempfile::tempdir().expect("tempdir");
+    let bob_home = tempfile::tempdir().expect("tempdir");
     let broker = spawn_quic_broker();
 
     let alice = create_account(home.path());
-    let bob = create_account(home.path());
-    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let bob = create_account(bob_home.path());
+    run_json(bob_home.path(), &["--account", &bob, "keys", "publish"]);
     let created_group = run_json(
         home.path(),
         &["--account", &alice, "group", "create", "agent", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    run_json(bob_home.path(), &["--account", &bob, "sync"]);
 
     let stream_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
@@ -3940,7 +3943,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         .expect("start message id");
 
     let bob_start_message = wait_until_projected_agent_stream_message(
-        home.path(),
+        bob_home.path(),
         test_relay_url(),
         &bob,
         group_id,
@@ -3961,7 +3964,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         serde_json::json!([broker_candidate])
     );
 
-    let mut watcher = wn(home.path());
+    let mut watcher = wn(bob_home.path());
     watcher
         .args([
             "--account",
@@ -4046,7 +4049,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
 
     let bob_final_message = wait_until_projected_agent_stream_message(
-        home.path(),
+        bob_home.path(),
         test_relay_url(),
         &bob,
         group_id,
@@ -4060,7 +4063,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
 
     let verified = run_json(
-        home.path(),
+        bob_home.path(),
         &[
             "--account",
             &bob,

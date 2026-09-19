@@ -92,7 +92,8 @@ binary timestamps do not prove which revisions opened the home on September 18.
 Direct CLI execution now takes the root lease before opening app storage,
 including fallback after an abandoned implicit daemon socket. Daemon startup
 acquires ownership before removing socket/PID artifacts. Socket clients use
-the daemon's ownership. Internal daemon helpers remain within that process's
+the daemon's ownership. Raw QUIC receive and unanchored send commands do not
+open account storage and do not acquire a root lease. Internal daemon helpers remain within that process's
 lease; this patch does not claim to redesign all in-process runtime scheduling.
 
 Use one owning runtime per root. With `wnd` as owner, CLI clients use its
