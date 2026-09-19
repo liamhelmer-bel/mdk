@@ -292,6 +292,12 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     }
 
+    // Socket clients use the daemon's ownership. Direct execution, including
+    // fallback after a stale socket, must not bypass another host's root lease.
+    let _root_lease = match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+        Ok(lease) => lease,
+        Err(error) => return command_output_result(cli.json, Err(error.into())),
+    };
     run_cli_local(cli, import_nsec).await
 }
 

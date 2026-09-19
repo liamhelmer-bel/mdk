@@ -457,6 +457,14 @@ impl AccountDeviceSession {
         Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
+    /// Host-scheduled structural integrity check; never repairs or logs row data.
+    pub fn probe_storage_integrity(
+        &self,
+        budget: std::time::Duration,
+    ) -> SessionResult<storage_sqlite::IntegrityProbe> {
+        Ok(self.storage.probe_integrity(budget)?)
+    }
+
     pub async fn fresh_key_package(&mut self) -> Result<KeyPackage, EngineError> {
         tracing::debug!(
             target: TRACE_TARGET,

@@ -158,6 +158,10 @@ async fn run_server(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error + 
         .or_else(|| discovery_relays.first().cloned())
         .or_else(|| default_account_relays.first().cloned())
         .ok_or(crate::WnError::MissingRelay)?;
+    // Hold ownership for the entire daemon, including local-command helpers
+    // that intentionally share its root without constructing another lease.
+    // Acquire before touching socket/pid artifacts belonging to another host.
+    let _root_lease = marmot_app::MarmotRootRuntimeLease::try_acquire(&home)?;
     let _socket_parent_guard = socket
         .parent()
         .map(|parent| prepare_socket_dir(parent, &home))
