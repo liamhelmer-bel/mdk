@@ -6569,6 +6569,72 @@ fn daemon_socket_path_is_private() {
 }
 
 #[test]
+#[cfg(unix)]
+fn tui_rejects_daemon_owned_home_and_reaches_terminal_after_release() {
+    use std::os::unix::process::CommandExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .args(["--secret-store", "file"])
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let blocked = wn(home.path())
+        .env_remove("WN_SOCKET")
+        .arg("tui")
+        .output()
+        .expect("TUI should start");
+    // Stop the disposable daemon before assertions so a failure cannot leak it.
+    stop_daemon(&socket, &mut child);
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout)
+        .expect("owned-home rejection must use the CLI JSON error contract");
+    assert_eq!(blocked["ok"], false);
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already in use")
+    );
+
+    let mut command = wn(home.path());
+    command
+        .env_remove("WN_SOCKET")
+        .arg("tui")
+        .stdin(Stdio::null());
+    // SAFETY: setsid is async-signal-safe; the child needs no controlling
+    // terminal so this test deterministically stops at terminal initialization.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let released = command.output().expect("headless TUI should start");
+    assert!(!released.status.success());
+    assert!(
+        String::from_utf8_lossy(&released.stderr).contains("failed to initialize terminal"),
+        "{}",
+        command_output_summary(&released)
+    );
+    assert!(!String::from_utf8_lossy(&released.stdout).contains("already in use"));
+    assert!(marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).is_ok());
+}
+
+#[test]
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");

@@ -9,6 +9,13 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `wn tui` rejects startup when another runtime already owns its home, using
+  the same ownership error as direct CLI commands. The startup lease is released
+  before entering the subprocess-based UI; child commands retain their own
+  runtime ownership checks.
+
 ## [0.10.3] - 2026-09-19
 
 Update generated bindings, native libraries, and C headers together for the changed prepared-row layout. Storage remains at migration 86. See [release notes](../../docs/release/0.10.3.md) and the [client upgrade guide](../../docs/integration/0.10.3.md).
