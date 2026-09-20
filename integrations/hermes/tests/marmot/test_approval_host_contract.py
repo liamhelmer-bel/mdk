@@ -155,6 +155,27 @@ class ApprovalHostContractTests(unittest.IsolatedAsyncioTestCase):
         await self.typed("deny")
         self.assertEqual((await task)["choice"], "deny")
 
+    async def test_flag_off_preserves_standard_send_and_metadata(self):
+        from unittest.mock import AsyncMock
+        self.adapter.approval_reactions = False
+        metadata = {"thread_id": "approval-thread", "type": "preview"}
+        result = self.module.SendResult(success=True, message_id="standard-send")
+        self.adapter.send = AsyncMock(return_value=result)
+        actual = await self.adapter.send_exec_approval(
+            self.group, command="echo disabled", session_key=self.session,
+            description="disabled request", metadata=metadata,
+            allow_permanent=False, smart_denied=True,
+        )
+        expected = self.host._format_exec_approval_fallback(
+            "echo disabled", "disabled request", "/",
+            allow_permanent=False, smart_denied=True,
+        )
+        self.adapter.send.assert_awaited_once_with(self.group, expected, metadata=metadata)
+        self.assertIs(actual, result)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.adapter._approval_prompt_messages, {})
+        self.assertEqual(self.adapter._approval_prompt_bindings, {})
+
     async def test_parallel_notification_has_no_reaction_binding(self):
         first, target = await self.request("echo first")
         second, parallel_target = await self.request("echo second")
