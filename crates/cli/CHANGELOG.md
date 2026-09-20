@@ -35,6 +35,11 @@ versioning through the workspace version in the root `Cargo.toml`.
 
 ### Fixed
 
+- `wn tui` rejects startup when another runtime already owns its home, using
+  the same ownership error as direct CLI commands. The startup lease is released
+  before entering the subprocess-based UI; child commands retain their own
+  runtime ownership checks.
+
 - MarmotKit release-profile measurements now fail closed when `create_group` benchmarks error or
   omit fresh Criterion estimates, including when stale results are already on disk. The Apple
   archive helper classifies little-endian Mach-O magic correctly so embedded `__LLVM` / `__bitcode`

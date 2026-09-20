@@ -215,6 +215,15 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
     }
 
     if matches!(cli.command, Command::Tui { .. }) {
+        let home = resolve_home(cli.home.clone());
+        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            // The TUI is a subprocess shell, not a runtime owner. Keeping this
+            // startup lease would block its own wn/wnd children. Each child
+            // still acquires ownership before opening a local runtime; this
+            // check does not reserve the home for the lifetime of the UI.
+            Ok(lease) => drop(lease),
+            Err(error) => return command_output_result(cli.json, Err(error.into())),
+        }
         return tui::run_tui(cli).await;
     }
 
