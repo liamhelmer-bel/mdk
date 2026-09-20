@@ -270,7 +270,8 @@ Streaming text also switches to thinking when no tool is active.
 While a tool runs, the construction emoji advances after 120, 240, 480, then
 600 seconds, remaining capped at 600 seconds. Every new tool start resets the
 cycle and timer. Inbound messages retarget the active indicator only after queue admission,
-activation, and onboarding checks; successful
+activation, onboarding, and an explicit allow from the host's full sender-authorization
+callback. Missing or unknown authorization leaves the indicator unchanged; successful
 completion marks the original reply anchor with a checkmark. Failed turns get
 a cross, superseded turns get an arrow, and cancellation removes the temporary
 indicator. Terminal reactions are preserved.
