@@ -15,6 +15,9 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
+mod database;
+#[cfg(test)]
+mod database_tests;
 #[cfg(unix)]
 mod publication;
 #[cfg(unix)]
@@ -843,12 +846,21 @@ pub fn tighten_existing_private_file(path: &Path) -> io::Result<()> {
 /// onto the `-wal`/`-shm`/journal sidecars it creates) and tighten any
 /// sidecars left behind by earlier permissive builds — SQLite does not
 /// rewrite pre-existing sidecar modes when the main file's mode changes.
+///
+/// Unlike the general file helpers, this never opens and closes an existing
+/// database inode for I/O: that would release SQLite's process-wide POSIX locks.
+/// New files are closed before publication. The parent directory must be owned
+/// by the caller; Android publishers must all use this helper.
 pub fn ensure_private_db_files(path: &Path) -> io::Result<()> {
-    ensure_private_file(path)?;
+    database::prepare(path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
-        tighten_existing_private_file(Path::new(&sidecar))?;
+        match database::tighten(Path::new(&sidecar)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

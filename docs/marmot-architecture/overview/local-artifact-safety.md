@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-19
+updated: 2026-09-20
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -35,13 +35,38 @@ mdk#357, mdk#367, mdk#396).
 ## The helpers
 
 `crates/fs-private` owns the shared implementations: `write_private`, `open_private_append`, `create_new_private`,
-`ensure_private_file`, `tighten_existing_private_file`, `create_dir_all_private`, `set_private_file_mode`,
+`ensure_private_file`, `ensure_private_db_files`, `tighten_existing_private_file`, `create_dir_all_private`, `set_private_file_mode`,
 `parse_octal_mode`, `bind_unix_listener_private`, and `rename_noreplace_with_lock`.
 
 **Coverage rule:** new code that creates a local file, socket, or database calls these helpers (or proves equivalent
 restrictive-by-construction posture with an on-disk mode test) instead of re-deriving umask/chmod/PRAGMA ordering.
 `crates/marmot-account/src/io.rs` (`write_file_atomically` with `FileMode::Private`) is a compliant-equivalent
 implementation that predates the shared crate.
+
+## Preserving SQLite locks during permission hardening
+
+Database openers use `ensure_private_db_files`, never the general file-tightening
+helpers. Closing an unrelated I/O descriptor for the main database or a sidecar
+can release **all of this process's POSIX locks on that inode**, including locks
+held by independently constructed SQLite connections. Serializing permission
+passes alone does not protect those connection-lifetime locks.
+
+On Linux and Android, the database helper pins regular files with `O_PATH` and
+changes mode through `/proc/self/fd` without opening them for I/O. It rejects
+symlinks and fails closed if procfs is unavailable; it never falls back to chmod
+of the original path. Other Unix platforms use native no-follow `fchmodat` without
+opening the inode. Callers must own the parent directory in either case.
+New databases are staged at 0600 and **closed before publication** so a concurrent
+SQLite opener cannot acquire locks before the creator closes its descriptor.
+Publication uses a no-replace hard link, or the existing cooperative publication
+lock and rename on Android. All Android database creators must use this helper.
+
+Encrypted account, shared, projection, and directory-cache openers share this
+path. Subprocess regressions cover encrypted WAL and rollback-journal exclusion,
+independent storage handles, and main/WAL/SHM/journal permission passes. The
+Linux implementation is exercised locally; native mobile/macOS validation remains
+part of platform CI. Root-runtime ownership is a separate protection, and this
+lock-loss regression does not establish the cause of historical corruption.
 
 ## Initializing encrypted account databases
 
