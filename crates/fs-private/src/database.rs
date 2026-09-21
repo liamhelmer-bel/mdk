@@ -32,10 +32,10 @@ pub(super) fn prepare(path: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     }
     // Android's successful rename already consumed staging.
-    if let Err(error) = cleanup {
-        if error.kind() != io::ErrorKind::NotFound {
-            return Err(error);
-        }
+    if let Err(error) = cleanup
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(error);
     }
     tighten(path)
 }
