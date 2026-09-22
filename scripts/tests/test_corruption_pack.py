@@ -1,3 +1,5 @@
+import hashlib
+import subprocess
 import importlib.util
 import json
 import os
@@ -31,6 +33,29 @@ class CorruptionPackTests(unittest.TestCase):
                 self.assertTrue(all(m.mode == 0o600 for m in archive))
             with self.assertRaises(FileExistsError):
                 pack.pack(args)
+
+            # Exercise the real CLI's offline opt-in boundary, not just pack().
+            snapshot = root / "offline.sqlite"
+            snapshot.write_bytes(b"synthetic encrypted snapshot bytes")
+            included = root / "with-database.tar.gz"
+            command = [sys.executable, str(Path(pack.__file__)), "--output", str(included),
+                       "--database-snapshot", str(snapshot), "--wn-agent", "/missing/wn-agent"]
+            denied = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertFalse(included.exists())
+            accepted = subprocess.run(command + ["--confirm-offline-snapshot"],
+                                      capture_output=True, text=True)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            with tarfile.open(included) as archive:
+                manifest = json.load(archive.extractfile("manifest.json"))
+                self.assertTrue(manifest["contains_database"])
+                self.assertEqual(manifest["classification"], "PRIVATE_REVIEW_REQUIRED")
+                artifact = manifest["artifacts"][0]
+                data = archive.extractfile(artifact["name"]).read()
+                self.assertEqual(data, snapshot.read_bytes())
+                self.assertEqual(hashlib.sha256(data).hexdigest(), artifact["sha256"])
+                self.assertFalse(manifest["artifacts"][1]["status"]["available"])
+            self.assertEqual(included.stat().st_mode & 0o777, 0o600)
 
     def test_symlink_and_nonregular_inputs_rejected(self):
         with tempfile.TemporaryDirectory() as root:

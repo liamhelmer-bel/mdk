@@ -27,5 +27,51 @@ The companion instrumentation delta captures bounded local metadata on storage
 failures, and the evidence-pack tool hashes and packages explicitly supplied
 reports with clear coverage gaps. PR #1937 remains the periodic probe owner.
 The resulting archive is private by default; review is required before any
-public attachment. Validation results and the final delta commit should be
-added to this draft once the implementation has passed its checks.
+public attachment. The instrumentation WIP is signed commit `7ab46023`, based on `28db7b3b`.
+It has not been deployed; deployment is handled by manager.
+
+## Reproduction and validation
+
+The historical incident is not deterministically reproduced. The instrumentation
+regressions instead create an encrypted fixture, damage an encrypted page after
+closing the connection, reopen it with the fixture key and verify private
+forensic publication. Separate regressions cover wrong-key classification and
+preservation of SQLite's reserved POSIX lock against another process.
+
+```sh
+cargo test -p storage-sqlite forensics::tests --locked
+python3 -m unittest discover -s scripts/tests -p test_corruption_pack.py
+just --tempdir /tmp fast-ci
+```
+
+Worker evidence records five forensic regressions passing and fast-ci passing
+against the WIP source. The pack suite has four test cases, including real CLI
+rejection without offline-snapshot confirmation and archive hash verification
+after explicit opt-in. The full storage suite remains pending; this draft does
+not claim complete workspace test parity.
+
+## Evidence available and missing
+
+The private pack format records SHA-256 hashes, supplied-report coverage and
+version-command failures. Staged pack validation used synthetic reports and the
+installed binary's version, not the incident database. No incident archive is
+attached or represented as public-safe. The retained incident snapshots and
+journal require private review before sharing.
+
+Unavailable historical evidence includes a demonstrated consistent pre-failure
+snapshot, exact writer overlap at the failure, and contemporaneous host disk
+error counters. The new recorder cannot recover those facts retroactively.
+PR #1937's probe must be integrated with the forensic hook before periodic
+structural failures produce the new record; no second scheduler is introduced.
+
+## Requested maintainer guidance
+
+Can maintainers identify additional SQLCipher-safe metadata that would help
+distinguish page damage, wrong-key/key-lifecycle problems and inconsistent
+snapshot artifacts without reopening the live database or logging private
+values? Is there a supported connection-local diagnostic callback for the
+failing page number that avoids global logging of SQLCipher error text?
+
+Please advise on a private channel for any encrypted snapshot or journal
+exchange. This report does not attribute the historical incident to a specific
+change without further evidence.

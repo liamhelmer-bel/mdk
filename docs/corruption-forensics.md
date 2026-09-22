@@ -17,6 +17,8 @@ result and call `connection.record_integrity_failure()` when it is
 reported as diagnostic rows as well as native SQLite errors. This integration
 is intentionally not applied to this branch, which lacks PR #1937. Periodic
 structural detection remains dependent on that PR and this small wiring change.
+The task evidence bundle includes `pr1937-forensic-wiring.patch` against the
+surveyed head; manager integration must apply and validate it with both changes.
 
 ## Local recorder
 
@@ -87,3 +89,14 @@ Never include keys. Review salt, identifiers and all reports before sharing.
 Deployment is handled by manager with the PR #1937 and SQLite lock-fix cohort.
 The upstream issue text is drafted separately; private artifacts require review
 before attachments are selected.
+
+## Validation scope
+
+The encrypted forensic regressions cover damaged-page capture, wrong-key
+classification, rate limiting, private publication, bounded history and POSIX
+lock preservation. Pack tests exercise the actual CLI's offline opt-in boundary,
+verify included snapshot bytes against the manifest SHA-256, and reject input
+symlinks/FIFOs and oversized or failed inputs. Staged reports are synthetic;
+passing these checks does not validate an incident snapshot or complete the
+PR #1937 integration. See the task evidence for exact commands and full-suite
+completion status.
