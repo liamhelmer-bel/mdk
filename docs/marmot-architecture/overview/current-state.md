@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-19
+updated: 2026-09-22
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -18,6 +18,12 @@ status: overview
 > explicit group evolution.
 
 # Current State — Implementations & Spec
+
+Loaded account workers run a privacy-safe structural integrity probe on their
+maintenance path, with a 120-second cadence and 250-ms SQLite VM budget.
+Corrupt outcomes trigger bounded private forensic capture; incomplete outcomes
+report unknown health. See [corruption evidence capture](../../corruption-forensics.md)
+for timing limits, PR #1937 reconciliation and private evidence-pack handling.
 
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.

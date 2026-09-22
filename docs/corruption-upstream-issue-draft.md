@@ -25,7 +25,8 @@ are incomplete. Current binary hashes cannot reconstruct historical deployment.
 
 The companion instrumentation delta captures bounded local metadata on storage
 failures, and the evidence-pack tool hashes and packages explicitly supplied
-reports with clear coverage gaps. PR #1937 remains the periodic probe owner.
+reports with clear coverage gaps. The probe subset from PR #1937 is reused with the forensic hook; integration
+retains one scheduler.
 The resulting archive is private by default; review is required before any
 public attachment. The instrumentation WIP is signed commit `7ab46023`, based on `28db7b3b`.
 It has not been deployed; deployment is handled by manager.
@@ -61,8 +62,9 @@ journal require private review before sharing.
 Unavailable historical evidence includes a demonstrated consistent pre-failure
 snapshot, exact writer overlap at the failure, and contemporaneous host disk
 error counters. The new recorder cannot recover those facts retroactively.
-PR #1937's probe must be integrated with the forensic hook before periodic
-structural failures produce the new record; no second scheduler is introduced.
+The independent probe delta reuses PR #1937's implementation and wires structural
+failures to forensic capture. Reconciliation retains one scheduler; validation
+and deployment of the combined branch remain separate from this draft.
 
 ## Requested maintainer guidance
 

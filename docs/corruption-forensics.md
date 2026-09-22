@@ -1,24 +1,35 @@
 # Corruption evidence capture
 
-This delta is based on `28db7b3b`. It does not duplicate PR #1937 or change its
-root-lease policy. The fetched origin corruption branch was reviewed at
+This delta retains base `28db7b3b` and does not import PR #1937's root-lease
+changes. The fetched corruption branch was reviewed at
 `ab72e9e5e30a6b51a0b1af665ba6ee9a8cffe450`.
 
 ## Reuse and integration
 
-PR #1937 owns `SqliteAccountStorage::probe_integrity` and the loaded-account
-worker's 120-second scheduler with a 250-ms SQLite VM budget. Its health states
-are healthy, corrupt and incomplete. Reuse that implementation; do not install
-a second timer. A VM budget does not preempt filesystem I/O or connection waits.
+Under the manager's independent-delta ruling, this branch carries the probe
+subset from PR #1937 commit `5d48c7a1a550cb0515b6db23c3bf668bd0b44196`:
+`storage-sqlite/src/integrity.rs`, its export and rusqlite hooks feature, the
+`AccountDeviceSession::probe_storage_integrity` bridge, and the account worker's
+`storage_integrity::Schedule`. The scheduler runs on the existing maintenance
+path after readiness, initially when maintenance runs and then every 120 seconds,
+with a 250-ms SQLite VM budget. Connection waits, synchronous filesystem work and
+worker scheduling are not preemptible, so this is not a hard wall-clock SLA.
+Health output distinguishes healthy, corrupt and incomplete using fixed fields.
 
-After integrating that PR, change its `probe_integrity` wrapper to retain the
-result and call `connection.record_integrity_failure()` when it is
-`IntegrityProbe::Corrupt`, before returning it. This captures structural failures
-reported as diagnostic rows as well as native SQLite errors. This integration
-is intentionally not applied to this branch, which lacks PR #1937. Periodic
-structural detection remains dependent on that PR and this small wiring change.
-The task evidence bundle includes `pr1937-forensic-wiring.patch` against the
-surveyed head; manager integration must apply and validate it with both changes.
+The delta over that probe is in the public storage wrapper: retain the outcome,
+call `connection.record_integrity_failure()` for `IntegrityProbe::Corrupt`, then
+return the outcome. This captures structural failures returned as diagnostic
+rows even when SQLite's native result is successful. An encrypted public-API
+regression verifies healthy/incomplete produce no artifact and a violated CHECK
+constraint produces a private record without its diagnostic row content.
+
+When PR #1937 integrates, keep exactly one module export, session bridge,
+scheduler field and maintenance tick. Identical imported probe code should
+coalesce; resolve any add/add conflict by retaining this wrapper's forensic hook
+and regression plus any newer upstream probe fixes. Do not apply the old
+`pr1937-forensic-wiring.patch` again: its change is now included here. CLI/TUI
+root ownership remains wholly in PR #1937. No second timer or new lease semantics
+are introduced. Validate the combined branch before deployment.
 
 ## Local recorder
 
