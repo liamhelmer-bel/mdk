@@ -25,11 +25,20 @@ are incomplete. Current binary hashes cannot reconstruct historical deployment.
 
 The companion instrumentation delta captures bounded local metadata on storage
 failures, and the evidence-pack tool hashes and packages explicitly supplied
-reports with clear coverage gaps. The probe subset from PR #1937 is reused with the forensic hook; integration
-retains one scheduler.
-The resulting archive is private by default; review is required before any
-public attachment. The instrumentation WIP is signed commit `7ab46023`, based on `28db7b3b`.
-It has not been deployed; deployment is handled by manager.
+reports with clear coverage gaps. The probe subset from PR #1937 is reused with
+the forensic hook; integration retains one scheduler. The resulting archive is
+private by default; review is required before any public attachment.
+
+Implementation provenance on base `28db7b3b`:
+
+- `7ab46023`: storage recorder, pack script and initial issue draft.
+- `a983420d`: stronger pack tests and documentation.
+- `4f8a3526`: independent probe wiring, session bridge and maintenance scheduler.
+
+All three commits are signed. No deployment evidence is asserted here;
+deployment is handled by manager. The probe checks loaded accounts through the
+existing maintenance loop at a 120-second cadence with a 250-ms SQLite VM
+budget. Worker delays and filesystem I/O can exceed that budget.
 
 ## Reproduction and validation
 
@@ -41,15 +50,33 @@ preservation of SQLite's reserved POSIX lock against another process.
 
 ```sh
 cargo test -p storage-sqlite forensics::tests --locked
+cargo test -p storage-sqlite integrity::tests --locked
+cargo test -p cgka-session --locked --features test-policy-overrides
 python3 -m unittest discover -s scripts/tests -p test_corruption_pack.py
 just --tempdir /tmp fast-ci
 ```
 
-Worker evidence records five forensic regressions passing and fast-ci passing
-against the WIP source. The pack suite has four test cases, including real CLI
-rejection without offline-snapshot confirmation and archive hash verification
-after explicit opt-in. The full storage suite remains pending; this draft does
-not claim complete workspace test parity.
+Recorded checks: five forensic regressions, four integrity regressions, four
+pack test cases, 22 session tests with policy overrides, and fast-ci pass. The
+public probe regression checks an encrypted database: healthy/incomplete
+outcomes produce no artifact, while a structural constraint violation produces
+a private forensic record without the diagnostic row content. Pack tests cover
+real CLI rejection without offline-snapshot confirmation and byte/hash
+verification after explicit opt-in.
+
+The default-feature session run failed two `nostr_stack` tests:
+`duplicate_group_relay_delivery_is_idempotent_at_session_boundary` and
+`invite_group_evolution_publishes_commit_and_welcome_through_stack`. Both request
+non-default convergence settings that the pinned production policy rejects;
+the full session suite passes with `test-policy-overrides`. The failed run is
+retained in the evidence rather than counted as a pass.
+
+The full storage run completed with 778 unit tests and two integration tests
+passing, seven ignored and zero failures. That run used the pre-probe source
+(the implementation committed as `7ab46023`); the four integrity regressions,
+22 session tests and fast-ci cover the added probe delta at `4f8a3526`. This is
+incremental validation, not a claim of full workspace test parity or a complete
+storage-suite rerun against the probe commit.
 
 ## Evidence available and missing
 
