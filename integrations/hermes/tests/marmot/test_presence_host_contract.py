@@ -15,7 +15,7 @@ class PresenceHostContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_host_authorization_gates_active_turn_retarget(self):
         from unittest.mock import AsyncMock, patch
         import gateway.run as host
-        from gateway.platforms.base import BasePlatformAdapter
+        BasePlatformAdapter = host.BasePlatformAdapter
         from enum import Enum
         platform = Enum("PluginPlatform", {"MARMOT": "marmot"}).MARMOT
         runner = object.__new__(host.GatewayRunner)
@@ -36,12 +36,13 @@ class PresenceHostContractTests(unittest.IsolatedAsyncioTestCase):
         group, original, allowed = "22" * 16, "33" * 32, "44" * 32
         operations = []
         adapter._presence._enqueue = lambda *args: operations.append(args)
-        await adapter.on_processing_start(module.MessageEvent(
-            text="active", message_id=original, source=types.SimpleNamespace(chat_id=group)))
-        before = len(operations)
         with patch.dict(os.environ, {"GATEWAY_ALLOWED_USERS": allowed,
                 "GATEWAY_ALLOW_ALL_USERS": "false", "MARMOT_ALLOWED_USERS": "",
                 "MARMOT_ALLOW_ALL_USERS": "false"}), patch.dict(sys.modules, {"gateway.run": host}):
+            await adapter.on_processing_start(module.MessageEvent(
+                text="active", message_id=original,
+                source=types.SimpleNamespace(chat_id=group, user_id=allowed, chat_type="group")))
+            before = len(operations)
             for sender, target in [("55" * 32, "66" * 32), (allowed, "77" * 32)]:
                 await adapter._dispatch_inbound_message({
                     "group_id_hex": group, "message_id_hex": target,
@@ -54,6 +55,70 @@ class PresenceHostContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(adapter._presence.groups[group].target, target)
                     self.assertGreater(len(operations), before)
 
+    async def test_real_background_lifecycle_does_not_start_denied_presence(self):
+        from unittest.mock import AsyncMock, patch
+        from enum import Enum
+        import gateway.run as host
+        base = types.SimpleNamespace(BasePlatformAdapter=host.BasePlatformAdapter,
+                                     MessageEvent=host.MessageEvent)
+        PlatformConfig = host.PlatformConfig
+        platform = Enum("PluginPlatform", {"MARMOT": "marmot"}).MARMOT
+        # Preserve real host modules while the transport fixture loads its stubs.
+        real_modules = {name: value for name, value in sys.modules.items()
+                        if name == "gateway" or name.startswith("gateway.")}
+        module = load_adapter_module()
+        fixture = module.MarmotPlatformAdapter(
+            sys.modules["gateway.config"].PlatformConfig(extra={
+                "account_id_hex": "11" * 32, "presence_reactions": True,
+                "approval_reactions": True,
+            }), client=_DeliveryRoutingFakeClient())
+        self.addAsyncCleanup(fixture.disconnect)
+        # Only transport is substituted: handle_message, background task and
+        # completion classification are the pinned BasePlatformAdapter methods.
+        class LifecycleAdapter(base.BasePlatformAdapter):
+            connect = AsyncMock()
+            disconnect = AsyncMock()
+            send = AsyncMock()
+            get_chat_info = AsyncMock()
+
+        adapter = LifecycleAdapter(PlatformConfig(extra={}, typing_indicator=False), platform)
+        adapter.on_processing_start = fixture.on_processing_start
+        adapter.on_processing_complete = fixture.on_processing_complete
+        fixture._is_sender_authorized = adapter._is_sender_authorized
+        runner = object.__new__(host.GatewayRunner)
+        runner.config = types.SimpleNamespace(multiplex_profiles=False)
+        runner.adapters = {platform: adapter}
+        runner._pairing_store_for = lambda source: None
+        runner._scale_to_zero_note_real_inbound = lambda: None
+        runner.session_store = None
+        adapter.set_authorization_check(runner._make_adapter_auth_check(platform))
+        adapter._message_handler = AsyncMock(wraps=runner._handle_message)
+        operations = []
+        fixture._presence._enqueue = lambda *args: operations.append(args)
+        allowed, group = "44" * 32, "22" * 16
+        with patch.dict(sys.modules, real_modules), patch.dict(os.environ, {
+                "GATEWAY_ALLOWED_USERS": allowed, "GATEWAY_ALLOW_ALL_USERS": "false",
+                "MARMOT_ALLOWED_USERS": "", "MARMOT_ALLOW_ALL_USERS": "false"}):
+            for existing, denied_sender in ((False, "55" * 32), (False, None),
+                                             (True, "55" * 32), (True, None)):
+                if existing:
+                    active = base.MessageEvent(text="active", message_id="33" * 32,
+                        source=adapter.build_source(chat_id=group, user_id=allowed, chat_type="group"))
+                    await fixture.on_processing_start(active)
+                before = list(operations)
+                rejected = base.MessageEvent(text="activated", message_id="66" * 32,
+                    source=adapter.build_source(chat_id=group, user_id=denied_sender, chat_type="group"))
+                await adapter.handle_message(rejected)
+                tasks = list(adapter._session_tasks.values())
+                self.assertTrue(tasks, "real handle_message must spawn the host lifecycle")
+                await asyncio.wait_for(asyncio.gather(*tasks), 5)
+                adapter._message_handler.assert_awaited_with(rejected)
+                self.assertEqual(operations, before)
+                if existing:
+                    self.assertIs(fixture._presence.groups[group].owner, active)
+                else:
+                    self.assertEqual(fixture._presence.groups, {})
+
     async def test_late_host_tool_callback_keeps_originating_turn(self):
         import gateway.run as host
         module = load_adapter_module()
@@ -63,9 +128,10 @@ class PresenceHostContractTests(unittest.IsolatedAsyncioTestCase):
             }), client=_DeliveryRoutingFakeClient(),
         )
         self.addAsyncCleanup(adapter.disconnect)
+        adapter._is_sender_authorized = lambda user, chat_type, chat: True
         group = "22" * 16
         old = module.MessageEvent(text="old", message_id="33" * 32,
-                                  source=types.SimpleNamespace(chat_id=group))
+                                  source=types.SimpleNamespace(chat_id=group, user_id="44" * 32, chat_type="group"))
         new = module.MessageEvent(text="new", message_id="44" * 32, source=old.source)
         # No transport assertions here: existing socket tests cover reaction IO.
         adapter._presence._enqueue = lambda *args: None

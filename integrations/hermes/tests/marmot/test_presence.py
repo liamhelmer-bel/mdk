@@ -301,6 +301,36 @@ class PresenceTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await self.adapter.disconnect()
 
+    async def test_start_requires_explicit_authorization_before_ownership(self):
+        from unittest.mock import Mock
+        original_owner = object()
+        token = self.module._PRESENCE_OWNER.set(original_owner)
+        self.addCleanup(self.module._PRESENCE_OWNER.reset, token)
+        for decision in (False, None, 1, "true"):
+            with self.subTest(decision=decision):
+                self.adapter._is_sender_authorized = Mock(return_value=decision)
+                event = self.event()
+                await self.adapter.on_processing_start(event)
+                await self.adapter.on_processing_complete(event, "success")
+                await self.flush()
+                self.assertEqual(self.ops(), [])
+                self.assertEqual(self.adapter._presence.groups, {})
+                self.assertIs(self.module._PRESENCE_OWNER.get(), original_owner)
+        self.adapter._is_sender_authorized = lambda *args: True
+        active = self.event()
+        await self.adapter.on_processing_start(active)
+        await self.flush()
+        before = self.ops()
+        for decision in (False, None):
+            self.adapter._is_sender_authorized = lambda *args: decision
+            rejected = self.event(message="66" * 32)
+            await self.adapter.on_processing_start(rejected)
+            await self.adapter.on_processing_complete(rejected, "success")
+            await self.flush()
+            self.assertIs(self.module._PRESENCE_OWNER.get(), active)
+            self.assertIs(self.adapter._presence.groups[self.GROUP].owner, active)
+            self.assertEqual(self.ops(), before)
+
     async def test_activated_unauthorized_sender_cannot_retarget(self):
         from unittest.mock import AsyncMock, Mock
         await self.adapter.on_processing_start(self.event())

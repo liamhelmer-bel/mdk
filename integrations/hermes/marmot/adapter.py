@@ -2121,6 +2121,15 @@ class MarmotPlatformAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         self._capture_loop()
+        # The host invokes this hook before its message-handler authorization.
+        # Leave dispatch to the host, but require explicit authorization before
+        # creating or replacing externally visible presence (and its owner).
+        authorization_check = getattr(self, "_is_sender_authorized", None)
+        if not self._presence.enabled or authorization_check is None:
+            return
+        source = event.source
+        if authorization_check(source.user_id, source.chat_type, source.chat_id) is not True:
+            return
         _PRESENCE_OWNER.set(event)
         self._presence.start(event.source.chat_id, event.message_id, event)
 
