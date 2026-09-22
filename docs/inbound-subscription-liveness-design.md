@@ -261,3 +261,27 @@ No new protocol implementation exists to dogfood. Full connector/workspace suite
 new heartbeat acceptance tests, and deployed sink verification were not performed;
 they are not implied by these results. Research logs and hashes are retained in
 the Bead's harness evidence directory, outside the checkout.
+
+### Installed binary probe and journal transport follow-up
+
+A follow-up inspection of the retained 133-record journal sample found 117 records
+with `_TRANSPORT=stdout` and `SYSLOG_IDENTIFIER=wn-agent`, and 16 systemd journal
+records. Thus the sample positively establishes daemon stdout/stderr transport to
+journald. It does **not** establish that the subscription tracing target reaches it.
+
+The installed binary with the hash above was also run as a separate subprocess
+with a new empty temporary home, its own Unix socket, a loopback-only relay setting,
+and `RUST_LOG=agent_connector=trace`. The probe received a valid subscription ACK,
+sent a second subscription request (which exercises a warning path in the reviewed
+source), disconnected, and terminated only its own subprocess. Captured stdout
+and stderr were both empty. The binary hash was unchanged. No live daemon or
+shared account home was touched.
+
+This is negative logging evidence, not a successful lifecycle-sink test. Without
+installed source provenance it cannot prove which internal branch executed, and
+absence of a marker cannot prove the absence of every tracing subscriber. It does
+show that this exercised subscription path produced no captured log under the
+requested filter. Keep verified stdout transport and unverified subscription
+tracing as separate results. The implementation acceptance gate must supply an
+explicit positive open/close marker observed at the configured sink; merely
+setting `RUST_LOG` is not a demonstrated repair.
