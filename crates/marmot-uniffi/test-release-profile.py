@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import struct
@@ -716,20 +717,117 @@ class ReleaseProfileTests(unittest.TestCase):
             self.assertNotIn("embed-bitcode=no", row["darwin_rustflags"] or "")
         self.assertTrue((crate / extras["output"]).exists())
 
-    def test_profile_workflow_is_non_publishing(self):
+    def test_automatic_profile_workflow_only_validates_candidate_packages(self):
         text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
-        self.assertIn("persist-credentials: false", text)
-        self.assertIn("contents: read", text)
-        self.assertNotIn("pull_request_target", text)
-        self.assertNotIn("secrets.", text)
-        self.assertNotIn("softprops/action-gh-release", text)
-        self.assertNotIn("upload-to-github-release", text)
-        self.assertIn("github.event.pull_request.head.sha", text)
-        self.assertGreaterEqual(text.count("if: always()"), 4)
-        self.assertIn("--diagnostics-dir", text)
-        self.assertIn("target/release-profile-measure/logs", text)
+        self.assertIn("pull_request:", text)
+        self.assertNotIn("measure-release-profile.py", text)
+        self.assertNotIn("release-profile-measurements", text)
+        self.assertIn("./crates/marmot-uniffi/kotlin-bindings.sh generate", text)
+        for invocation in (
+            "ANDROID_ABIS=\"$PART\" ./crates/marmot-uniffi/kotlin-bindings.sh native",
+            "./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios ;;",
+            "./crates/marmot-uniffi/xcframework.sh native aarch64-apple-ios-sim ;;",
+            "./crates/marmot-uniffi/xcframework-macos.sh native ;;",
+            "./crates/marmot-uniffi/xcframework.sh assemble",
+            "./crates/marmot-uniffi/xcframework-macos.sh assemble",
+        ):
+            self.assertEqual(text.count(invocation), 1, invocation)
+
+    def test_automatic_profile_workflow_binds_same_run_inputs_to_exact_head(self):
+        text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        self.assertIn("github.event.pull_request.number || github.ref", text)
+        self.assertNotIn("group: marmotkit-profile-${{ github.event.pull_request.head.sha", text)
+        self.assertIn("github.event.pull_request.head.sha || github.sha", text)
+        self.assertIn("actions/download-artifact@", text)
+        self.assertIn("build-provenance.py verify android", text)
+        self.assertIn("build-provenance.py verify ios", text)
+        self.assertIn("build-provenance.py verify macos", text)
+        self.assertIn("GITHUB_RUN_ID: ${{ github.run_id }}", text)
+        self.assertNotIn("run-id:", text)
+        self.assertGreaterEqual(text.count("MARMOTKIT_WORKSPACE_DIR: ${{ github.workspace }}"), 2)
+
+    def test_automatic_profile_workflow_limits_cost_and_preserves_diagnostics(self):
+        text = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        trigger = text.split("permissions:", 1)[0]
+        excluded = [
+            line.strip().removeprefix("- ").strip('"').strip("'")
+            for line in trigger.splitlines()
+            if line.strip().startswith(("- \"!crates/marmot-uniffi/", "- '!crates/marmot-uniffi/"))
+        ]
+
+        def github_glob_matches(path, pattern):
+            expression = ""
+            index = 0
+            while index < len(pattern):
+                if pattern.startswith("**", index):
+                    expression += ".*"
+                    index += 2
+                elif pattern[index] == "*":
+                    expression += "[^/]*"
+                    index += 1
+                else:
+                    expression += re.escape(pattern[index])
+                    index += 1
+            return re.fullmatch(expression, path) is not None
+
+        for document in HERE.rglob("*.md"):
+            relative = document.relative_to(ROOT).as_posix()
+            self.assertTrue(
+                any(github_glob_matches(relative, pattern.removeprefix("!")) for pattern in excluded),
+                f"Markdown-only change would still trigger packaging: {relative}",
+            )
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", text)
+        self.assertGreaterEqual(text.count("error: sdkmanager not found under $sdk_root"), 1)
+        apple_build = text.split("  apple-build:", 1)[1].split("  android-build:", 1)[0]
+        self.assertIn("if: matrix.part == 'swift'", apple_build)
+        self.assertIn("rustup component add llvm-tools-preview", apple_build)
+        self.assertIn("python3 crates/marmot-uniffi/test-native-archive.py", apple_build)
+        ios_package = text.split("  ios-package:", 1)[1]
+        self.assertNotIn("test-native-archive.py", ios_package)
+
+    def test_profile_workflows_are_non_publishing_and_diagnostic_rich(self):
+        for workflow in ("bindings-profile.yml", "bindings-profile-measurement.yml"):
+            with self.subTest(workflow=workflow):
+                text = (ROOT / ".github/workflows" / workflow).read_text()
+                self.assertIn("persist-credentials: false", text)
+                self.assertIn("contents: read", text)
+                self.assertNotIn("pull_request_target", text)
+                self.assertNotIn("secrets.", text)
+                self.assertNotIn("softprops/action-gh-release", text)
+                self.assertNotIn("upload-to-github-release", text)
+                self.assertGreaterEqual(text.count("if: always()"), 2)
+                self.assertIn("xcodebuild -version", text)
+
+    def test_comparative_measurement_is_manual_and_complete(self):
+        text = (ROOT / ".github/workflows/bindings-profile-measurement.yml").read_text()
+        trigger = text.split("permissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", trigger)
+        self.assertIn("source_sha:", trigger)
+        self.assertNotIn("pull_request:", trigger)
+        self.assertNotIn("push:", trigger)
+        self.assertIn("--host --android --cpu", text)
+        self.assertIn("--apple", text)
+        self.assertGreaterEqual(text.count("--source-sha \"$SOURCE_SHA\""), 2)
+        self.assertGreaterEqual(text.count("--builder-sha \"$SOURCE_SHA\""), 2)
         self.assertIn("cpu-${variant}/criterion", text)
-        self.assertIn("xcodebuild -version", text)
+        self.assertIn("target/release-profile-measure/logs", text)
+        self.assertNotIn("Swatinem/rust-cache", text)
+
+    def test_profile_cache_writes_are_trusted_only(self):
+        automatic = (ROOT / ".github/workflows/bindings-profile.yml").read_text()
+        measurement = (ROOT / ".github/workflows/bindings-profile-measurement.yml").read_text()
+        trusted = "save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}"
+        self.assertGreaterEqual(automatic.count(trusted), 2)
+        self.assertNotIn("save-if: true", automatic)
+        self.assertNotIn("save-if: true", measurement)
+        self.assertNotIn("save-if:", measurement)
+
+    def test_measurement_policy_requires_explicit_evidence_for_policy_changes(self):
+        guidance = (HERE / "AGENTS.md").read_text()
+        self.assertIn(
+            "must dispatch and link completed comparative evidence before merge",
+            " ".join(guidance.split()),
+        )
 
     def test_measurement_stage_identifies_unsanitized_apple_archives(self):
         baseline = self.root / "baseline.a"

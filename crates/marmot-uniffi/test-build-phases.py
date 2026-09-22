@@ -5,6 +5,7 @@ These tests check phase isolation and assembly inputs; real workflow consumers
 remain the authority for generated ABI and platform compatibility.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -80,6 +81,7 @@ class BuildPhases(unittest.TestCase):
         self.crate.mkdir(parents=True)
         for folder in ["apple-privacy", "kotlin-support"]:
             shutil.copytree(TOOLS / folder, self.crate / folder)
+        (self.crate / "marmotkit-release-profile.env").write_text("fixture profile\n")
         self.bin = self.root / ".cargo/bin"
         self.bin.mkdir(parents=True)
         for tool in ["cargo", "rustup", "xcodebuild"]:
@@ -203,7 +205,7 @@ class BuildPhases(unittest.TestCase):
             self.shim(self.bin / tool)
         (self.root / "ndk/source.properties").write_text("Pkg.Revision = 27.2.12479018\n")
         self.env.update(SOURCE_SHA="a" * 40, BUILDER_SHA="b" * 40,
-            GITHUB_ENV=str(self.root / "github-env"))
+            GITHUB_ENV=str(self.root / "github-env"), GITHUB_RUN_ID="12345")
         paths = [self.root / "provenance" / (part + ".json") for part in parts]
         for part, path in zip(parts, paths):
             self.provenance("record", part, path)
@@ -211,6 +213,11 @@ class BuildPhases(unittest.TestCase):
 
     def test_android_manifest_uses_observed_build_provenance(self):
         paths = self.record_inputs(["kotlin", "arm64-v8a", "armeabi-v7a", "x86", "x86_64"])
+        recorded = json.loads(paths[0].read_text())
+        expected_profile_hash = hashlib.sha256(
+            (TOOLS / "marmotkit-release-profile.env").read_bytes()
+        ).hexdigest()
+        self.assertEqual(recorded["release_profile_sha256"], expected_profile_hash)
         self.provenance("verify", "android", *paths)
         values = dict(line.split("=", 1) for line in Path(self.env["GITHUB_ENV"]).read_text().splitlines())
         self.assertEqual(values["MARMOTKIT_BUILD_ANDROID_NDK_HOME"], str(self.root / "ndk"))
@@ -224,8 +231,9 @@ class BuildPhases(unittest.TestCase):
         self.provenance("verify", "android", *paths[:-1], success=False)
         self.provenance("verify", "android", *paths[:-1], paths[1], success=False)
         original = json.loads(paths[-1].read_text())
-        for key in ["source_sha", "builder_sha", "rustc", "cargo", "android_ndk_home",
-                    "android_ndk_version", "android_api", "part"]:
+        for key in ["source_sha", "builder_sha", "workflow_run_id",
+                    "release_profile_sha256", "feature_set", "rustc", "cargo",
+                    "android_ndk_home", "android_ndk_version", "android_api", "part"]:
             with self.subTest(key=key):
                 paths[-1].write_text(json.dumps(original | {key: "different"}))
                 self.provenance("verify", "android", *paths, success=False)
@@ -240,6 +248,17 @@ class BuildPhases(unittest.TestCase):
                 data = json.loads(paths[0].read_text())
                 paths[0].write_text(json.dumps(data | {"cargo": "different"}))
                 self.provenance("verify", platform, *paths, success=False)
+
+    def test_snapshot_verification_hashes_the_builder_profile(self):
+        workflow = (TOOLS.parents[1] / ".github/workflows/bindings.yaml").read_text()
+        verify_steps = workflow.split("      - name: Verify build provenance\n")[1:]
+        self.assertEqual(len(verify_steps), 3)
+        for step in verify_steps:
+            step = step.split("      - name:", 1)[0]
+            self.assertNotIn(
+                "MARMOTKIT_CRATE_DIR: ${{ github.workspace }}/packaged-source/crates/marmot-uniffi",
+                step,
+            )
 
     def test_master_cache_warming_rejects_untrusted_source_ancestry(self):
         # Execute the workflow's actual identity script, rather than a copy of
