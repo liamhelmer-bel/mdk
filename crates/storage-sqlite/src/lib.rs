@@ -20,6 +20,7 @@ mod chat_presentation;
 mod codec;
 mod connection;
 mod encrypted_media_secrets;
+mod forensics;
 mod message_drafts;
 mod migrations;
 mod openmls_storage;

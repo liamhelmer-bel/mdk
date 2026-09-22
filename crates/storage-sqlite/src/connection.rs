@@ -139,7 +139,25 @@ fn sqlite_error_kind(error: &rusqlite::Error) -> &'static str {
 /// that the slot is occupied, so the deref is infallible for the guard's
 /// lifetime.
 pub struct ConnectionGuard<'a> {
+    recorder: &'a crate::forensics::Recorder,
+    started: std::time::Instant,
     guard: MutexGuard<'a, Option<rusqlite::Connection>>,
+}
+
+impl ConnectionGuard<'_> {
+    /// Capture a structural integrity failure on this existing keyed connection.
+    /// The private local record contains metadata only, never SQL or row values.
+    pub fn record_integrity_failure(&self) {
+        self.recorder.integrity_failure();
+    }
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.guard.as_ref() {
+            self.recorder.finish(connection, self.started);
+        }
+    }
 }
 
 impl Deref for ConnectionGuard<'_> {
@@ -179,6 +197,7 @@ impl DerefMut for ConnectionGuard<'_> {
 /// live in one place.
 #[derive(Debug)]
 pub struct CloseableConnection {
+    recorder: crate::forensics::Recorder,
     slot: Mutex<Option<rusqlite::Connection>>,
     /// Published before [`Self::close`] waits for the connection mutex. New
     /// operations must stop being admitted as soon as closing begins; otherwise
@@ -196,6 +215,7 @@ impl CloseableConnection {
     #[must_use]
     pub fn new(connection: rusqlite::Connection, closed_detail: &'static str) -> Self {
         Self {
+            recorder: crate::forensics::Recorder::new(&connection),
             slot: Mutex::new(Some(connection)),
             closed: AtomicBool::new(false),
             closed_detail,
@@ -218,7 +238,11 @@ impl CloseableConnection {
         if self.is_closed() || guard.is_none() {
             return Err(StorageError::Closed(self.closed_detail.to_string()));
         }
-        Ok(ConnectionGuard { guard })
+        Ok(ConnectionGuard {
+            guard,
+            recorder: &self.recorder,
+            started: std::time::Instant::now(),
+        })
     }
 
     /// Whether [`Self::close`] has started. Nonblocking.
@@ -1045,10 +1069,12 @@ impl SqliteAccountStorage {
         mut connection: rusqlite::Connection,
         options: SqliteStorageOptions,
     ) -> StorageResult<Self> {
-        apply_operational_pragmas(&connection, &options)?;
+        apply_operational_pragmas(&connection, &options)
+            .inspect_err(|_| crate::forensics::Recorder::open_failure(&connection))?;
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
         let migration_started = std::time::Instant::now();
-        let migrations_applied = migrations::run_all(&mut connection)?;
+        let migrations_applied = migrations::run_all(&mut connection)
+            .inspect_err(|_| crate::forensics::Recorder::open_failure(&connection))?;
         let migration_duration = migration_started.elapsed();
         let connection = SharedConnection::new(connection);
         let openmls = SqliteOpenMlsStorage::new(connection.clone());
@@ -1127,6 +1153,7 @@ fn apply_sqlcipher_key(connection: &rusqlite::Connection, key: &SqlCipherKey) ->
         .storage()?;
     let _: i64 = connection
         .query_row_cached("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .inspect_err(|_| crate::forensics::Recorder::open_failure(connection))
         .storage()?;
     Ok(())
 }
