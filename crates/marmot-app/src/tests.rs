@@ -12312,13 +12312,25 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
                     .unwrap(),
                 crate::EpochBackfillRunOutcome::Incomplete(_)
             ));
-            let remaining = client
-                .recovery_owner
-                .test_retry_remaining(&client.app.account_storage(&client.state.label).unwrap());
-            let expected = Duration::from_secs(15 * (1 << ordinal));
+            let storage = client.app.account_storage(&client.state.label).unwrap();
+            let retry = storage.recovery_retry_state().unwrap();
+            // The earned delay is the durable reservation. Wall-clock remaining
+            // shrinks by whatever the attempt still does after that write, which
+            // exceeds a one-second window on a loaded runner.
+            let expected_ms = 15_000 * (1_u64 << u32::try_from(ordinal).unwrap());
+            assert_eq!(
+                retry.delay_ms, expected_ms,
+                "overflow attempt {ordinal} must earn {expected_ms}ms"
+            );
+            assert_eq!(
+                retry.not_before_ms.saturating_sub(retry.recorded_at_ms),
+                expected_ms,
+                "overflow attempt {ordinal} deadline must match the earned delay"
+            );
+            let remaining = client.recovery_owner.test_retry_remaining(&storage);
             assert!(
-                remaining > expected - Duration::from_secs(1) && remaining <= expected,
-                "overflow attempt {ordinal} must earn {expected:?}, got {remaining:?}"
+                !remaining.is_zero() && remaining <= Duration::from_millis(expected_ms),
+                "overflow attempt {ordinal} cooldown must still be pending, got {remaining:?}"
             );
             let subscriptions = relay.accepted_subscriptions().len();
             assert!(matches!(
