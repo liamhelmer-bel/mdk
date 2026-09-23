@@ -93,6 +93,10 @@ All methods, including less common management/diagnostic operations, are listed 
 3. Use local reads for initial UI where their contracts allow it. Start the runtime for live
    account workers, relay synchronization and acquisition. Local data and send readiness are
    distinct: render a conversation's available history while honoring its composer capabilities.
+   If one account worker fails to start, another ready account remains usable. A failed account
+   is retried on a later trigger after bounded in-memory backoff; repeated commands during the
+   delay report unavailability without reopening it. The runtime's aggregate start/reconcile
+   result still reports the partial failure.
 4. Keep synchronous storage reads off the UI thread. Async Swift/Kotlin calls may suspend;
    C methods are blocking unless documented otherwise. Host signer/secret-store callbacks may
    run concurrently on worker threads and must be thread-safe.
@@ -412,6 +416,17 @@ Build all Android ABIs:
 
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
+The two 64-bit Android links also pass `-Wl,-z,max-page-size=16384` and
+`-Wl,-z,common-page-size=16384`. The 32-bit ABIs stay on the NDK's default
+page size, and the supported ABI set is unchanged. Google Play's 16 KB check
+reads ELF `PT_LOAD` alignment; aligning the app bundle ZIP does not change
+those segments. Each published Android archive includes `android-elf.json`
+with the SHA-256, ELF class, machine, and observed load alignments of all
+four `libmarmot_uniffi.so` files. `manifest.json` keeps its existing ordered
+`contents` list and records `elf_validation: android-elf.json`. Exact-head
+candidate packages carry the same report next to their provenance manifest.
+A later release publishes the new artifact; this check does not by itself
+select a version or prove an app's Play Console result.
 
 Standard MarmotKit release builds use the workspace `[profile.release]` together with
 `marmotkit-release-profile.env`: `lto=thin`, `codegen-units=1`, `opt-level=3`,
@@ -539,7 +554,23 @@ Imported identities can use the durable preflight API instead of `login`:
    explicit `continue_onboarding_without`. Empty follow lists are valid.
 4. `propose_onboarding_recommended_relays`, `propose_onboarding_relays`,
    `propose_onboarding_profile`, and `propose_onboarding_follows` only prepare
-   a proposal. Profile fields left unset preserve their current values; an
+   a proposal. Recommended relays append missing defaults to the observed list,
+   preserving every original relay tag, including private-network, `ws://` and `wss://` onion,
+   retired, and unparseable entries. Dial policy filters connections, not published
+   declarations. Both onion schemes require a Tor transport and are excluded from direct dialing.
+   Defaults are deduplicated against raw tags, including unknown roles.
+   If every default already has a read-only or unknown role, the general-relay step
+   offers explicit editing instead of recommending an append that cannot add a write route.
+   Relay findings are advisory once a usable outbox/inbox route is
+   confirmed. Proposals require a policy-allowed write route (or inbox route);
+   reachability is checked after publication. Explicit relay selections replace
+   the list and require every selected endpoint to pass dial policy. Approval
+   requires every configured discovery source to complete; failures from additional
+   user-declared sources are tolerated only when the previous record is found.
+   This bounded check cannot rule out newer records on unreachable or unqueried sources.
+   A missing discovery result is not global proof of absence: hosts must
+   not automatically approve publication for imported identities.
+   Profile fields left unset preserve their current values; an
    explicit empty string clears a field. Display the proposed edits, then pass the returned
    snapshot revision to `approve_onboarding_repair`. For an inbox proposal use
    `read_relays` and an empty `write_relays`. `cancel_onboarding_repair` dismisses
@@ -579,13 +610,16 @@ previous recovery journal is retained as opaque evidence there. A subsequent
 explicit recovery may replace older evidence. Keep any evidence needing longer
 retention outside this latest-only workflow before acknowledging recovery.
 
-Ordinary checkpoints remain version 3, with supported version 1/2 upgrades.
+Ordinary checkpoints start at version 3, with supported version 1/2 upgrades.
 Version 3 is a semantic barrier: old version 2 code rejects approved cancellation
 and cannot safely restart it. Recovery checkpoints use version 4 because a
 version 3 reader cannot validate epoch-scoped approvals. Completed recovery
 leaves a version 4 cancellation tombstone even before a new begin, so older
-readers fail closed. Downgrading during recovery is unsupported; finish recovery
-with an epoch-aware build. Do not relabel versions or delete checkpoints to
+readers fail closed. Preparing an additive relay proposal upgrades its checkpoint
+to version 5, with or without a recovery epoch. This prevents older readers from
+resuming an approved, unsigned proposal as a destructive replacement.
+Downgrading once either format is used is unsupported; use a build that supports
+the checkpoint version. Do not relabel versions or delete checkpoints to
 force a downgrade. Restore/upgrade to a supporting build, or explicitly recover
 unsupported evidence with this API.
 
