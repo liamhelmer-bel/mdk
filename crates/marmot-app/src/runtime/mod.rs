@@ -71,6 +71,7 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_otlp_delivery;
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
@@ -5949,6 +5950,10 @@ impl AccountManager {
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
         let account = self.app.account_home().account(account_ref)?;
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let account_id = account.account_id_hex.clone();
+        let _audit_export_mutation =
+            blocking_app_task(move || Ok(audit_export.mutate_account(&account_id))).await?;
         self.ensure_worker_reaped(&account.account_id_hex).await?;
         let _teardown = AccountTeardownGuard::new(self, account.account_id_hex.clone());
         async {
@@ -6625,6 +6630,15 @@ impl AccountManager {
         path: &str,
     ) -> Result<AuditLogDeleteOutcome, AppError> {
         let (path, owner_account_id_hex) = self.app.resolve_audit_log_path(path)?;
+        let audit_export = self.app.audit_export_lifecycle.clone();
+        let fence_owner = owner_account_id_hex.clone();
+        let _audit_export_mutation = blocking_app_task(move || {
+            Ok(match fence_owner.as_deref() {
+                Some(account) => audit_export.mutate_account(account),
+                None => audit_export.mutate_all(),
+            })
+        })
+        .await?;
         if let Some(account_id_hex) = owner_account_id_hex {
             let commands = {
                 let workers = self.workers.lock().await;
@@ -6637,15 +6651,20 @@ impl AccountManager {
                 // A send error means the worker channel is closed, so its
                 // session — and thus any file handle — is gone; fall through to
                 // a direct removal, which is then safe.
-                if commands
+                let queued = commands
                     .send(AccountWorkerCommand::DeleteAuditLog {
                         path: path.clone(),
                         respond,
                     })
                     .await
-                    .is_ok()
-                    && account_worker_response(response).await?
-                {
+                    .is_ok();
+                #[cfg(test)]
+                if queued {
+                    self.app
+                        .audit_export_lifecycle
+                        .notify_delete_queued_for_test();
+                }
+                if queued && account_worker_response(response).await? {
                     // The live recorder owned this file and rotated it: old
                     // file gone, fresh file already recording.
                     return Ok(AuditLogDeleteOutcome {
