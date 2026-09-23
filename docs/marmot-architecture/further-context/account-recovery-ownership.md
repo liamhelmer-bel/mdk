@@ -345,6 +345,14 @@ explicit authorized withdrawal, never the result of unavailable coverage. No deb
 is marked satisfied to stop traffic. Test zero additional activations across
 multiple capped retry windows and reopen, followed by each permitted rearm cause.
 
+Approved #1992 amendment: cold startup may join one bounded retained-inventory
+comparison even while older coverage is parked. Its durable singleton shares the
+same owner, reservation and retry cost. Per-route servicing never completes
+coverage or acknowledges loss. The live timestamp cutoff and retained-inventory
+floor are distinct; see
+[the concrete comparison amendment](account-recovery-incremental-comparison-proposal.md)
+for mixed-result settlement, repeated-start behavior and acceptance tests.
+
 Apply that eligibility rule by cause, without changing completion predicates:
 
 - An epoch-gap attempt with no admitted input, transient failure, or a legacy EOSE
@@ -515,3 +523,14 @@ live-session guard, converting unclean close into unknown-scope debt. It would n
 additional lifecycle design and recovery after process death, including the existing
 close-before-graceful-cleanup shutdown order. Merely queueing the write behind a
 blocking worker would weaken loss durability and was not proposed as safe.
+
+### Approved exception: unresolved durable loss retention
+
+On 2026-09-23 the task owner approved retaining unresolved per-generation loss
+watermarks without a fixed disk-row cap. Qualified completion and the exact live
+acknowledgment remain the only reclamation path; the current backend cannot
+certify exhaustive history. Repeated unresolved generations can therefore grow
+this table even after automatic investigation stops. Do not evict, merge away or
+legacy-retire another generation to enforce a cap. This exception does not permit
+unbounded active snapshots, completed metadata or automatic replay. Their
+lifetimes and bounds are tracked in `../runtime-state-bounds.md`.

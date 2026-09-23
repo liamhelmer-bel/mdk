@@ -1,16 +1,20 @@
 //! Account-private recovery demand. The worker owns demand and completion;
 //! the narrow loss writer may only append monotonically increasing evidence.
+mod comparison;
+pub use comparison::{RecoveryComparison, RecoveryComparisonOutcome, RecoveryComparisonPlan};
 mod demand;
 pub use demand::{
     RecoveryCause, RecoveryDemand, RecoveryDemandTicket, RecoveryPredicate, RecoveryRequest,
 };
 mod loss;
 mod plan;
-pub use loss::{RecoveryLossCause, RecoveryLossWatermark};
+mod stall;
+pub use loss::{RecoveryLossCause, RecoveryLossSnapshot, RecoveryLossWatermark};
 pub use plan::{
     RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint, RecoveryScopeOutcome,
     RecoveryScopePlan, RecoveryScopeToken, StoredRecoveryScope,
 };
+pub use stall::QualifiedRecoveryStallSample;
 
 use crate::connection::CachedSql;
 use crate::{SqliteAccountStorage, SqliteResultExt, i64_to_u64};
@@ -29,7 +33,8 @@ pub struct RecoveryRetryState {
 
 /// Immutable revision snapshot. Positive completion also requires qualified
 /// scope/admission evidence from the account owner; this is only the CAS fence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryRevisionFence {
     pub loss_revision: u64,
     pub route_revision: u64,
@@ -516,6 +521,18 @@ impl SqliteAccountStorage {
         delay_ms: u64,
         explicit_override: bool,
     ) -> StorageResult<Option<RecoveryRetryState>> {
+        self.reserve_recovery_work(expected, None, now_ms, delay_ms, explicit_override)
+    }
+
+    /// One account reservation for coverage, bounded comparison, or both.
+    pub fn reserve_recovery_work(
+        &self,
+        expected: &RecoveryRevisionFence,
+        comparison_revision: Option<u64>,
+        now_ms: u64,
+        delay_ms: u64,
+        explicit_override: bool,
+    ) -> StorageResult<Option<RecoveryRetryState>> {
         let now = sqlite_integer(now_ms)?;
         let delay = sqlite_integer(delay_ms)?;
         let due = now.checked_add(delay).ok_or_else(|| {
@@ -530,7 +547,8 @@ impl SqliteAccountStorage {
             ).storage()?;
             // One account-device identity per database: all loss causes must
             // be imported by that account owner before any scoped reservation.
-            if unimported || !selected_fence_matches(&revision_fence(&conn)?, expected)
+            if unimported || !comparison::work_fence_matches(&revision_fence(&conn)?, expected, comparison_revision.is_some())
+                || !comparison::selection_matches(&conn, comparison_revision, explicit_override)?
                 || (!explicit_override && now_ms < state.not_before_ms)
             {
                 return Ok(None);
@@ -559,6 +577,45 @@ impl SqliteAccountStorage {
                 params![now, delay, due],
             ).storage()?;
             Ok(Some(retry_state(&conn)?))
+        })
+    }
+
+    /// The worker calls this only for newly and durably retained input inside
+    /// the grant's scope. Engine progress, duplicate delivery and SDK counters
+    /// are not admission. Reset backoff without allowing a new activation less
+    /// than the minimum delay after this progress checkpoint.
+    pub fn checkpoint_recovery_progress(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        now_ms: u64,
+        minimum_delay_ms: u64,
+    ) -> StorageResult<bool> {
+        let due = now_ms.checked_add(minimum_delay_ms).ok_or_else(|| {
+            StorageError::Serialization("recovery deadline outside supported range".into())
+        })?;
+        self.connection.with_transaction(|| {
+            let conn = self.lock()?;
+            let prior = retry_state(&conn)?;
+            if attempt_serial == 0
+                || prior.attempt_serial != attempt_serial
+                || prior.ordinal <= 1
+                || !selected_fence_matches(&revision_fence(&conn)?, expected)
+                || !plan::no_unimported_loss(&conn)?
+            {
+                return Ok(false);
+            }
+            conn.execute_cached(
+                "UPDATE account_recovery_state SET retry_ordinal=1,retry_recorded_at_ms=?1,
+                 retry_delay_ms=?2,retry_not_before_ms=?3 WHERE singleton=1",
+                params![
+                    sqlite_integer(now_ms)?,
+                    sqlite_integer(minimum_delay_ms)?,
+                    sqlite_integer(due)?
+                ],
+            )
+            .storage()?;
+            Ok(true)
         })
     }
 
@@ -609,14 +666,20 @@ impl SqliteAccountStorage {
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            let rows = conn.prepare_cached(
-                "SELECT cause, marker_token, pending_since, dropped_count
-                 FROM account_delivery_loss_evidence
-                 WHERE account_label = ?1 AND (imported_count IS NULL OR dropped_count > imported_count)
-                 ORDER BY cause, marker_token",
-            ).storage()?.query_map([label], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)))
-                .storage()?.collect::<Result<Vec<_>, _>>().storage()?;
-            for (cause, token, observed_at, dropped) in rows {
+            // Import one row at a time in this transaction. The unresolved
+            // evidence set is deliberately not disk-capped; do not mirror it
+            // into an unbounded temporary Vec on reopen.
+            let mut cursor = (-1_i64, -1_i64);
+            loop {
+                let row = conn.query_row_cached(
+                    "SELECT cause,marker_token,pending_since,dropped_count FROM account_delivery_loss_evidence
+                     WHERE account_label=?1 AND (cause,marker_token)>(?2,?3)
+                     AND (imported_count IS NULL OR dropped_count>imported_count)
+                     ORDER BY cause,marker_token LIMIT 1", params![label,cursor.0,cursor.1],
+                    |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?))
+                ).optional().storage()?;
+                let Some((cause, token, observed_at, dropped)) = row else { break; };
+                cursor = (cause, token);
                 join_loss_tx(&conn, label, cause, token, dropped, observed_at, true)?;
                 conn.execute_cached(
                     "UPDATE account_delivery_loss_evidence SET imported_count = ?3

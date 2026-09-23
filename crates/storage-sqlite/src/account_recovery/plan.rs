@@ -36,7 +36,8 @@ pub struct RecoveryEndpointCheckpoint {
 
 /// SQL columns are authoritative for route identity and historical bounds.
 /// Only endpoint policy, attempt fences and outcomes live in the versioned blob.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryScopePlan {
     pub scope_id: u64,
     pub route_kind: u8,
@@ -94,7 +95,7 @@ pub enum RecoveryEligibility {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ScopePayloadV1 {
-    required_endpoints: Vec<String>,
+    pub(super) required_endpoints: Vec<String>,
     admitted_endpoints: Vec<String>,
     checkpoints: Vec<RecoveryEndpointCheckpoint>,
     retained_known_event: bool,
@@ -377,6 +378,19 @@ impl SqliteAccountStorage {
         obligation_id: [u8; 16],
         plans: &[RecoveryScopePlan],
     ) -> StorageResult<Option<Vec<RecoveryScopeToken>>> {
+        self.install_recovery_scope_plan_inner(expected, attempt_serial, obligation_id, plans, true)
+    }
+
+    // Only comparison-debt preparation may store a goal without reserving I/O.
+    // Its zero attempt can never certify completion or authorize an executor.
+    pub(super) fn install_recovery_scope_plan_inner(
+        &self,
+        expected: &RecoveryRevisionFence,
+        attempt_serial: u64,
+        obligation_id: [u8; 16],
+        plans: &[RecoveryScopePlan],
+        reserved: bool,
+    ) -> StorageResult<Option<Vec<RecoveryScopeToken>>> {
         let Some((_, revision)) = expected
             .obligations
             .iter()
@@ -384,7 +398,8 @@ impl SqliteAccountStorage {
         else {
             return Err(invalid_scope());
         };
-        if attempt_serial == 0
+        if (reserved && attempt_serial == 0)
+            || (!reserved && attempt_serial != 0)
             || plans.is_empty()
             || plans
                 .windows(2)
@@ -408,7 +423,7 @@ impl SqliteAccountStorage {
         }
         self.connection.with_transaction(|| {
             let conn = self.lock()?;
-            if retry_state(&conn)?.attempt_serial != attempt_serial
+            if (reserved && retry_state(&conn)?.attempt_serial != attempt_serial)
                 || !selected_fence_matches(&revision_fence(&conn)?, expected)
                 || !no_unimported_loss(&conn)?
             {
@@ -1892,78 +1907,82 @@ mod tests {
 
     #[test]
     fn plane_ack_reclaims_exact_evidence_only_after_qualified_completion() {
-        let (store, fence, attempt, id) = fixture();
-        let watermarks = store
-            .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
-            .unwrap();
-        assert!(
-            !store
-                .acknowledge_recovery_loss(&fence, id, &watermarks)
-                .unwrap()
-        );
-        qualify_loss(&store, &fence, attempt, id);
-        assert!(
-            store
-                .acknowledge_recovery_loss(&fence, id, &watermarks)
-                .unwrap()
-        );
-        assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
-        assert!(
-            store
+        for use_snapshot in [false, true] {
+            let (store, fence, attempt, id) = fixture();
+            let watermarks = store
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+                .unwrap();
+            let snapshot = store
+                .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                .unwrap();
+            let acknowledge = || {
+                if use_snapshot {
+                    store.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                } else {
+                    store.acknowledge_recovery_loss(&fence, id, &watermarks)
+                }
+            };
+            assert!(!acknowledge().unwrap());
+            qualify_loss(&store, &fence, attempt, id);
+            assert!(acknowledge().unwrap());
+            assert_eq!(store.restore_unacknowledged_recovery_loss().unwrap(), 0);
+            assert!(
+                store
+                    .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(store.account_delivery_recovery("alice").unwrap().is_none());
+        }
     }
 
     #[test]
     fn failed_ack_commit_and_new_loss_preserve_the_reopen_guard() {
-        let (store, fence, attempt, id) = fixture();
-        let watermarks = store
-            .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
-            .unwrap();
-        qualify_loss(&store, &fence, attempt, id);
-        store
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER fail_ack BEFORE DELETE ON account_delivery_loss_evidence
-            BEGIN SELECT RAISE(ABORT,'injected'); END;",
-            )
-            .unwrap();
-        assert!(
-            store
-                .acknowledge_recovery_loss(&fence, id, &watermarks)
-                .is_err()
-        );
-        store
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER fail_ack")
-            .unwrap();
-        assert_eq!(
-            store
+        for use_snapshot in [false, true] {
+            let (store, fence, attempt, id) = fixture();
+            let watermarks = store
                 .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                .unwrap();
+            let snapshot = store
+                .recovery_loss_snapshot("alice", RecoveryLossCause::Queue)
+                .unwrap();
+            let acknowledge = || {
+                if use_snapshot {
+                    store.acknowledge_recovery_loss_snapshot(&fence, id, &snapshot)
+                } else {
+                    store.acknowledge_recovery_loss(&fence, id, &watermarks)
+                }
+            };
+            qualify_loss(&store, &fence, attempt, id);
+            store
+                .lock()
                 .unwrap()
-                .len(),
-            1
-        );
-        store
-            .record_account_delivery_loss("alice", 1, 2, 11)
-            .unwrap();
-        assert!(
-            !store
-                .acknowledge_recovery_loss(&fence, id, &watermarks)
+                .execute_batch(
+                    "CREATE TRIGGER fail_ack BEFORE DELETE ON account_delivery_loss_evidence
+            BEGIN SELECT RAISE(ABORT,'injected'); END;",
+                )
+                .unwrap();
+            assert!(acknowledge().is_err());
+            store
+                .lock()
                 .unwrap()
-        );
-        store.synchronize_account_delivery_loss("alice").unwrap();
-        assert!(store.account_delivery_recovery("alice").unwrap().is_some());
-        assert!(
-            !store
-                .acknowledge_recovery_loss(&fence, id, &watermarks)
-                .unwrap()
-        );
+                .execute_batch("DROP TRIGGER fail_ack")
+                .unwrap();
+            assert_eq!(
+                store
+                    .recovery_loss_watermarks("alice", RecoveryLossCause::Queue)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .record_account_delivery_loss("alice", 1, 2, 11)
+                .unwrap();
+            assert!(!acknowledge().unwrap());
+            store.synchronize_account_delivery_loss("alice").unwrap();
+            assert!(store.account_delivery_recovery("alice").unwrap().is_some());
+            assert!(!acknowledge().unwrap());
+        }
     }
 
     #[test]
