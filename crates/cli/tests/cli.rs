@@ -3767,6 +3767,8 @@ fn group_create_includes_agent_text_streams_by_default() {
 #[test]
 fn stream_send_and_receive_show_quic_text_content() {
     let home = tempfile::tempdir().expect("tempdir");
+    // Raw QUIC transport never opens account storage, even in an owned home.
+    let _lease = marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
     let bind = free_udp_addr();
     let mut receiver = wn(home.path());
     receiver
@@ -3904,17 +3906,18 @@ fn stream_send_rejects_non_public_endpoints_without_insecure_local() {
 #[test]
 fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     let home = tempfile::tempdir().expect("tempdir");
+    let bob_home = tempfile::tempdir().expect("tempdir");
     let broker = spawn_quic_broker();
 
     let alice = create_account(home.path());
-    let bob = create_account(home.path());
-    run_json(home.path(), &["--account", &bob, "keys", "publish"]);
+    let bob = create_account(bob_home.path());
+    run_json(bob_home.path(), &["--account", &bob, "keys", "publish"]);
     let created_group = run_json(
         home.path(),
         &["--account", &alice, "group", "create", "agent", &bob],
     );
     let group_id = created_group["group_id"].as_str().expect("group id");
-    run_json(home.path(), &["--account", &bob, "sync"]);
+    run_json(bob_home.path(), &["--account", &bob, "sync"]);
 
     let stream_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let broker_candidate = format!("quic://127.0.0.1:{}", broker.addr.port());
@@ -3937,7 +3940,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         .expect("start message id");
 
     let bob_start_message = wait_until_projected_agent_stream_message(
-        home.path(),
+        bob_home.path(),
         test_relay_url(),
         &bob,
         group_id,
@@ -3958,7 +3961,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
         serde_json::json!([broker_candidate])
     );
 
-    let mut watcher = wn(home.path());
+    let mut watcher = wn(bob_home.path());
     watcher
         .args([
             "--account",
@@ -4043,7 +4046,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
 
     let bob_final_message = wait_until_projected_agent_stream_message(
-        home.path(),
+        bob_home.path(),
         test_relay_url(),
         &bob,
         group_id,
@@ -4057,7 +4060,7 @@ fn stream_start_quic_chunks_and_final_payload_verify_through_mls_messages() {
     );
 
     let verified = run_json(
-        home.path(),
+        bob_home.path(),
         &[
             "--account",
             &bob,
@@ -6566,6 +6569,72 @@ fn daemon_socket_path_is_private() {
 }
 
 #[test]
+#[cfg(unix)]
+fn tui_rejects_daemon_owned_home_and_reaches_terminal_after_release() {
+    use std::os::unix::process::CommandExt;
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .args(["--secret-store", "file"])
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let blocked = wn(home.path())
+        .env_remove("WN_SOCKET")
+        .arg("tui")
+        .output()
+        .expect("TUI should start");
+    // Stop the disposable daemon before assertions so a failure cannot leak it.
+    stop_daemon(&socket, &mut child);
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout)
+        .expect("owned-home rejection must use the CLI JSON error contract");
+    assert_eq!(blocked["ok"], false);
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already in use")
+    );
+
+    let mut command = wn(home.path());
+    command
+        .env_remove("WN_SOCKET")
+        .arg("tui")
+        .stdin(Stdio::null());
+    // SAFETY: setsid is async-signal-safe; the child needs no controlling
+    // terminal so this test deterministically stops at terminal initialization.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let released = command.output().expect("headless TUI should start");
+    assert!(!released.status.success());
+    assert!(
+        String::from_utf8_lossy(&released.stderr).contains("failed to initialize terminal"),
+        "{}",
+        command_output_summary(&released)
+    );
+    assert!(!String::from_utf8_lossy(&released.stdout).contains("already in use"));
+    assert!(marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).is_ok());
+}
+
+#[test]
 fn daemon_refuses_reset_over_socket() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
@@ -6609,7 +6678,7 @@ fn daemon_refuses_reset_over_socket() {
 }
 
 #[test]
-fn daemon_running_does_not_auto_forward_logout() {
+fn daemon_running_blocks_local_logout_until_ownership_is_released() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
     let account = create_local_account_id(home.path());
@@ -6642,11 +6711,24 @@ fn daemon_running_does_not_auto_forward_logout() {
     stop_daemon(&socket, &mut child);
 
     assert!(
-        logout.status.success(),
-        "implicit logout should run locally while daemon is running\n{}",
+        !logout.status.success(),
+        "implicit logout must not mutate a daemon-owned home\n{}",
         command_output_summary(&logout)
     );
-    let logout_json: Value = serde_json::from_slice(&logout.stdout).expect("logout stdout JSON");
+    assert!(String::from_utf8_lossy(&logout.stdout).contains("already in use"));
+    let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
+    assert_eq!(accounts.len(), 1);
+
+    let released_logout = logout_command
+        .output()
+        .expect("wn logout should start after daemon stops");
+    assert!(
+        released_logout.status.success(),
+        "logout should succeed after ownership is released\n{}",
+        command_output_summary(&released_logout)
+    );
+    let logout_json: Value =
+        serde_json::from_slice(&released_logout.stdout).expect("logout stdout JSON");
     assert_eq!(logout_json["result"]["logged_out"], true);
     assert_eq!(logout_json["result"]["account_id"], account);
 
