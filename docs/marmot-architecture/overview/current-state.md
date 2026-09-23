@@ -19,6 +19,11 @@ status: overview
 
 # Current State — Implementations & Spec
 
+CLI direct access and daemon startup now respect exclusive Marmot root ownership.
+Ready account workers perform periodic privacy-safe structural integrity probes.
+See [shared-home safety](local-artifact-safety.md#shared-home-access-and-corruption-detection)
+for socket routing, probe limits, and recovery/deployment requirements.
+
 C6a resolves accepted kind-1009 edits in the durable timeline once, sharing effective text with reply and chat-list
 previews. Compact metadata is part of native conversation rows; accepted edit history is a separate paged query.
 Migration 76 repairs existing projections. Raw edit events remain available, but edits are no longer transcript rows.

@@ -118,6 +118,18 @@ drop anything.
 `StorageError::Closed` is deliberately its own variant, and non-transient: work racing a close must be reportable as
 "we shut down" rather than as a storage fault the user is shown.
 
+## Shared-home access and corruption detection
+
+Direct `wn` execution and `wnd` startup acquire the same root lease used by
+`wn-agent`. A failed implicit socket connection cannot bypass ownership.
+Use the owning process's protocol: CLI forwarding uses `wnd`; connector clients
+use `wn-agent` agent-control. These socket protocols are not interchangeable.
+Ready account workers periodically check SQLite structure and emit fixed
+`corrupt` or `incomplete` diagnostic categories. This is detection, not repair
+or proof of full database/MLS consistency. See the
+[incident and recovery handoff](../../incident-2026-09-18-session-corruption.md)
+for coverage, supported access patterns, and manager deployment requirements.
+
 ## Deliberate exception
 
 The application root directory's mode is left as-is when it already exists: retroactively chmod-ing the root of
