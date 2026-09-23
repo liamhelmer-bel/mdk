@@ -27,6 +27,26 @@ The crate is split around storage concerns:
   `shared/legacy.sql` defines recognized compatibility columns, and `shared/fixtures/` plus the migration and assurance
   tests cover adoption and recovery. `shared/error.rs` owns the privacy-safe error mapper and result extension.
 
+## Account recovery groundwork
+
+`account_recovery.rs` owns the durable account recovery ledger and retry reservations.
+Migration 0092 replaces the overflow and epoch-demand tables while retaining their Rust
+storage methods as adapters. The overflow marker task writes loss evidence only; the
+account owner imports that evidence transactionally. A NULL imported count means that
+an observation has not been imported, including a valid zero-count loss marker.
+
+Attempt reservations fence demand and imported loss, survive reopen, and refuse unknown
+scope versions. They do not certify coverage. Runtime dispatch consolidation and qualified
+completion are subsequent integration work under [the recovery design](../../docs/marmot-architecture/further-context/account-recovery-ownership.md).
+Legacy clear methods remain caller-directed retirement adapters, not completion proofs;
+they retain loss watermarks until the coordinated owner can prove safe reclamation.
+Duplicate/stale epoch observations join without resetting eligibility; receipt release
+is distinct new evidence. Notification loss imports a separate cause. Reservations
+fence selected obligations plus account-wide invalidation, so unrelated joins do not
+block an otherwise eligible selection.
+This foundation must land with that coordinated integration; an old binary refuses schema
+0092, and binary downgrade requires a pre-upgrade backup.
+
 ## Replay-state validation
 
 `group_replay_state_fingerprint` captures a consistent read of the same live canonical/OpenMLS state as a
@@ -171,3 +191,9 @@ for the full-row query versus 15.1 ms for metadata, avoiding 8 MiB of full paylo
 The query still enumerates all deferred metadata so an unattempted row beyond a previously
 attempted prefix remains visible. Candidate-graph cost and repeated zero-attempt wake pacing
 remain follow-up work in [#1715](https://github.com/marmot-protocol/mdk/issues/1715).
+
+Legacy token-only overflow retirement records a per-token retired watermark separately
+from import. Clearing one token restores any other joined generations and returns
+`false` while loss remains, preserving the runtime's pending flag across reopen.
+Late duplicate writers cannot resurrect a retired generation; increased counts can.
+The coordinated owner still owns qualified completion and bounded evidence reclamation.
