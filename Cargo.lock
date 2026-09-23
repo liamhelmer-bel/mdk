@@ -66,6 +66,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "transport-quic-broker",
  "transport-quic-stream",
  "zeroize",

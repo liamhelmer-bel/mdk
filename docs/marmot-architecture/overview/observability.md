@@ -1,7 +1,7 @@
 ---
 title: "Observability & Privacy"
 created: 2026-05-09
-updated: 2026-09-10
+updated: 2026-09-23
 tags: [marmot, overview, observability, tracing, privacy]
 status: overview
 ---
@@ -59,6 +59,12 @@ mdk#379).
 | Errors wrapping any of the above | n/a | Constructors keep `Display` free of URLs/ids/values | n/a | Log `error_kind = privacy_safe_kind()` (or `io::ErrorKind`, variant names) — never `{err}`/`error = %err` | `error_kind` strings only |
 
 ## Current enforcement
+
+`wn-agent` installs a tracing subscriber filtered to the
+`marmot_app::storage_integrity` target at info level and above. Its current
+`periodic_probe` events carry only fixed health categories. Hosts must monitor
+missing checks as well as corrupt and repeated incomplete results; journal
+silence alone does not establish storage health.
 
 Terminal harness startup tracing may include the selected execution profile and
 typed approval/isolation support states. These are fixed enum values only

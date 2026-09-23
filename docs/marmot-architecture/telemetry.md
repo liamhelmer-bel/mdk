@@ -1,7 +1,7 @@
 ---
 title: "Telemetry, Logging, and Tracing Inventory"
 created: 2026-06-10
-updated: 2026-09-10
+updated: 2026-09-23
 tags: [marmot, architecture, telemetry, logging, tracing, privacy]
 status: current
 ---
@@ -707,10 +707,12 @@ Exporter timing:
 
 ## Tracing and logging
 
-The repo has the `tracing` and `tracing-subscriber` dependencies, but the current `wn`, `wnd`, `wn-agent`, and
-`marmot-app` runtime source does not install a global tracing subscriber. As a result, these `tracing::*` calls are
-instrumentation points. They are collected only if a host application, test harness, or future binary initializes a
-subscriber.
+The repo has the `tracing` and `tracing-subscriber` dependencies. The `wn` and `wnd` binaries and
+`marmot-app` runtime source do not install a global tracing subscriber, so most `tracing::*` calls remain
+instrumentation points collected only when a host application or test harness initializes one. The `wn-agent`
+binary installs a subscriber filtered to `marmot_app::storage_integrity` at info level and above. Its current
+events expose the fixed `periodic_probe` integrity categories to the service journal; an external monitor must still
+alert on corrupt, repeated incomplete, and missing checks.
 
 The guardrail test `production_tracing_calls_are_structured_and_privacy_safe` scans production Rust source under
 `crates/` and enforces:

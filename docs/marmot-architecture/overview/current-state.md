@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-19
+updated: 2026-09-23
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -21,6 +21,9 @@ status: overview
 
 CLI direct access and daemon startup now respect exclusive Marmot root ownership.
 Ready account workers perform periodic privacy-safe structural integrity probes.
+The `wn-agent` binary publishes these fixed integrity categories to its service
+journal; an external operator monitor remains necessary for alerts and missing
+check detection.
 See [shared-home safety](local-artifact-safety.md#shared-home-access-and-corruption-detection)
 for socket routing, probe limits, and recovery/deployment requirements.
 

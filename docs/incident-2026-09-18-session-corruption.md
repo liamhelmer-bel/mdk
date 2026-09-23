@@ -165,6 +165,11 @@ The deployed `wn-agent-hermes.service` was active with a September 21 start
 time. Its journal contained no observed `marmot_app::storage_integrity` /
 `periodic_probe` entries from that start through this inspection. This is
 missing health evidence, not proof that probes ran or that storage is healthy.
+The deployed service writes to journald, but the current `wn-agent` binary has
+no tracing subscriber, so these probe events cannot reach that journal even if
+the worker emits them. The isolated handoff worktree now adds a subscriber
+filtered to the integrity target; it must be merged and deployed with the
+matching cohort before journal-based alerts can be evaluated.
 Monitor only the fixed `healthy`, `corrupt`, and `incomplete` categories; alert
 on `corrupt`, repeated `incomplete`, and absent checks for expected loaded ready
 workers. The worker attempts a probe after readiness and 120 seconds after each
