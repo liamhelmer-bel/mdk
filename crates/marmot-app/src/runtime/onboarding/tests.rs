@@ -256,6 +256,12 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
     let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let now = tokio::time::Instant::now();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     assert!(
         manager
             .retry_onboarding_step(&id, OnboardingStep::Follows)
@@ -263,6 +269,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
             .is_err()
     );
     assert_eq!(manager.onboarding_snapshot(&id).unwrap().unwrap(), pending);
+    assert!(!manager.startup_retries.lock().unwrap().allows(&id, now));
     let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
     c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
@@ -283,6 +290,7 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert_eq!(
         retried.steps[OnboardingStep::Follows.index()].status,
         OnboardingStatus::Skipped
@@ -301,10 +309,16 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     );
     // Changing sources invalidates even an already acknowledged notice.
     manager.save_onboarding(&mut c).unwrap();
+    manager
+        .startup_retries
+        .lock()
+        .unwrap()
+        .fail(id.clone(), now);
     let changed = manager
         .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
         .await
         .unwrap();
+    assert!(manager.startup_retries.lock().unwrap().allows(&id, now));
     assert!(changed.single_device_notice.is_none());
     assert_eq!(
         changed.steps[OnboardingStep::Follows.index()].status,
