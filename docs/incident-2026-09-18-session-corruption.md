@@ -147,3 +147,45 @@ The storage tests cover healthy checks, interruption and subsequent connection
 reuse, constraint failures, and damaged encrypted pages. CLI subprocess tests
 cover ownership rejection, abandoned-socket fallback, release/reacquisition,
 and preserving another owner's socket artifact.
+
+## Operational handoff, 2026-09-23
+
+Read-only inspection of the running host found these shared-home senders and
+access paths. The harness-side work belongs with `hermes-maintenance`; this
+record does not authorize a second owner of the live root.
+
+| Sender or operation | Observed path | Routing disposition |
+| --- | --- | --- |
+| Workstream supervisor delivery, group creation, group info, and reactions | `hermes-workstream-harness/harness/marmot.py` uses the `marmot.agent-control.v2` socket and a durable outbox | Supported through the owning `wn-agent` facade. |
+| Multi-pane babysitter notices and escalations | Installed `babysitter.py` calls `harness.operator_asks.babysitter_notice`, which enqueues into the supervisor outbox | Supported through the same facade. The script retains unused `WN` and `WN_BASE` constants, but no current call site uses them. |
+| Manager messages sent through `workstream send` | Supervisor outbox and Marmot facade | Supported. Ad-hoc manager shell commands are not covered by this routing and must not invoke direct `wn` against the owned home. |
+| Operator admin-recipient lookup | Active harness configuration enables `harness.admin_references.lookup`, which runs `wn groups admins` against the shared home | **Unsupported while `wn-agent` owns the root.** Agent-control v2 has `group_info` but no admin-list request. Fail closed or perform it only in a manager-coordinated offline window until a reviewed facade operation exists. Do not set `WN_SOCKET` to the `wn-agent` socket or start `wnd` beside it. |
+
+The deployed `wn-agent-hermes.service` was active with a September 21 start
+time. Its journal contained no observed `marmot_app::storage_integrity` /
+`periodic_probe` entries from that start through this inspection. This is
+missing health evidence, not proof that probes ran or that storage is healthy.
+Monitor only the fixed `healthy`, `corrupt`, and `incomplete` categories; alert
+on `corrupt`, repeated `incomplete`, and absent checks for expected loaded ready
+workers. The worker attempts a probe after readiness and 120 seconds after each
+prior attempt, subject to scheduling. A fresh heartbeat and a successful
+`account_list` socket call do not establish storage health. Offline structural,
+foreign-key, and application-level checks are still required for recovery.
+
+The full backup named in the source Bead was not found under the operator home
+or `/tmp` during this inspection. The two retained account snapshots and
+`/tmp/rebuilt6.sqlite` remain unsuitable as verified restore candidates for
+the reasons above. Earlier actions documented here were read-only SQLCipher
+checks on private copies, two failed offline rebuilds, and the prior retained
+rebuild of unknown origin. No live database was mutated during this handoff.
+
+Installed `/home/openclaw/.local/bin/wn` and `wn-agent` both report 0.10.3 and
+have SHA-256 hashes `e7d6cfd18a16dc7259f00fbd77cf3f093431639af50b416f1091fbb4b0367c225ed11ac18e72505`
+and `da2b1ae1c488fde43387d5948e7a0bebe3501fbb4b0367c225ed11ac18e72505`,
+respectively. Their file timestamps are September 19 23:40 PDT. These facts
+do not establish the source commit used to build them. Hardening commit
+`5d48c7a1a550cb0515b6db23c3bf668bd0b44196` is present on the source
+Bead branch; no ordinary tracked remote branch contains it as of this
+inspection. Merge SHA, coherent deployment provenance, storage probe coverage,
+rollback copy, and two-way live messaging evidence remain to be recorded by
+the manager before marking deployment complete.
