@@ -21,6 +21,14 @@ import unittest
 TOOLS = Path(__file__).resolve().parent
 TARGETS = ["aarch64-apple-ios", "aarch64-apple-ios-sim", "aarch64-apple-darwin"]
 ANDROID = ["aarch64-linux-android", "armv7-linux-androideabi", "i686-linux-android", "x86_64-linux-android"]
+PAGE_POLICY_RUSTC_ARGS = [
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+    "-C", "link-arg=-Wl,-z,common-page-size=16384",
+]
+
+
+def page_policy_args(args):
+    return args[args.index("--") + 1:]
 SHIM = r'''#!/usr/bin/env python3
 import json, os, pathlib, runpy, sys
 name = pathlib.Path(sys.argv[0]).name
@@ -196,44 +204,46 @@ class BuildPhases(unittest.TestCase):
             self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS=abi)
         cargo = [c for c in self.commands() if c["tool"] == "cargo"]
         self.assertEqual(len(cargo), 2)
-        self.assertTrue(all(c["args"][0] == "build" and "--target" in c["args"] and c["strip"] == "symbols" for c in cargo))
+        self.assertTrue(all(c["args"][0] == "rustc" and "--lib" in c["args"] and "--target" in c["args"] and c["strip"] == "symbols" for c in cargo))
         for abi in ["arm64-v8a", "x86_64"]:
             self.assertTrue((self.crate / "output/android/jniLibs" / abi / "libmarmot_uniffi.so").exists())
         self.assertTrue((self.crate / "output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt").exists())
         for command in cargo:
-            triple = command["args"][command["args"].index("--target") + 1]
-            key = "CARGO_TARGET_" + triple.upper().replace("-", "_") + "_RUSTFLAGS"
-            self.assertIn("max-page-size=16384", command["target_rustflags"][key])
-            self.assertIn("common-page-size=16384", command["target_rustflags"][key])
+            self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
+            self.assertNotIn("max-page-size", json.dumps(command["target_rustflags"]))
 
     def test_android_page_policy_follows_rustflags_precedence(self):
         self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="armeabi-v7a")
         thirty_two = [c for c in self.commands() if c["tool"] == "cargo"][-1]
-        self.assertNotIn("max-page-size", json.dumps(thirty_two["target_rustflags"]))
+        self.assertEqual(thirty_two["args"][0], "build")
+        self.assertNotIn("max-page-size", json.dumps(thirty_two))
         self.assertIsNone(thirty_two["rustflags"])
         self.log.unlink()
         self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="arm64-v8a x86",
-            RUSTFLAGS="-C debuginfo=0")
+            RUSTFLAGS="-C debuginfo=0",
+            CARGO_BUILD_RUSTFLAGS="-C link-arg=-Wl,-z,origin")
         for command in [c for c in self.commands() if c["tool"] == "cargo"]:
             triple = command["args"][command["args"].index("--target") + 1]
+            self.assertEqual(command["rustflags"], "-C debuginfo=0")
             if triple == "aarch64-linux-android":
-                self.assertTrue(command["rustflags"].startswith("-C debuginfo=0 "))
-                self.assertIn("max-page-size=16384", command["rustflags"])
-                self.assertIn("common-page-size=16384", command["rustflags"])
-                self.assertGreater(command["rustflags"].index("debuginfo=0"), -1)
-                self.assertLess(command["rustflags"].index("debuginfo=0"), command["rustflags"].index("max-page-size"))
-            else:
-                self.assertEqual(command["rustflags"], "-C debuginfo=0")
+                self.assertEqual(command["args"][0], "rustc")
+                self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
                 self.assertNotIn("max-page-size", json.dumps(command["target_rustflags"]))
+                self.assertNotIn("origin", json.dumps(command["target_rustflags"]))
+            else:
+                self.assertEqual(command["args"][0], "build")
+                self.assertNotIn("--", command["args"])
+                self.assertNotIn("max-page-size", json.dumps(command))
         self.log.unlink()
         encoded = "-C\x1fdebuginfo=0"
+        target_key = "CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS"
         self.run_phase("kotlin-bindings.sh", "native", ANDROID_ABIS="x86_64",
-            CARGO_ENCODED_RUSTFLAGS=encoded)
+            CARGO_ENCODED_RUSTFLAGS=encoded,
+            **{target_key: "-C target-cpu=native"})
         command = [c for c in self.commands() if c["tool"] == "cargo"][-1]
-        self.assertIn("debuginfo=0", command["encoded_rustflags"])
-        self.assertLess(command["encoded_rustflags"].index("debuginfo=0"),
-            command["encoded_rustflags"].index("max-page-size=16384"))
-        self.assertIn("common-page-size=16384", command["encoded_rustflags"])
+        self.assertEqual(command["encoded_rustflags"], encoded)
+        self.assertEqual(command["target_rustflags"][target_key], "-C target-cpu=native")
+        self.assertEqual(page_policy_args(command["args"]), PAGE_POLICY_RUSTC_ARGS)
         self.assertEqual(command["rustflags"], None)
 
     def test_native_android_rejects_misaligned_library_before_success(self):

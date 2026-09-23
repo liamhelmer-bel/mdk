@@ -33,7 +33,9 @@ UniFFI bindings for the Marmot app runtime. Read `README.md` first for integrati
 - Android consumers must call `MarmotAndroid.initialize(context)` before constructing `Marmot` (Keystore JNI via
   `ndk-context`).
 - Android `arm64-v8a` and `x86_64` JNI libraries are linked with 16 KB ELF load alignment
-  (`-Wl,-z,max-page-size=16384` and `-Wl,-z,common-page-size=16384`). 32-bit ABIs keep the NDK default page size.
+  (`-Wl,-z,max-page-size=16384` and `-Wl,-z,common-page-size=16384`) through extra flags on the final
+  library `cargo rustc` invocation, so configured Cargo rustflags are left in place. 32-bit ABIs keep the
+  NDK default page size.
   `validate-android-artifact.py` checks the packaged bytes; ZIP alignment does not repair a 4 KB `PT_LOAD`.
 - Endpoint env vars set route URLs only; bearer tokens and runtime secrets stay with the host app.
 - Build and validate an Apple artifact against the same deployment target. Objects compiled under

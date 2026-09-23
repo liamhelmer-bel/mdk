@@ -486,7 +486,7 @@ class ReleaseProfileTests(unittest.TestCase):
             "    handle.write(json.dumps(entry) + '\\n')\n"
             "args = sys.argv[1:]\n"
             "target_dir = Path(os.environ['CARGO_TARGET_DIR'])\n"
-            "if args and args[0] == 'build':\n"
+            "if args and args[0] in {'build', 'rustc'}:\n"
             "    triple = None\n"
             "    if '--target' in args:\n"
             "        triple = args[args.index('--target') + 1]\n"
@@ -567,11 +567,16 @@ class ReleaseProfileTests(unittest.TestCase):
         for row in android:
             triple = row["argv"][row["argv"].index("--target") + 1]
             if triple in {"aarch64-linux-android", "x86_64-linux-android"}:
-                key = "CARGO_TARGET_" + triple.upper().replace("-", "_") + "_RUSTFLAGS"
-                self.assertIn("max-page-size=16384", row["target_rustflags"][key])
-                self.assertIn("common-page-size=16384", row["target_rustflags"][key])
-            else:
+                self.assertEqual(row["argv"][0], "rustc")
+                split = row["argv"].index("--")
+                self.assertEqual(row["argv"][split + 1:], [
+                    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+                    "-C", "link-arg=-Wl,-z,common-page-size=16384",
+                ])
                 self.assertNotIn("max-page-size", json.dumps(row["target_rustflags"]))
+            else:
+                self.assertEqual(row["argv"][0], "build")
+                self.assertNotIn("max-page-size", json.dumps(row))
                 self.assertFalse(row["rustflags"])
         self.assertTrue((crate / "output/android/kotlin/dev/ipf/marmotkit/marmot_uniffi.kt").is_file())
 

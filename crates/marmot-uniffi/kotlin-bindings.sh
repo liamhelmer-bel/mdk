@@ -213,40 +213,6 @@ validate_stripped_android_library() {
   fi
 }
 
-# Cargo uses exactly one rustflags source: CARGO_ENCODED_RUSTFLAGS, then
-# RUSTFLAGS, then target rustflags, then build.rustflags. Append the 16 KB
-# policy to the source that will actually reach the 64-bit linker. Call this
-# inside the native cargo subshell so 32-bit, host, and Apple builds do not
-# inherit it. The packaged-byte check remains authoritative.
-apply_android_64bit_page_policy() {
-  local target="$1"
-  local cargo_env target_var existing policy
-  cargo_env="$(echo "$target" | tr '[:lower:]-' '[:upper:]_')"
-  target_var="CARGO_TARGET_${cargo_env}_RUSTFLAGS"
-  policy="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
-  if [[ -v CARGO_ENCODED_RUSTFLAGS ]]; then
-    local sep=$'\x1f'
-    local piece="-C${sep}link-arg=-Wl,-z,max-page-size=16384${sep}-C${sep}link-arg=-Wl,-z,common-page-size=16384"
-    if [[ -n "$CARGO_ENCODED_RUSTFLAGS" ]]; then
-      export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${sep}${piece}"
-    else
-      export CARGO_ENCODED_RUSTFLAGS="$piece"
-    fi
-  elif [[ -v RUSTFLAGS ]]; then
-    if [[ -n "$RUSTFLAGS" ]]; then
-      export RUSTFLAGS="$RUSTFLAGS $policy"
-    else
-      export RUSTFLAGS="$policy"
-    fi
-  else
-    existing="${!target_var-}"
-    if [[ -z "$existing" && -v CARGO_BUILD_RUSTFLAGS && -n "${CARGO_BUILD_RUSTFLAGS}" ]]; then
-      existing="$CARGO_BUILD_RUSTFLAGS"
-    fi
-    export "${target_var}=${existing:+$existing }${policy}"
-  fi
-}
-
 cd "$WORKSPACE_DIR"
 
 if [[ "$MODE" != generate ]]; then
@@ -297,12 +263,30 @@ for abi in $ANDROID_ABIS; do
   target="$(abi_to_target "$abi")"
   echo "==> Building Android target $target ($abi)"
   configure_android_toolchain "$NDK_DIR" "$HOST_TAG" "$target"
+  # 16 KB alignment belongs on the final JNI link. `cargo rustc --lib` appends
+  # these flags after Cargo's selected rustflags source and does not replace
+  # build.rustflags or target rustflags. 32-bit ABIs keep `cargo build`.
   (
+    cargo_cmd=()
     case "$abi" in
-      arm64-v8a|x86_64) apply_android_64bit_page_policy "$target" ;;
+      arm64-v8a|x86_64)
+        cargo_cmd=(cargo rustc --locked --release --timings -p "$CRATE_NAME" --target "$target" --lib)
+        ;;
+      *)
+        cargo_cmd=(cargo build --locked --release --timings -p "$CRATE_NAME" --target "$target")
+        ;;
     esac
-    CARGO_PROFILE_RELEASE_STRIP=symbols \
-      cargo build --locked --release --timings -p "$CRATE_NAME" --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+    if ((${#FEATURE_ARGS[@]})); then
+      cargo_cmd+=("${FEATURE_ARGS[@]}")
+    fi
+    if [[ "$abi" == "arm64-v8a" || "$abi" == "x86_64" ]]; then
+      cargo_cmd+=(
+        --
+        -C link-arg=-Wl,-z,max-page-size=16384
+        -C link-arg=-Wl,-z,common-page-size=16384
+      )
+    fi
+    CARGO_PROFILE_RELEASE_STRIP=symbols "${cargo_cmd[@]}"
   )
   rm -rf "${JNI_OUT_DIR:?}/$abi"
   mkdir -p "$JNI_OUT_DIR/$abi"

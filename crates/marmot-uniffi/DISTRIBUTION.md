@@ -211,6 +211,7 @@ The archive has a `marmotkit-android-<identifier>` root containing:
 - `manifest.json`
 
 `arm64-v8a` and `x86_64` libraries are linked so every ELF `PT_LOAD` segment is aligned to at least 16 KB.
+The linker flags are extra arguments on the final library build, so configured Cargo rustflags remain in effect.
 `armeabi-v7a` and `x86` stay on the NDK default page size. The four ABIs and the Kotlin API are unchanged.
 `android-elf.json` is a schema-1 report of the packaged bytes: each `jniLibs/<abi>/libmarmot_uniffi.so` entry has
 the library's lowercase SHA-256, ELF class, machine, and ordered `PT_LOAD` alignments. Compare those hashes with

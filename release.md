@@ -640,7 +640,8 @@ The Android zip contains:
 - `android-elf.json`
 - `manifest.json`
 
-`arm64-v8a` and `x86_64` are linked with 16 KB ELF load-segment alignment. `armeabi-v7a` and `x86` keep the NDK
+`arm64-v8a` and `x86_64` are linked with 16 KB ELF load-segment alignment on the final library invocation, which
+leaves configured Cargo rustflags in place. `armeabi-v7a` and `x86` keep the NDK
 default page size. The ABI list is unchanged. `android-elf.json` records each library's SHA-256 and observed
 `PT_LOAD` alignments from the packaged bytes. `manifest.json` keeps the existing ordered `contents` array and adds
 `elf_validation` pointing at that report. App-bundle ZIP alignment does not change those ELF segments. The

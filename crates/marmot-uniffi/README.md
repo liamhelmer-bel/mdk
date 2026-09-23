@@ -416,8 +416,10 @@ Build all Android ABIs:
 
 The script keeps the host library's UniFFI metadata intact while stripping
 debug and static symbol sections from each packaged Android JNI library.
-The two 64-bit Android links also pass `-Wl,-z,max-page-size=16384` and
-`-Wl,-z,common-page-size=16384`. The 32-bit ABIs stay on the NDK's default
+The two 64-bit Android links pass `-Wl,-z,max-page-size=16384` and
+`-Wl,-z,common-page-size=16384` as extra flags on the final library `cargo rustc`
+invocation. That appends the policy after Cargo's selected rustflags instead of
+replacing `build.rustflags` or target rustflags. The 32-bit ABIs stay on the NDK's default
 page size, and the supported ABI set is unchanged. Google Play's 16 KB check
 reads ELF `PT_LOAD` alignment; aligning the app bundle ZIP does not change
 those segments. Each published Android archive includes `android-elf.json`
