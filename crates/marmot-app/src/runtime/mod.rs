@@ -327,6 +327,21 @@ const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
 
 #[derive(Clone)]
 pub struct RuntimeSharedServices {
+    /// Off until the production SDK acquisition backend passes its two-relay
+    /// conformance gate. Controlled worker fixtures opt in explicitly.
+    pub(crate) bounded_group_recovery_enabled: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_recovery_finished: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_preparation_probes: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    pub(crate) bounded_result_ready: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_prefix_admitted: Arc<Notify>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_before_admission: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) bounded_pause_after_first_admission: Arc<AtomicBool>,
     local_submission_wakeups: watch::Sender<()>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
     attachment_updates: watch::Sender<()>,
@@ -419,6 +434,19 @@ impl MessageSubscriptionSeenIds {
 impl Default for RuntimeSharedServices {
     fn default() -> Self {
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             local_submission_wakeups: watch::channel(()).0,
             attachment_updates: watch::channel(()).0,
@@ -466,6 +494,19 @@ impl RuntimeSharedServices {
             lifecycle.clone(),
         );
         Self {
+            bounded_group_recovery_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_recovery_finished: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_preparation_probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            bounded_result_ready: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_prefix_admitted: Arc::new(Notify::new()),
+            #[cfg(test)]
+            bounded_pause_before_admission: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            bounded_pause_after_first_admission: Arc::new(AtomicBool::new(false)),
             attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
             attachment_updates: watch::channel(()).0,
             local_submission_wakeups: watch::channel(()).0,

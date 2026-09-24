@@ -47,8 +47,8 @@ same endpoint.
 Event/serialized-byte budgets are **not** total memory or wire-byte bounds.
 They exclude SDK notification queues, WebSocket and parser buffers, temporary
 serialization, bounded filter/ID input, event object overhead, in-flight frames, and
-other concurrent requests. A later recovery executor must limit concurrent
-requests and admission work separately. No pagination cursor or exhaustive
+other concurrent requests. The controlled P5 worker slice therefore limits
+concurrent requests and admission work separately. No pagination cursor or exhaustive
 history claim is provided here.
 Validation rejects zero budgets, oversized or repeated explicit-ID filters,
 duplicate endpoints, and reversed time windows; it does not impose upper
@@ -104,6 +104,55 @@ rejected before I/O.
   network evidence without clearing durable progress. Worker migration and
   scheduling are outside this interface PR.
 
-This integration adds the production SDK acquisition and account-scoped loss
-bridge. It adds no recovery executor, durable retry policy, schema migration,
-or public binding.
+The #2009 SDK integration added the production acquisition and account-scoped
+loss bridge. It added no recovery executor, durable retry policy, schema
+migration, or public binding.
+
+## #1947 P5 controlled worker slice
+
+The account worker now has an inactive, controlled-backend path for one exact
+known kind-445 event in one group. It uses the existing recovery owner's
+conservative selection and durable attempt reservation, keeping the frozen
+scope token, route/loss/inventory fences and exact event ID in the worker.
+The relay request runs in a separate task through the endpoint-validated
+`MarmotRelayPlane::acquire_history`; its result
+returns to the same worker for peeler/engine receipt and storage admission.
+Two process-wide credits are reserved before an attempt and held until pending
+admission and the guarded checkpoint finish. One account has at most one job.
+The worker probes at most once a second and checks the owner's durable retry
+deadline before preparing a plan; live deliveries during cooldown do not
+re-run the SQLite preparation writes. This slice considers the first known-event
+demand, leaving later known-event obligations to the existing owner executor.
+The fixture limits each request to two endpoints, one requested ID, 16 retained
+events and 128 KiB of serialized event JSON per endpoint, with a five-second
+request deadline. The worker admits one event per turn and yields between
+completed units. These SDK request budgets do not bound parser buffers, wire
+bytes or temporary conversion allocations.
+
+The path never treats EOSE as history coverage. A known event qualifies only
+after its exact eligible input has a durable receipt or valid terminal
+disposition. The owner fences checkpoint evidence against new loss and route
+state. Partial results do not clear unretained demand; saturated responses and
+stale fences leave it pending. Unsupported returns without a legacy replay
+fallback. Unsupported scope shapes, including a third required relay, are
+declined before spending retry authority and retain their full legacy scope.
+Installed maintenance subscriptions and their owner observations remain in
+place on both a declined and a matched exact-ID selection. Controlled worker
+regressions cover a queued send, incoming and other-account
+projection, stable live subscriptions, duplicate relay copies, saturation,
+partial results, stale loss/route evidence, shutdown before admission and after
+a durable prefix with the obligation still pending, storage reopen, and two
+already-retained epoch inputs progressing while a
+separate request waits.
+
+`RuntimeSharedServices::bounded_group_recovery_enabled` defaults to false and
+has no public production setter. The production SDK backend is now available,
+but enabling this worker path requires the same integrated two-relay cases
+against actual SDK sessions, including cancellation, partial and saturated
+results, reopen, stale generation/loss/route evidence, local backlog progress
+and measured protocol-byte/duplicate baselines. The legacy
+`execute_recovery_grant` path still owns general epoch, overflow, explicit and
+unknown-history recovery; it
+remains worker-held and can still wait for EOSE. This exact-ID slice does not
+establish unknown-history discovery, bandwidth optimality or the original
+phone/NSE outcome.
