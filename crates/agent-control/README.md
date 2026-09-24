@@ -54,6 +54,39 @@ Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenti
 `any_authenticated`. Deserialization also accepts the CLI spellings `any-authenticated-direct` and
 `any-authenticated`.
 
+## Group management and Welcome repair
+
+`group_member_add` and `group_member_remove` take `account_id_hex`, `group_id_hex`,
+and a `members` list of account references. Add also accepts `initial_admins`,
+which must name invitees. `group_admin_add` and `group_admin_remove` take one
+existing `member` reference. The connector uses the app runtime and MLS admin
+policy; the local account must be a current group admin. Granting admin rights
+to an existing member does not remove and re-invite that member.
+
+Membership changes return `group_membership_updated` with
+`pending_welcome_count`. A `null` or omitted count means the status read failed
+after the MLS operation committed, so callers must query `group_welcome_status`
+before deciding what to do. `group_welcome_status` lists durable undelivered
+Welcomes for one group by message id, recipient id, and recording time. The same
+entries appear as `maintenance_status.pending_welcomes`; they are Welcome
+delivery obligations, separate from the MLS maintenance obligations. A zero
+count only means this device has no undelivered Welcome record; it does not
+prove that a recipient accepted an invite. Use the existing app runtime
+`redeliver_welcome` repair path for a listed message id.
+
+Errors expose a stable control `code` and, for app runtime failures, the
+underlying `app_error_code`. Missing packages use `key_package_missing` with
+`app_error_code: "missing_key_package"`; ask the recipient to publish a fresh
+KeyPackage, then retry. Relay publication uses `relay_publish_failure` with
+`app_error_code: "publish"`; query group state before retrying because the
+MLS change may already be durable.
+
+`invalid_key_package_capabilities` means the recipient must update its client
+and republish a conforming package. `not_group_admin` means the local account
+lacks MLS authority. `mls_commit_conflict` means the MLS epoch forked; refresh
+group state before retrying. A repeated mutation can return an error once the
+requested state already exists; inspect group state after a timeout.
+
 `send_reaction` adds arbitrary non-blank, control-free reaction content of at
 most 64 Unicode scalar values to a durable message. Repeating the same content
 from the same account on the same target is idempotent and returns the existing

@@ -59,7 +59,16 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
-            Self::App(_) => "app_error",
+            Self::App(AppError::MissingKeyPackage(_)) => "key_package_missing",
+            Self::App(AppError::Publish(_)) => "relay_publish_failure",
+            Self::App(error)
+                if error
+                    .as_engine_error()
+                    .is_some_and(|engine| engine.privacy_safe_kind() == "forked_epoch") =>
+            {
+                "mls_commit_conflict"
+            }
+            Self::App(error) => error.privacy_safe_kind(),
             Self::Control(_) => "control_error",
             Self::Hex(_) => "invalid_hex",
             Self::Json(_) => "json_error",
@@ -118,6 +127,36 @@ impl ConnectorError {
             Self::Io(_) => "connector I/O failed",
             Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
             Self::App(AppError::MediaUploadTimedOut) => "media upload timed out before publication",
+            Self::App(AppError::MissingKeyPackage(_)) => {
+                "recipient has no usable KeyPackage; ask them to republish and retry"
+            }
+            Self::App(AppError::InvalidKeyPackageEvent(_)) => {
+                "recipient KeyPackage is invalid; ask them to publish a conforming package"
+            }
+            Self::App(error)
+                if error.as_engine_error().is_some_and(|engine| {
+                    engine.privacy_safe_kind() == "invalid_key_package_capabilities"
+                }) =>
+            {
+                "recipient KeyPackage capabilities are invalid; ask them to update and republish"
+            }
+            Self::App(error)
+                if error
+                    .as_engine_error()
+                    .is_some_and(|engine| engine.privacy_safe_kind() == "not_group_admin") =>
+            {
+                "local account is not a group admin"
+            }
+            Self::App(error)
+                if error
+                    .as_engine_error()
+                    .is_some_and(|engine| engine.privacy_safe_kind() == "forked_epoch") =>
+            {
+                "MLS epoch changed; refresh group state before retrying"
+            }
+            Self::App(AppError::Publish(_) | AppError::Transport(_)) => {
+                "group publication failed; inspect authoritative group state before retrying"
+            }
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
         }
     }
@@ -132,5 +171,12 @@ impl ConnectorError {
 
     pub fn privacy_safe_code(&self) -> &'static str {
         self.code()
+    }
+
+    pub fn app_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::App(error) => Some(error.privacy_safe_kind()),
+            _ => None,
+        }
     }
 }

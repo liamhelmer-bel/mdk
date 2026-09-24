@@ -342,6 +342,36 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    /// Add members to an existing group. A confirmed MLS change may leave
+    /// Welcomes pending; inspect the response and GroupWelcomeStatus.
+    GroupMemberAdd {
+        account_id_hex: String,
+        group_id_hex: String,
+        members: Vec<String>,
+        #[serde(default)]
+        initial_admins: Vec<String>,
+    },
+    GroupMemberRemove {
+        account_id_hex: String,
+        group_id_hex: String,
+        members: Vec<String>,
+    },
+    /// Grant or revoke admin rights for an existing member.
+    GroupAdminAdd {
+        account_id_hex: String,
+        group_id_hex: String,
+        member: String,
+    },
+    GroupAdminRemove {
+        account_id_hex: String,
+        group_id_hex: String,
+        member: String,
+    },
+    /// Durable Welcomes awaiting publication for one group.
+    GroupWelcomeStatus {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
@@ -468,6 +498,9 @@ pub enum AgentControlResponse {
     Error {
         code: String,
         message: String,
+        /// The underlying AppError classification, when this came from the app runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_error_code: Option<String>,
         /// Whether retrying the same operation is safe. Missing legacy fields
         /// default to false so compatibility never widens retry behavior.
         #[serde(default)]
@@ -539,6 +572,19 @@ pub enum AgentControlResponse {
         /// status query failed; zero does not imply recipients accepted invites.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pending_welcome_count: Option<usize>,
+    },
+    GroupMembershipUpdated {
+        group_id_hex: String,
+        /// None means the status read failed after the MLS operation committed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_welcome_count: Option<usize>,
+    },
+    GroupAdminUpdated {
+        group_id_hex: String,
+    },
+    GroupWelcomeStatus {
+        group_id_hex: String,
+        pending: Vec<AgentControlPendingWelcome>,
     },
     GroupInfo {
         account_id_hex: String,
@@ -770,6 +816,9 @@ pub struct AgentControlMaintenanceStatus {
     pub last_own_leaf_rotation_at: Option<u64>,
     pub next_periodic_rotation_at: Option<u64>,
     pub obligations: Vec<AgentControlMaintenanceObligation>,
+    /// Confirmed MLS additions whose Welcome publication still needs repair.
+    #[serde(default)]
+    pub pending_welcomes: Vec<AgentControlPendingWelcome>,
     pub preparing_evolutions: u32,
     pub prepared_evolutions: u32,
     pub attempting_evolutions: u32,
@@ -780,6 +829,13 @@ pub struct AgentControlMaintenanceStatus {
     pub failed_fanout_targets: u32,
     pub policy_prohibited_fanout_targets: u32,
     pub paused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlPendingWelcome {
+    pub message_id_hex: String,
+    pub recipient_hex: String,
+    pub recorded_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1066,6 +1122,73 @@ mod tests {
         assert_eq!(
             decode_envelope::<AgentControlRequest>(&encoded).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn group_management_frames_round_trip() {
+        let account_id_hex = "ab".repeat(32);
+        let group_id_hex = "cd".repeat(16);
+        let requests = [
+            AgentControlRequest::GroupMemberAdd {
+                account_id_hex: account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                members: vec!["peer".into()],
+                initial_admins: vec!["peer".into()],
+            },
+            AgentControlRequest::GroupMemberRemove {
+                account_id_hex: account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                members: vec!["peer".into()],
+            },
+            AgentControlRequest::GroupAdminAdd {
+                account_id_hex: account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: "peer".into(),
+            },
+            AgentControlRequest::GroupAdminRemove {
+                account_id_hex: account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: "peer".into(),
+            },
+            AgentControlRequest::GroupWelcomeStatus {
+                account_id_hex,
+                group_id_hex: group_id_hex.clone(),
+            },
+        ];
+        for request in requests {
+            let envelope = AgentControlEnvelope::request(Some("group-op".into()), request);
+            let frame = encode_frame(&envelope).unwrap();
+            assert_eq!(
+                decode_envelope::<AgentControlRequest>(&frame).unwrap(),
+                envelope
+            );
+        }
+        let legacy: AgentControlRequest = serde_json::from_value(serde_json::json!({
+            "type": "group_member_add",
+            "account_id_hex": "ab",
+            "group_id_hex": "cd",
+            "members": ["peer"]
+        }))
+        .unwrap();
+        assert!(
+            matches!(legacy, AgentControlRequest::GroupMemberAdd { initial_admins, .. } if initial_admins.is_empty())
+        );
+        let response = AgentControlEnvelope::new(
+            Some("group-op".into()),
+            AgentControlResponse::GroupWelcomeStatus {
+                group_id_hex,
+                pending: vec![crate::AgentControlPendingWelcome {
+                    message_id_hex: "11".repeat(32),
+                    recipient_hex: "22".repeat(32),
+                    recorded_at: 7,
+                }],
+            },
+        );
+        let frame = encode_frame(&response).unwrap();
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&frame).unwrap(),
+            response
         );
     }
 
@@ -1959,6 +2082,7 @@ mod tests {
             "type": "error",
             "code": "media_upload_timeout",
             "message": "media upload timed out before publication",
+            "app_error_code": "media_upload_timeout",
             "retryable": true,
         });
 
@@ -1966,6 +2090,7 @@ mod tests {
         let round_tripped = serde_json::to_value(response).unwrap();
 
         assert_eq!(round_tripped["retryable"], true);
+        assert_eq!(round_tripped["app_error_code"], "media_upload_timeout");
 
         let legacy_value = serde_json::json!({
             "type": "error",
@@ -1973,10 +2098,16 @@ mod tests {
             "message": "connector request failed",
         });
         let legacy: AgentControlResponse = serde_json::from_value(legacy_value).unwrap();
-        let AgentControlResponse::Error { retryable, .. } = legacy else {
+        let AgentControlResponse::Error {
+            retryable,
+            app_error_code,
+            ..
+        } = legacy
+        else {
             panic!("expected error response");
         };
         assert!(!retryable);
+        assert_eq!(app_error_code, None);
     }
 
     fn account() -> String {

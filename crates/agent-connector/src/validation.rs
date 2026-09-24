@@ -165,6 +165,11 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::GroupCreate { .. } => "group_create",
         AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::GroupLeave { .. } => "group_leave",
+        AgentControlRequest::GroupMemberAdd { .. } => "group_member_add",
+        AgentControlRequest::GroupMemberRemove { .. } => "group_member_remove",
+        AgentControlRequest::GroupAdminAdd { .. } => "group_admin_add",
+        AgentControlRequest::GroupAdminRemove { .. } => "group_admin_remove",
+        AgentControlRequest::GroupWelcomeStatus { .. } => "group_welcome_status",
         AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
         AgentControlRequest::MaintenanceScheduleSelfUpdate { .. } => {

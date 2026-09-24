@@ -1,6 +1,9 @@
 //! Account and group membership, profile publishing, and welcomer-allowlist operations.
 
-use agent_control::{AgentControlAccount, AgentControlProfileLookupStatus, AgentControlResponse};
+use agent_control::{
+    AgentControlAccount, AgentControlPendingWelcome, AgentControlProfileLookupStatus,
+    AgentControlResponse,
+};
 use marmot_account::{AccountHome, AccountHomeError, AccountSummary};
 use marmot_app::{AccountRelayListBootstrap, UserProfileMetadata};
 
@@ -9,6 +12,25 @@ use crate::error::ConnectorError;
 use crate::validation::{unix_now_seconds, validate_profile_name};
 
 impl AgentConnector {
+    pub(crate) async fn group_pending_welcomes(
+        &self,
+        account_label: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<AgentControlPendingWelcome>, ConnectorError> {
+        Ok(self
+            .runtime
+            .pending_welcome_deliveries(account_label)
+            .await?
+            .into_iter()
+            .filter(|delivery| delivery.group_id_hex == group_id_hex)
+            .map(|delivery| AgentControlPendingWelcome {
+                message_id_hex: delivery.message_id_hex,
+                recipient_hex: delivery.recipient_hex,
+                recorded_at: delivery.recorded_at,
+            })
+            .collect())
+    }
+
     pub(crate) fn account_list_response(&self) -> Result<AgentControlResponse, ConnectorError> {
         let accounts = self
             .account_home
@@ -90,20 +112,106 @@ impl AgentConnector {
         // Creation is already canonical. A failed status read must not invite
         // a retry of the non-idempotent create operation.
         let pending_welcome_count = self
-            .runtime
-            .pending_welcome_deliveries(&account.label)
+            .group_pending_welcomes(&account.label, &group_id_hex)
             .await
             .ok()
-            .map(|pending| {
-                pending
-                    .iter()
-                    .filter(|delivery| delivery.group_id_hex == group_id_hex)
-                    .count()
-            });
+            .map(|pending| pending.len());
         Ok(AgentControlResponse::GroupCreated {
             group_id_hex,
             pending_welcome_count,
             agent_created,
+        })
+    }
+
+    pub(crate) async fn group_member_add_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        members: Vec<String>,
+        initial_admins: Vec<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group_id_hex)?);
+        self.runtime
+            .invite_members_with_initial_admins(
+                &account.label,
+                &group_id,
+                &members,
+                &initial_admins,
+            )
+            .await?;
+        // The MLS change is committed. A status failure must not turn success
+        // into an error that encourages a second invite.
+        let pending_welcome_count = self
+            .group_pending_welcomes(&account.label, &group_id_hex)
+            .await
+            .ok()
+            .map(|pending| pending.len());
+        Ok(AgentControlResponse::GroupMembershipUpdated {
+            group_id_hex,
+            pending_welcome_count,
+        })
+    }
+
+    pub(crate) async fn group_member_remove_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        members: Vec<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group_id_hex)?);
+        self.runtime
+            .remove_members(&account.label, &group_id, &members)
+            .await?;
+        let pending_welcome_count = self
+            .group_pending_welcomes(&account.label, &group_id_hex)
+            .await
+            .ok()
+            .map(|pending| pending.len());
+        Ok(AgentControlResponse::GroupMembershipUpdated {
+            group_id_hex,
+            pending_welcome_count,
+        })
+    }
+
+    pub(crate) async fn group_admin_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        member: &str,
+        grant: bool,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let group_id = cgka_traits::GroupId::new(hex::decode(&group_id_hex)?);
+        if grant {
+            self.runtime
+                .promote_admin(&account.label, &group_id, member)
+                .await?;
+        } else {
+            self.runtime
+                .demote_admin(&account.label, &group_id, member)
+                .await?;
+        }
+        Ok(AgentControlResponse::GroupAdminUpdated { group_id_hex })
+    }
+
+    pub(crate) async fn group_welcome_status_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = crate::validation::normalize_hex(group_id_hex)?;
+        let pending = self
+            .group_pending_welcomes(&account.label, &group_id_hex)
+            .await?;
+        Ok(AgentControlResponse::GroupWelcomeStatus {
+            group_id_hex,
+            pending,
         })
     }
 

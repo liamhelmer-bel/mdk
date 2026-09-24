@@ -23,11 +23,14 @@ use marmot_app::{
     AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent, MarmotAppRuntime, ReceivedMessage,
     RuntimeAgentStreamMessage, RuntimeMessageReceived,
 };
-use nostr_relay_builder::MockRelay;
+use nostr_relay_builder::builder::{PolicyResult, WritePolicy};
+use nostr_relay_builder::prelude::{BoxedFuture, Event};
+use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
@@ -124,6 +127,33 @@ fn reaction_not_found_has_a_distinct_idempotency_contract() {
     let error = crate::ConnectorError::App(marmot_app::AppError::ReactionNotFound);
     assert_eq!(error.code(), "reaction_not_found");
     assert_eq!(error.client_message(), "no matching reaction to remove");
+}
+
+#[test]
+fn group_errors_keep_privacy_safe_app_variant_codes() {
+    let missing = crate::ConnectorError::App(AppError::MissingKeyPackage("peer".into()));
+    assert_eq!(missing.code(), "key_package_missing");
+    assert_eq!(missing.app_error_code(), Some("missing_key_package"));
+    assert!(missing.client_message().contains("republish"));
+    assert!(!missing.retryable());
+
+    let invalid =
+        crate::ConnectorError::App(AppError::Account(marmot_account::AccountError::Engine(
+            cgka_traits::error::EngineError::InvalidKeyPackageCapabilities {
+                member: cgka_traits::MemberId::new(vec![0; 32]),
+            },
+        )));
+    assert_eq!(invalid.code(), "invalid_key_package_capabilities");
+    assert!(
+        invalid.client_message().contains("conforming")
+            || invalid.client_message().contains("update")
+    );
+
+    let publish = crate::ConnectorError::App(AppError::Publish("relay refused".into()));
+    assert_eq!(publish.code(), "relay_publish_failure");
+    assert_eq!(publish.app_error_code(), Some("publish"));
+    assert!(publish.client_message().contains("publication failed"));
+    assert!(!publish.retryable());
 }
 
 #[tokio::test]
@@ -6920,7 +6950,7 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
             vec!["invalid-member".into()],
             None,
             None,
-            "app_error",
+            "invalid_public_key",
         ),
         (
             agent.account_id_hex.clone(),
@@ -6928,7 +6958,7 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
             vec![],
             None,
             Some(vec![]),
-            "app_error",
+            "invalid_nostr_routing",
         ),
         (
             agent.account_id_hex.clone(),
@@ -6936,7 +6966,7 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
             vec![],
             None,
             Some(vec!["https://relay.example.com".into()]),
-            "app_error",
+            "invalid_nostr_routing",
         ),
         (
             agent.account_id_hex.clone(),
@@ -6944,7 +6974,7 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
             vec![],
             None,
             Some(vec!["wss://192.168.1.1".into()]),
-            "app_error",
+            "invalid_nostr_routing",
         ),
     ];
     for (account_id_hex, name, members, description, relays, expected_code) in cases {
@@ -6966,6 +6996,7 @@ async fn connector_group_create_rejects_invalid_inputs_without_creating_groups()
             code,
             message,
             retryable,
+            ..
         } = response.payload
         else {
             panic!("expected error");
@@ -7055,6 +7086,414 @@ async fn connector_socket_leaves_group_and_removes_activation_provenance() {
 }
 
 #[tokio::test]
+async fn connector_socket_manages_members_admins_and_missing_key_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer = AccountHome::open(peer_dir.path())
+        .create_account("peer")
+        .unwrap();
+    let peer_app = MarmotApp::with_relay(peer_dir.path(), relay.url().await.to_string());
+    let peer_runtime = MarmotAppRuntime::new(peer_app.clone());
+    let relay_endpoint = cgka_traits::TransportEndpoint(relay.url().await.to_string());
+    peer_app
+        .publish_account_relay_lists(
+            &peer.label,
+            marmot_app::AccountRelayListBootstrap::new(
+                vec![relay_endpoint.clone()],
+                vec![relay_endpoint],
+            ),
+        )
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let missing_create = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Missing recipient package".into(),
+            vec![peer.account_id_hex.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing_create.code(), "key_package_missing");
+    let AgentControlResponse::GroupCreated { group_id_hex, .. } = connector
+        .create_group_response(&agent.account_id_hex, "Members".into(), vec![], None, None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected group_created")
+    };
+    let add = || AgentControlRequest::GroupMemberAdd {
+        account_id_hex: agent.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        members: vec![peer.account_id_hex.clone()],
+        initial_admins: vec![],
+    };
+    let missing =
+        serve_control_request_once(&connector, &listener, &socket, "missing", add()).await;
+    assert!(
+        matches!(missing.payload, AgentControlResponse::Error { ref code, ref app_error_code, .. } if code == "key_package_missing" && app_error_code.as_deref() == Some("missing_key_package")),
+        "{:?}",
+        missing.payload
+    );
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            member_count: 1,
+            ..
+        }
+    ));
+
+    peer_runtime.publish_key_package(&peer.label).await.unwrap();
+    let added = serve_control_request_once(&connector, &listener, &socket, "add", add()).await;
+    assert!(matches!(
+        added.payload,
+        AgentControlResponse::GroupMembershipUpdated {
+            pending_welcome_count: Some(0),
+            ..
+        }
+    ));
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            member_count: 2,
+            ..
+        }
+    ));
+    let welcome = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "welcome",
+        AgentControlRequest::GroupWelcomeStatus {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(welcome.payload, AgentControlResponse::GroupWelcomeStatus { ref pending, .. } if pending.is_empty())
+    );
+    let duplicate =
+        serve_control_request_once(&connector, &listener, &socket, "duplicate", add()).await;
+    assert!(matches!(
+        duplicate.payload,
+        AgentControlResponse::Error { .. }
+    ));
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            member_count: 2,
+            ..
+        }
+    ));
+
+    for (grant, expected) in [
+        (true, "group_admin_updated"),
+        (false, "group_admin_updated"),
+    ] {
+        let request = if grant {
+            AgentControlRequest::GroupAdminAdd {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            }
+        } else {
+            AgentControlRequest::GroupAdminRemove {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            }
+        };
+        let response =
+            serve_control_request_once(&connector, &listener, &socket, "admin", request).await;
+        assert!(
+            matches!(
+                response.payload,
+                AgentControlResponse::GroupAdminUpdated { .. }
+            ),
+            "expected {expected}: {:?}",
+            response.payload
+        );
+    }
+    let removed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "remove",
+        AgentControlRequest::GroupMemberRemove {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            members: vec![peer.account_id_hex.clone()],
+        },
+    )
+    .await;
+    assert!(matches!(
+        removed.payload,
+        AgentControlResponse::GroupMembershipUpdated { .. }
+    ));
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            member_count: 1,
+            ..
+        }
+    ));
+    peer_runtime.publish_key_package(&peer.label).await.unwrap();
+    let readded = serve_control_request_once(&connector, &listener, &socket, "readd", add()).await;
+    assert!(matches!(
+        readded.payload,
+        AgentControlResponse::GroupMembershipUpdated { .. }
+    ));
+    let granted = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "grant",
+        AgentControlRequest::GroupAdminAdd {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            member: peer.account_id_hex.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        granted.payload,
+        AgentControlResponse::GroupAdminUpdated { .. }
+    ));
+    connector
+        .runtime
+        .self_demote_admin(
+            &agent.label,
+            &GroupId::new(hex::decode(&group_id_hex).unwrap()),
+        )
+        .await
+        .unwrap();
+    let denied = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "denied",
+        AgentControlRequest::GroupMemberRemove {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            members: vec![peer.account_id_hex.clone()],
+        },
+    )
+    .await;
+    assert!(
+        matches!(denied.payload, AgentControlResponse::Error { ref code, .. } if code == "not_group_admin"),
+        "{:?}",
+        denied.payload
+    );
+    for (operation, request) in [
+        (
+            "grant",
+            AgentControlRequest::GroupAdminAdd {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            },
+        ),
+        (
+            "revoke",
+            AgentControlRequest::GroupAdminRemove {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            },
+        ),
+    ] {
+        let denied =
+            serve_control_request_once(&connector, &listener, &socket, operation, request).await;
+        assert!(
+            matches!(denied.payload, AgentControlResponse::Error { ref code, .. } if code == "not_group_admin"),
+            "{operation}: {:?}",
+            denied.payload
+        );
+    }
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            member_count: 2,
+            ..
+        }
+    ));
+    connector.runtime.shutdown().await;
+    peer_runtime.shutdown().await;
+}
+
+#[derive(Debug)]
+struct ToggleWritePolicy(Arc<AtomicU8>);
+
+impl WritePolicy for ToggleWritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            let reject = match self.0.load(Ordering::SeqCst) {
+                1 => true,
+                2 => u16::from(event.kind) == 1059,
+                _ => false,
+            };
+            if reject {
+                PolicyResult::Reject("injected relay rejection".into())
+            } else {
+                PolicyResult::Accept
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn connector_socket_reports_relay_rejection_for_member_add() {
+    let dir = tempfile::tempdir().unwrap();
+    let reject = Arc::new(AtomicU8::new(0));
+    let relay =
+        LocalRelay::new(RelayBuilder::default().write_policy(ToggleWritePolicy(reject.clone())));
+    relay.run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let peer = AccountHome::open(peer_dir.path())
+        .create_account("peer")
+        .unwrap();
+    let peer_app = MarmotApp::with_relay(peer_dir.path(), relay_url.clone());
+    let peer_runtime = MarmotAppRuntime::new(peer_app.clone());
+    let endpoint = cgka_traits::TransportEndpoint(relay_url);
+    peer_app
+        .publish_account_relay_lists(
+            &peer.label,
+            marmot_app::AccountRelayListBootstrap::new(vec![endpoint.clone()], vec![endpoint]),
+        )
+        .await
+        .unwrap();
+    peer_runtime.publish_key_package(&peer.label).await.unwrap();
+    let AgentControlResponse::GroupCreated { group_id_hex, .. } = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Publish failure".into(),
+            vec![],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected group_created")
+    };
+    let listener = bind_connector_socket(&socket).unwrap();
+    reject.store(1, Ordering::SeqCst);
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "reject-member-add",
+        AgentControlRequest::GroupMemberAdd {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            members: vec![peer.account_id_hex.clone()],
+            initial_admins: vec![],
+        },
+    )
+    .await;
+    assert!(
+        matches!(response.payload, AgentControlResponse::Error { ref code, ref app_error_code, .. }
+            if code == "relay_publish_failure" && app_error_code.as_deref() == Some("publish")),
+        "{:?}",
+        response.payload
+    );
+    reject.store(2, Ordering::SeqCst);
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "reject-welcome-only",
+        AgentControlRequest::GroupMemberAdd {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            members: vec![peer.account_id_hex.clone()],
+            initial_admins: vec![],
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            response.payload,
+            AgentControlResponse::GroupMembershipUpdated {
+                pending_welcome_count: Some(1),
+                ..
+            }
+        ),
+        "{:?}",
+        response.payload
+    );
+    let pending = connector
+        .group_pending_welcomes(&agent.label, &group_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "failed Welcome must remain retryable");
+    let AgentControlResponse::GroupWelcomeStatus {
+        pending: polled, ..
+    } = connector
+        .group_welcome_status_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap()
+    else {
+        panic!("expected group Welcome status")
+    };
+    assert_eq!(polled, pending);
+    let AgentControlResponse::MaintenanceStatus { status } = connector
+        .maintenance_status_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap()
+    else {
+        panic!("expected maintenance status")
+    };
+    assert_eq!(status.pending_welcomes, pending);
+    connector.runtime.shutdown().await;
+    peer_runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
     connector_leave_group_case(true).await;
 }
@@ -7104,7 +7543,11 @@ async fn connector_leave_group_case(block_cleanup: bool) {
             "invalid_hex",
         ),
         ("not-hex".into(), group_id_hex.clone(), "invalid_hex"),
-        (agent.account_id_hex.clone(), missing.clone(), "app_error"),
+        (
+            agent.account_id_hex.clone(),
+            missing.clone(),
+            "unknown_group",
+        ),
     ] {
         let response = serve_control_request_once(
             &connector,
@@ -7142,7 +7585,7 @@ async fn connector_leave_group_case(block_cleanup: bool) {
         .leave_group_response(&agent.account_id_hex, &group_id_hex)
         .await
         .unwrap_err();
-    assert_eq!(admin_error.code(), "app_error");
+    assert_eq!(admin_error.code(), "admin_cannot_self_remove");
     assert!(!admin_error.retryable());
     assert!(
         connector

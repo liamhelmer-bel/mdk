@@ -244,6 +244,13 @@ struct ImportIdentityArgs {
 }
 
 fn main() -> ExitCode {
+    // The shared-home service must expose structural integrity probes to its
+    // operator without logging other application events or identifiers.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "marmot_app::storage_integrity=info",
+        ))
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::UsageDiagnostics {
