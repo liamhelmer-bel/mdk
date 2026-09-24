@@ -237,15 +237,235 @@ async fn counted_relay() -> (String, Arc<RelayState>) {
 
 #[tokio::test]
 async fn bounded_real_sdk_two_relays_retain_one_encrypted_known_event() {
-    run_real_sdk_known_event(false).await;
+    run_real_sdk_known_event(false, false).await;
+}
+
+#[tokio::test]
+async fn bounded_real_sdk_conforming_relay_services_competing_comparison() {
+    let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = super::super::super::MarmotAppRuntime::new(app.clone());
+    runtime
+        .shared_services()
+        .bounded_group_recovery_enabled
+        .store(true, Ordering::SeqCst);
+    crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, &url);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.publish_key_package("bob").await.unwrap();
+    let group = runtime
+        .create_group_with_options(
+            &alice.label,
+            "conforming comparison",
+            std::slice::from_ref(&bob.account_id_hex),
+            AppCreateGroupOptions {
+                relays: Some(vec![url.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            runtime.catch_up_accounts().await.unwrap();
+            if app
+                .group(&bob.label, &hex::encode(&group))
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let routing = app
+        .group(&alice.label, &hex::encode(&group))
+        .unwrap()
+        .unwrap()
+        .nostr_routing
+        .nostr_group_id_hex;
+    let route = storage_sqlite::TransportReconciliationRoute::Group(
+        hex::decode(routing).unwrap().try_into().unwrap(),
+    );
+    let storage = app.account_storage(&alice.label).unwrap();
+    let before = storage
+        .transport_reconciliation_inventory(&route, crate::unix_now_seconds())
+        .unwrap();
+    runtime
+        .send_message(&bob.label, &group, b"conforming exact control".to_vec())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if app
+                .messages(&alice.label)
+                .unwrap()
+                .iter()
+                .any(|message| message.plaintext == "conforming exact control")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after = storage
+        .transport_reconciliation_inventory(&route, crate::unix_now_seconds())
+        .unwrap();
+    let known = after
+        .items
+        .iter()
+        .find(|item| !before.items.iter().any(|old| old.event_id == item.event_id))
+        .expect("new encrypted message is retained in the route inventory");
+    let event_id = known.event_id;
+    let created_at = known.created_at;
+    assert!(
+        storage
+            .retained_recovery_event(&route, &event_id, None, created_at)
+            .unwrap()
+    );
+    let comparison_before = storage.recovery_comparison().unwrap();
+    let fence_before = storage.recovery_revision_fence().unwrap();
+    assert_ne!(
+        comparison_before.blocked_route_revision,
+        Some(fence_before.route_revision),
+        "the conforming relay must leave comparison selectable"
+    );
+    let telemetry_before = app.relay_telemetry().await.metrics.reconciliation_attempts;
+    let prior_routes = comparison_before
+        .plan
+        .as_ref()
+        .expect("conforming startup comparison has a frozen route")
+        .routes
+        .clone();
+    storage
+        .join_recovery_comparison(
+            &[0x77; 16],
+            crate::client::recovery::wall_now_ms().unwrap(),
+            &prior_routes,
+        )
+        .unwrap();
+    assert!(storage.recovery_comparison().unwrap().pending());
+    let shared = runtime.shared_services();
+    let mut bounded_finished = Box::pin(shared.bounded_recovery_finished.notified());
+    bounded_finished.as_mut().enable();
+    storage
+        .request_recovery(
+            storage_sqlite::RecoveryRequest::KnownEvent {
+                group_id: group.as_slice(),
+                event_id: &event_id,
+            },
+            crate::client::recovery::wall_now_ms().unwrap(),
+        )
+        .unwrap();
+    runtime
+        .advance_recovery_clock_for_test(&alice.label, Duration::from_secs(600))
+        .await;
+    // The worker probe and the 15-second maintenance tick may select either
+    // obligation first. Observe which debt settles, then cross the shared
+    // retry deadline again only if the other remains pending.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let known_cleared = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .iter()
+                .all(|d| d.known_event_id != Some(event_id));
+            let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+                > comparison_before.settled_revision;
+            if known_cleared || comparison_settled {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("automatic worker service settles at least one competing demand");
+    let known_cleared = storage
+        .pending_recovery_demands()
+        .unwrap()
+        .iter()
+        .all(|d| d.known_event_id != Some(event_id));
+    let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+        > comparison_before.settled_revision;
+    if !known_cleared || !comparison_settled {
+        if known_cleared {
+            timeout(Duration::from_secs(10), bounded_finished.as_mut())
+                .await
+                .expect("the selected bounded KnownEvent attempt finishes before retry");
+        }
+        let (retry_before_next, remaining, comparison_pending) =
+            runtime.recovery_retry_snapshot_for_test(&alice.label).await;
+        assert!(remaining > Duration::ZERO);
+        assert_eq!(
+            comparison_pending, !comparison_settled,
+            "the next opportunity observes the durable comparison state"
+        );
+        runtime
+            .advance_recovery_clock_for_test(&alice.label, remaining + Duration::from_millis(1))
+            .await;
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let known_cleared = storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .all(|d| d.known_event_id != Some(event_id));
+                let comparison_settled = storage.recovery_comparison().unwrap().settled_revision
+                    > comparison_before.settled_revision;
+                if known_cleared && comparison_settled {
+                    break;
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "next automatic owner opportunity settles the other demand: {err:?}; comparison={:?}; retry={:?}; demands={:?}",
+                {
+                    let comparison = storage.recovery_comparison().unwrap();
+                    (comparison.revision, comparison.settled_revision, comparison.attempt_serial)
+                },
+                (retry_before_next, storage.recovery_retry_state().unwrap(), storage.recovery_comparison().unwrap().blocked_route_revision, storage.recovery_revision_fence().unwrap().route_revision),
+                storage.pending_recovery_demands().unwrap().iter().map(|d| (format!("{:?}", d.cause), d.known_event_id.is_some())).collect::<Vec<_>>(),
+            )
+        });
+    }
+    let after_tick = storage.recovery_comparison().unwrap();
+    assert_eq!(after_tick.settled_revision, after_tick.revision);
+    assert!(after_tick.attempt_serial > comparison_before.attempt_serial);
+    assert!(
+        app.relay_telemetry().await.metrics.reconciliation_attempts > telemetry_before,
+        "the conforming relay was compared by the SDK"
+    );
+    runtime.shutdown_and_close().await.unwrap();
+    relay.shutdown();
 }
 
 #[tokio::test]
 async fn bounded_real_sdk_missing_eose_keeps_send_and_read_available() {
-    run_real_sdk_known_event(true).await;
+    run_real_sdk_known_event(true, false).await;
 }
 
-async fn run_real_sdk_known_event(omit_right_eose: bool) {
+#[tokio::test]
+async fn bounded_real_sdk_new_loss_rejects_stale_exact_checkpoint() {
+    run_real_sdk_known_event(true, true).await;
+}
+
+async fn run_real_sdk_known_event(omit_right_eose: bool, new_loss: bool) {
     let _serial = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
     let bootstrap = MockRelay::run().await.unwrap();
     let bootstrap_url = bootstrap.url().await.to_string();
@@ -458,6 +678,82 @@ async fn run_real_sdk_known_event(omit_right_eose: bool) {
             futures::FutureExt::now_or_never(network_result.as_mut()).is_none(),
             "the worker has not accepted an SDK acquisition result"
         );
+        if new_loss {
+            let retained_before_loss = storage
+                .retained_recovery_event(&route, &event_id, None, created_at)
+                .unwrap();
+            assert!(
+                retained_before_loss,
+                "the other relay already supplied valid retained evidence"
+            );
+            let demand_id = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.known_event_id == Some(event_id))
+                .unwrap()
+                .ticket
+                .id;
+            let scope_before = storage.recovery_scope_snapshots(demand_id).unwrap();
+            assert!(!scope_before.is_empty());
+            assert!(scope_before.iter().all(|scope| !scope.retained_known_event));
+            // finish() would report retained=true for this already-durable ID.
+            // An accepted stale checkpoint would flip this frozen scope bit.
+            let before = storage.recovery_revision_fence().unwrap();
+            storage
+                .record_account_delivery_loss(&alice.label, 777, 1, crate::unix_now_seconds())
+                .unwrap();
+            storage
+                .synchronize_account_delivery_loss(&alice.label)
+                .unwrap();
+            let after = storage.recovery_revision_fence().unwrap();
+            assert!(after.loss_revision > before.loss_revision);
+            let retry_before_finish = storage.recovery_retry_state().unwrap();
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    if bounded_recovery::available_credits()
+                        == bounded_recovery::MAX_CONCURRENT_JOBS
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("bounded result releases capacity after the delayed relay");
+            let scope_after = storage.recovery_scope_snapshots(demand_id).unwrap();
+            assert_eq!(scope_after.len(), scope_before.len());
+            for (prior, current) in scope_before.iter().zip(&scope_after) {
+                assert!(current.token == prior.token);
+                assert_eq!(current.attempt_serial, prior.attempt_serial);
+                assert_eq!(current.loss_revision, prior.loss_revision);
+                assert_eq!(current.retained_known_event, prior.retained_known_event);
+                assert!(current.checkpoints == prior.checkpoints);
+                assert!(current.loss_revision < after.loss_revision);
+            }
+            assert_eq!(
+                storage.recovery_retry_state().unwrap().attempt_serial,
+                retry_before_finish.attempt_serial,
+                "no newer owner attempt may be confused with this stale result"
+            );
+            assert!(
+                storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+            );
+            assert!(
+                storage
+                    .pending_recovery_demands()
+                    .unwrap()
+                    .iter()
+                    .any(|demand| demand.known_event_id == Some(event_id))
+            );
+            runtime.shutdown_and_close().await.unwrap();
+            bootstrap.shutdown();
+            return;
+        }
     }
     let completion = timeout(Duration::from_secs(10), async {
         loop {
