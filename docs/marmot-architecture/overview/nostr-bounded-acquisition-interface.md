@@ -1,7 +1,7 @@
 ---
 title: "Nostr Bounded Acquisition Interface"
 created: 2026-09-23
-updated: 2026-09-23
+updated: 2026-09-24
 tags: [marmot, nostr, recovery, transport]
 status: overview
 ---
@@ -12,8 +12,9 @@ status: overview
 relay-client boundary. It takes an owned `NostrAcquisitionRequest` and a
 request-local `tokio_util::sync::CancellationToken`, and returns owned
 `NostrAcquisitionResult` evidence. No account worker, engine, or storage borrow
-needs to survive the network wait. Current `NostrSdkRelayClient` uses the
-default explicit `Unsupported` result; production traffic is unchanged.
+needs to survive the network wait. The production `NostrSdkRelayClient` now
+implements this operation with the qualified rust-nostr fork. Existing account
+recovery policy and durable admission remain owned outside the transport.
 
 The request's account ID selects the authentication context and inbox
 recipient. The calling executor retains its existing `AttemptGrant`,
@@ -63,11 +64,15 @@ receiver. Its value is a cumulative skipped-notification watermark for the
 relay-client lifetime, including replacement receivers. The generation changes
 when the receiver changes, but the count never resets. Coalescing therefore
 does not erase a gap. The scope stays fixed and is explicitly
-`SharedReceiver` or `AccountReceiver`; the production shared SDK receiver
-cannot attribute loss to a group or one account. Its current implementation
-also returns `Unsupported`. A future per-account client may narrow the scope
-only when the underlying receiver is actually account-specific. This control
-path must stay observable when event delivery is saturated.
+`SharedReceiver` or `AccountReceiver`. The production SDK now gives each
+account its own receiver and cumulative `AccountReceiver` watermark. Its
+multi-account root returns `Unsupported` from `notification_loss()`, because
+one coalescing watch cannot preserve independent account watermarks. The
+smallest contract extension is `notification_loss_for_account(account_id)`,
+which returns that account's watch or rejects an unregistered account. The
+recovery consumer must subscribe for each activated account and must never
+infer a group from a receiver gap. This control path must stay observable
+when event delivery is saturated.
 The backend must update the watch value without waiting for room in the
 event-delivery queue.
 
@@ -84,10 +89,12 @@ rejected before I/O.
   validates limits before I/O, uses the fixed EOSE request policy, and maps
   receiver `Lagged` updates to cumulative
   `NostrNotificationLoss`. SDK types and error-string parsing stay inside its
-  implementation. Any new dial path must pass the existing relay-plane
-  `RelaySafetyPolicy` and host-safety checks. It must prove cleanup preserves
-  live subscriptions and qualify real SDK behavior separately; the fake tests
-  here check only request validation and the owned result/control shape.
+  implementation. The app's `MarmotRelayPlane::acquire_history` validates
+  endpoints with the existing `RelaySafetyPolicy` before the backend may
+  register a new relay; the recovery consumer must call this guarded method.
+  Its production-backend regressions cover bounded partial results, dropped
+  request cleanup, live-subscription preservation, and independent account
+  loss watches. Platform artifact qualification remains a separate gate.
 - The #1947 recovery consumer captures an owned plan from the #1946 owner,
   retains its grant and scope token, dispatches network acquisition outside
   the serialized account worker,
@@ -97,5 +104,6 @@ rejected before I/O.
   network evidence without clearing durable progress. Worker migration and
   scheduling are outside this interface PR.
 
-This slice adds no connection allocator, production SDK acquisition, loss
-bridge, recovery executor, retry policy, schema migration, or public binding.
+This integration adds the production SDK acquisition and account-scoped loss
+bridge. It adds no recovery executor, durable retry policy, schema migration,
+or public binding.

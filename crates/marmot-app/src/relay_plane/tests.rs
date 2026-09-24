@@ -1,3 +1,23 @@
+type RelayPoolNotification = nostr_sdk::prelude::ClientNotification;
+use nostr_sdk::prelude::FinalizeEvent;
+fn test_notification_stream(
+    receiver: broadcast::Receiver<RelayPoolNotification>,
+) -> RelayNotificationStream {
+    Box::pin(futures::stream::unfold(
+        receiver,
+        |mut receiver| async move {
+            match receiver.recv().await {
+                Ok(notification) => {
+                    Some((NotificationUpdate::Notification(notification), receiver))
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    Some((NotificationUpdate::Lagged { skipped }, receiver))
+                }
+                Err(broadcast::error::RecvError::Closed) => None,
+            }
+        },
+    ))
+}
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -90,28 +110,61 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         .sdk_relay_client
         .as_ref()
         .expect("sdk-backed plane has a relay client");
+    let keys = nostr::prelude::Keys::generate();
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
     assert!(
-        sdk.client().signer().await.is_err(),
-        "a fresh plane must not have a signer"
+        sdk.notification_loss_for_account(&account_id)
+            .await
+            .is_err()
     );
-
     plane
-        .set_transport_signer(Arc::new(nostr::Keys::generate()))
-        .await;
-
-    assert!(
-        sdk.client().signer().await.is_ok(),
-        "the transport client must hold a signer to answer NIP-42 AUTH"
-    );
+        .set_transport_signer(&account_id, Arc::new(keys))
+        .await
+        .unwrap();
+    assert!(sdk.notification_loss_for_account(&account_id).await.is_ok());
     let directory_client = plane
         .inner
         .transport
         .directory_client
         .as_ref()
         .expect("sdk-backed plane has an anonymous directory client");
+    assert!(directory_client.relays().await.is_empty());
+}
+
+#[tokio::test]
+async fn history_acquisition_rejects_unsafe_endpoint_before_sdk_registration() {
+    use transport_nostr_adapter::{NostrAcquisitionLimits, NostrAcquisitionScope};
+
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let request = NostrAcquisitionRequest {
+        account_id: MemberId::new(vec![1; 32]),
+        scope: NostrAcquisitionScope::KnownEventIds(vec![[2; 32]]),
+        endpoints: vec![TransportEndpoint("ws://127.0.0.1:19474".into())],
+        limits: NostrAcquisitionLimits {
+            max_endpoints: 1,
+            max_requested_event_ids: 1,
+            max_received_items_per_endpoint: 1,
+            max_serialized_event_bytes_per_endpoint: 1024,
+            max_duration: Duration::from_secs(1),
+        },
+    };
+    assert!(matches!(
+        plane
+            .acquire_history(request, NostrAcquisitionCancellation::new())
+            .await,
+        Err(NostrAcquisitionError::InvalidRequest)
+    ));
     assert!(
-        directory_client.signer().await.is_err(),
-        "directory queries must never borrow the transport signer's credentials"
+        plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .relays()
+            .await
+            .is_empty()
     );
 }
 
@@ -310,9 +363,11 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let _ = notifications.send(RelayPoolNotification::Shutdown);
     let _ = notifications.send(RelayPoolNotification::Shutdown);
 
-    let outcome =
-        run_relay_notification_consumer(receiver, relay_plane.inner.transport.adapter.clone())
-            .await;
+    let outcome = run_relay_notification_consumer(
+        test_notification_stream(receiver),
+        relay_plane.inner.transport.adapter.clone(),
+    )
+    .await;
 
     assert_eq!(
         outcome.exit,
@@ -330,6 +385,204 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
         RelayNotificationConsumerExit::Shutdown,
         "the retained notification after the lag must still be consumed"
     );
+}
+
+#[tokio::test]
+async fn abandoned_notification_lane_counts_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+    let source = SdkRelayNotificationSource {
+        client: alice_client.client().clone(),
+        loss: Some(alice_client),
+    };
+    let pending = AtomicU64::new(3);
+    let failed_worker = tokio::spawn(async { panic!("forced event worker failure") });
+    assert!(failed_worker.await.unwrap_err().is_panic());
+    let exit = abandoned_notification_lane(&pending, &source);
+    assert_eq!(exit, RelayNotificationConsumerExit::Lagged(3));
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    recover_relay_notification_forwarder_scoped(&plane.inner.transport, exit, Some(&alice));
+    assert_eq!(
+        alice_adapter
+            .pending_delivery_overflow()
+            .unwrap()
+            .notification_losses,
+        1
+    );
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+}
+
+struct QueuedWorkerFailureSource {
+    sender: broadcast::Sender<RelayPoolNotification>,
+    subscriptions: AtomicUsize,
+    notifications_queued: AtomicUsize,
+    loss: NostrSdkRelayClient,
+    hook: Arc<NotificationWorkerFailureHook>,
+}
+
+impl QueuedWorkerFailureSource {
+    fn new(loss: NostrSdkRelayClient) -> Self {
+        Self {
+            sender: broadcast::channel(8).0,
+            subscriptions: AtomicUsize::new(0),
+            notifications_queued: AtomicUsize::new(0),
+            loss,
+            hook: Arc::new(NotificationWorkerFailureHook {
+                entered: Notify::new(),
+                release: Notify::new(),
+                fail_once: AtomicBool::new(true),
+            }),
+        }
+    }
+
+    fn send_notice(&self) {
+        self.sender
+            .send(RelayPoolNotification::Message {
+                relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+                message: Box::new(RelayMessage::Notice("queued test notification".into())),
+            })
+            .expect("supervisor has an active receiver");
+    }
+}
+
+impl RelayNotificationSource for QueuedWorkerFailureSource {
+    fn notifications(&self) -> RelayNotificationStream {
+        self.subscriptions.fetch_add(1, Ordering::SeqCst);
+        test_notification_stream(self.sender.subscribe())
+    }
+
+    fn is_shutdown(&self) -> bool {
+        false
+    }
+
+    fn record_loss(&self, skipped: u64) {
+        self.loss.record_notification_gap(skipped);
+    }
+
+    fn receiver_replaced(&self) {
+        self.loss.notification_receiver_replaced();
+    }
+
+    fn worker_failure_hook(&self) -> Option<Arc<NotificationWorkerFailureHook>> {
+        Some(self.hook.clone())
+    }
+
+    fn notification_queued(&self) {
+        self.notifications_queued.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn failed_notification_worker_latches_queued_loss_for_only_its_account() {
+    let sdk = NostrSdkRelayClient::multi_account();
+    let alice_keys = nostr::prelude::Keys::generate();
+    let bob_keys = nostr::prelude::Keys::generate();
+    let alice = MemberId::new(alice_keys.public_key().to_bytes().to_vec());
+    let bob = MemberId::new(bob_keys.public_key().to_bytes().to_vec());
+    let alice_client = sdk
+        .register_account(alice.clone(), Arc::new(alice_keys))
+        .await
+        .unwrap();
+    sdk.register_account(bob.clone(), Arc::new(bob_keys))
+        .await
+        .unwrap();
+    let mut alice_loss = sdk.notification_loss_for_account(&alice).await.unwrap();
+    let bob_loss = sdk.notification_loss_for_account(&bob).await.unwrap();
+
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
+    let alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+    let bob_adapter = plane.account_adapter(bob, relay);
+    let source = Arc::new(QueuedWorkerFailureSource::new(alice_client));
+    let supervisor = spawn_relay_notification_supervisor_scoped(
+        source.clone(),
+        plane.inner.transport.clone(),
+        Some(alice),
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supervised consumer subscribes");
+    source.send_notice();
+    timeout(Duration::from_secs(2), source.hook.entered.notified())
+        .await
+        .expect("the real event worker takes its first notification");
+    source.send_notice();
+    source.send_notice();
+    timeout(Duration::from_secs(2), async {
+        while source.notifications_queued.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("two more notifications enter the consumer's queue");
+    source.hook.release.notify_one();
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            alice_loss.changed().await.unwrap();
+            if alice_loss
+                .borrow_and_update()
+                .as_ref()
+                .is_some_and(|gap| gap.cumulative_skipped >= 3)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("worker panic latches the in-flight and queued loss");
+    assert_eq!(alice_loss.borrow().as_ref().unwrap().cumulative_skipped, 3);
+    assert!(bob_loss.borrow().is_none());
+    timeout(Duration::from_secs(2), async {
+        while alice_adapter
+            .pending_delivery_overflow()
+            .is_none_or(|overflow| overflow.notification_losses == 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor signals account recovery from the real loss exit");
+    assert!(bob_adapter.pending_delivery_overflow().is_none());
+    assert_eq!(
+        plane
+            .inner
+            .transport
+            .notification_forwarder_health
+            .snapshot()
+            .lagged_notifications,
+        3
+    );
+
+    source.sender.send(RelayPoolNotification::Shutdown).unwrap();
+    timeout(Duration::from_secs(2), supervisor)
+        .await
+        .expect("supervisor stops after the replacement observes shutdown")
+        .unwrap();
+    sdk.shutdown_accounts().await;
 }
 
 #[tokio::test]
@@ -473,6 +726,15 @@ struct TestNotificationSource {
 }
 
 impl TestNotificationSource {
+    fn steady() -> Self {
+        Self {
+            sender: broadcast::channel(1).0,
+            subscriptions: AtomicUsize::new(0),
+            preload_lag: false,
+            panic_first: AtomicBool::new(false),
+        }
+    }
+
     fn lag_once() -> Self {
         Self {
             sender: broadcast::channel(1).0,
@@ -499,7 +761,7 @@ impl TestNotificationSource {
 }
 
 impl RelayNotificationSource for TestNotificationSource {
-    fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
+    fn notifications(&self) -> RelayNotificationStream {
         if self.panic_first.swap(false, Ordering::SeqCst) {
             panic!("injected notification consumer panic");
         }
@@ -508,17 +770,108 @@ impl RelayNotificationSource for TestNotificationSource {
             let relay_url = RelayUrl::parse("wss://relay.example").unwrap();
             let notice = || RelayPoolNotification::Message {
                 relay_url: relay_url.clone(),
-                message: RelayMessage::Notice("preloaded notification".into()),
+                message: Box::new(RelayMessage::Notice("preloaded notification".into())),
             };
             let _ = self.sender.send(notice());
             let _ = self.sender.send(notice());
         }
-        receiver
+        test_notification_stream(receiver)
     }
 
     fn is_shutdown(&self) -> bool {
         false
     }
+}
+
+#[tokio::test]
+async fn aborted_scoped_supervisors_release_health_across_account_restarts() {
+    let relay = Arc::new(RecordingRelayClient::default());
+    let plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
+    let alice = MemberId::new(vec![0xA1; 32]);
+    let bob = MemberId::new(vec![0xB2; 32]);
+    let running_count = &plane
+        .inner
+        .transport
+        .notification_forwarder_health
+        .running_count;
+
+    for _ in 0..3 {
+        let _alice_adapter = plane.account_adapter(alice.clone(), relay.clone());
+        let _bob_adapter = plane.account_adapter(bob.clone(), relay.clone());
+        let source = Arc::new(TestNotificationSource::steady());
+        let mut forwarders = plane
+            .inner
+            .transport
+            .account_notification_forwarders
+            .lock()
+            .await;
+        assert!(
+            forwarders
+                .insert(
+                    alice.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(alice.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        assert!(
+            forwarders
+                .insert(
+                    bob.clone(),
+                    spawn_relay_notification_supervisor_scoped(
+                        source.clone(),
+                        plane.inner.transport.clone(),
+                        Some(bob.clone()),
+                    ),
+                )
+                .is_none()
+        );
+        drop(forwarders);
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 2
+                || source.subscriptions.load(Ordering::SeqCst) != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both scoped supervisors start");
+
+        plane.deactivate_account_context(&alice).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting Alice releases only her supervisor count");
+        assert!(plane.relay_health().await.notification_forwarder_running);
+        assert!(
+            plane
+                .inner
+                .transport
+                .account_notification_forwarders
+                .lock()
+                .await
+                .get(&bob)
+                .is_some_and(|handle| !handle.is_finished())
+        );
+
+        plane.deactivate_account_context(&bob).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while running_count.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborting the last account releases the running count");
+        assert!(!plane.relay_health().await.notification_forwarder_running);
+    }
+
+    plane.shutdown().await;
 }
 
 #[tokio::test]
@@ -585,8 +938,13 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
 async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
     let relay_plane = MarmotRelayPlane::with_subscription_rebuild_lookback(Duration::from_secs(30));
     let relay = Arc::new(RecordingRelayClient::default());
-    let existing_adapter =
-        relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay.clone());
+    let keys = nostr::prelude::Keys::generate();
+    let account_id = MemberId::new(keys.public_key().to_bytes().to_vec());
+    let existing_adapter = relay_plane.account_adapter(account_id.clone(), relay.clone());
+    relay_plane
+        .set_transport_signer(&account_id, Arc::new(keys))
+        .await
+        .unwrap();
 
     timeout(Duration::from_secs(1), async {
         while !relay_plane
@@ -608,18 +966,20 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
         .sdk_relay_client
         .as_ref()
         .unwrap()
-        .client()
-        .shutdown()
+        .shutdown_accounts()
         .await;
     timeout(Duration::from_secs(1), async {
         loop {
             let forwarder = relay_plane
                 .inner
                 .transport
-                .notification_forwarder
+                .account_notification_forwarders
                 .lock()
                 .await;
-            if forwarder.as_ref().is_some_and(JoinHandle::is_finished) {
+            if forwarder
+                .get(&account_id)
+                .is_some_and(JoinHandle::is_finished)
+            {
                 break;
             }
             drop(forwarder);
@@ -648,10 +1008,11 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
         relay_plane
             .inner
             .transport
-            .notification_forwarder
+            .account_notification_forwarders
             .lock()
             .await
-            .is_none(),
+            .get(&account_id)
+            .is_some_and(JoinHandle::is_finished),
         "a terminal SDK pool must not be respawned"
     );
     assert!(
@@ -666,6 +1027,15 @@ async fn clean_sdk_shutdown_stays_terminal_across_spawn_router_reentry() {
 
 #[async_trait]
 impl NostrRelayClient for RecordingRelayClient {
+    async fn publish_event_for_account(
+        &self,
+        _account_id: &MemberId,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        self.publish_event(endpoints, event, required_acks).await
+    }
     async fn subscribe(
         &self,
         subscription: NostrSubscription,
@@ -1915,7 +2285,7 @@ async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failu
         2
     );
 
-    let writer = NostrSdkClient::builder().signer(bob.clone()).build();
+    let writer = NostrSdkClient::default();
     let relay_url = RelayUrl::parse(&new_url).unwrap();
     writer.add_relay(relay_url.clone()).await.unwrap();
     writer
@@ -1923,9 +2293,9 @@ async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failu
         .await
         .unwrap();
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"bob"}"#)
-        .sign_with_keys(&bob)
+        .finalize(&bob)
         .unwrap();
-    writer.send_event_to([relay_url], &profile).await.unwrap();
+    writer.send_event(&profile).to([relay_url]).await.unwrap();
     timeout(Duration::from_secs(5), async {
         loop {
             if let DirectoryRelayPlaneEvent::Record(record) = events.recv().await.unwrap()
@@ -2012,7 +2382,7 @@ async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
     .unwrap();
 
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
     source.send(RelayPoolNotification::Event {
         relay_url: endpoint.clone(),
@@ -2062,7 +2432,7 @@ async fn directory_live_auth_challenge(deny_read: bool) {
 
     let keys = Keys::generate();
     let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
-        .sign_with_keys(&keys)
+        .finalize(&keys)
         .unwrap();
     let expected_id = profile.id.to_hex();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2356,18 +2726,15 @@ fn relay_pool_group_notification(
     id_prefix: &str,
     transport_group_id: &[u8],
 ) -> RelayPoolNotification {
-    use nostr_sdk::prelude::{Alphabet, EventBuilder, Keys, SingleLetterTag, Tag, TagKind};
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Tag};
 
     let signed = EventBuilder::new(
         Kind::MlsGroupMessage,
         format!("encrypted recovery {id_prefix}"),
     )
-    .tags([Tag::custom(
-        TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H)),
-        [hex::encode(transport_group_id)],
-    )])
+    .tags([Tag::custom("h", [hex::encode(transport_group_id)])])
     .custom_created_at(NostrTimestamp::from_secs(1_700_000_001))
-    .sign_with_keys(&Keys::generate())
+    .finalize(&Keys::generate())
     .expect("sign test group event");
     RelayPoolNotification::Event {
         relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
