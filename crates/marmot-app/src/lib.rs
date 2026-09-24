@@ -111,6 +111,7 @@ mod relay_plane;
 mod relay_telemetry_export;
 mod root_runtime_lease;
 mod runtime;
+mod session_backup;
 mod sqlcipher;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
@@ -477,6 +478,9 @@ pub struct MarmotApp {
     /// it counts against the same App Group suspension rule as the databases
     /// (see [`Self::close_storage`]).
     root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Current-process MLS generation and its verified encrypted snapshot.
+    /// Candidate reads reject older epochs while retaining history for audit.
+    session_backup_generation: Arc<Mutex<HashMap<String, (u64, PathBuf)>>>,
     /// Latched as soon as [`Self::close_storage`] starts. Every database
     /// accessor checks it so a late call cannot silently reopen a database
     /// while terminal close is in progress or after it completes.
@@ -1425,6 +1429,7 @@ impl MarmotApp {
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            session_backup_generation: Arc::new(Mutex::new(HashMap::new())),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1509,6 +1514,7 @@ impl MarmotApp {
         Self {
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            session_backup_generation: Arc::new(Mutex::new(HashMap::new())),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -5336,6 +5342,10 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.session_backup_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.presentation_signals.catalog_changed();
         let mut first_error = None;
         let mut closed = 0usize;
@@ -5489,18 +5499,7 @@ impl MarmotApp {
         {
             return Ok(storage);
         }
-        let account = self.account_home().account(label)?;
-        let key = if account.local_signing {
-            let keys = self.account_home().load_signing_keys(label)?;
-            self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
-        } else {
-            self.external_sqlcipher_key(
-                label,
-                &account.account_id_hex,
-                &database,
-                SqlcipherDatabaseKind::Session,
-            )?
-        };
+        let key = self.session_sqlcipher_key_locked(label, &database)?;
         let migration_observation =
             self.product_analytics
                 .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
@@ -6060,6 +6059,10 @@ impl MarmotApp {
     /// the warm/stale/ready flags forces the rebuilt account to re-warm its
     /// projections from the fresh database.
     fn drop_account_caches(&self, label: &str) {
+        self.session_backup_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
         // Close live bounded windows before a label can bind to another store.
         let _ = self
             .presentation_signals

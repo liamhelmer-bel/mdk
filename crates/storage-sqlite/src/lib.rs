@@ -7,6 +7,8 @@
 
 mod integrity;
 pub use integrity::IntegrityProbe;
+mod backup;
+pub use backup::{create_encrypted_backup, verify_encrypted_backup};
 
 mod group_system;
 pub use group_system::{

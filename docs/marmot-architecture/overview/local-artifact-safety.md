@@ -1,7 +1,7 @@
 ---
 title: "Local Artifact Safety"
 created: 2026-07-02
-updated: 2026-09-19
+updated: 2026-09-24
 tags: [marmot, overview, security, filesystem, permissions]
 status: overview
 ---
@@ -129,6 +129,31 @@ Ready account workers periodically check SQLite structure and emit fixed
 or proof of full database/MLS consistency. See the
 [incident and recovery handoff](../../incident-2026-09-18-session-corruption.md)
 for coverage, supported access patterns, and manager deployment requirements.
+
+## Encrypted session backups
+
+The leased `wn-agent` account worker snapshots each account's `session.sqlite`
+through SQLCipher's online backup API at startup, every 12 hours, and when the
+MLS write generation changes. A concurrent MLS write invalidates that attempt
+and schedules a retry. Snapshots live in the account's private
+`session-backups/` directory; only a backup that passes `cipher_integrity_check`
+and full `integrity_check` is published. The worker keeps the seven newest
+published generations and logs only `healthy`, `corrupt`, or `incomplete`.
+Inventory rechecks each backup, while restore candidates include only the
+healthy snapshot of the current process's MLS write generation. A new MLS write
+withholds all candidates until another verified snapshot is published. Older
+generations remain historical inventory; after restart, candidates remain
+empty until the worker creates a fresh snapshot. The operator must still
+validate MLS and group state before any restore.
+
+The operator's existing whole-home backup cron remains independent. It may
+include these encrypted files, but does not create or validate them. There is
+no automatic restore. Before restoring, stop every home owner, preserve the
+current home for rollback, and work on private offline copies with matching
+secrets and SQLCipher version. Follow the
+[incident recovery handoff](../../incident-2026-09-18-session-corruption.md#recovery-and-deployment-handoff)
+for structural, foreign-key, and application-level MLS checks before replacing
+any live file.
 
 ## Deliberate exception
 

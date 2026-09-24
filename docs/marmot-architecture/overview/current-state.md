@@ -1,7 +1,7 @@
 ---
 title: "Current State — Implementations & Spec"
 created: 2026-04-19
-updated: 2026-09-23
+updated: 2026-09-24
 tags: [marmot, overview, current-state, implementations]
 status: overview
 ---
@@ -24,6 +24,10 @@ Ready account workers perform periodic privacy-safe structural integrity probes.
 The `wn-agent` binary publishes these fixed integrity categories to its service
 journal; an external operator monitor remains necessary for alerts and missing
 check detection.
+Leased account workers also create SQLCipher-encrypted session snapshots every
+12 hours and after MLS storage writes. They retain seven generations and only
+present a generation after checking the backup file itself. Restore remains an
+operator action; see [session backup safety](local-artifact-safety.md#encrypted-session-backups).
 See [shared-home safety](local-artifact-safety.md#shared-home-access-and-corruption-detection)
 for socket routing, probe limits, and recovery/deployment requirements.
 

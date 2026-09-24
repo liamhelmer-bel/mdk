@@ -205,6 +205,25 @@ impl SqlcipherDatabaseKind {
 }
 
 impl MarmotApp {
+    pub(crate) fn session_sqlcipher_key_locked(
+        &self,
+        label: &str,
+        database: &DatabaseOpenGuard<'_>,
+    ) -> Result<SqlCipherKey, AppError> {
+        let account = self.account_home().account(label)?;
+        if account.local_signing {
+            let keys = self.account_home().load_signing_keys(label)?;
+            self.sqlcipher_key_locked(label, &keys, database, SqlcipherDatabaseKind::Session)
+        } else {
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                database,
+                SqlcipherDatabaseKind::Session,
+            )
+        }
+    }
+
     pub(crate) fn sqlcipher_key_locked(
         &self,
         label: &str,

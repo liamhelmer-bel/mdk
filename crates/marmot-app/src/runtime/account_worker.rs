@@ -2,6 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
+mod session_backup;
 mod storage_integrity;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
@@ -690,6 +691,16 @@ async fn run_app_runtime_account_worker(
         );
         let _ = ready.send(Ok(()));
     }
+    // Start the first encrypted snapshot as soon as the local account is
+    // ready. Startup relay work below can be slow; it must not delay the
+    // initial recoverable copy.
+    let backup_enabled = app
+        .root_runtime_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    let mut session_backup = session_backup::Schedule::new(backup_enabled);
+    session_backup.poll(&client).await;
 
     // The durable setup journal records publication intent before the worker
     // is reconciled. That marker authorizes exactly one narrow startup action:
@@ -1138,6 +1149,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     'worker: loop {
+        session_backup.poll(&client).await;
         let ready_command = ready_command_index(&pending, &media_http);
         tokio::select! {
             biased;
