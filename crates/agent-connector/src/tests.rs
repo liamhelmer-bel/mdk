@@ -7117,6 +7117,17 @@ async fn connector_socket_manages_members_admins_and_missing_key_packages() {
         .await
         .unwrap();
     let listener = bind_connector_socket(&socket).unwrap();
+    let missing_create = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Missing recipient package".into(),
+            vec![peer.account_id_hex.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(missing_create.code(), "key_package_missing");
     let AgentControlResponse::GroupCreated { group_id_hex, .. } = connector
         .create_group_response(&agent.account_id_hex, "Members".into(), vec![], None, None)
         .await
