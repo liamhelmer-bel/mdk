@@ -91,6 +91,7 @@ impl AgentConnector {
                         AgentControlResponse::Error {
                             code: "server_busy".to_owned(),
                             message: "agent connector subscription capacity is busy".to_owned(),
+                            app_error_code: None,
                             retryable: true,
                         },
                     );
@@ -142,6 +143,7 @@ impl AgentConnector {
         AgentControlResponse::Error {
             code: err.code().to_owned(),
             message: err.client_message().to_owned(),
+            app_error_code: err.app_error_code().map(str::to_owned),
             retryable: err.retryable(),
         }
     }
@@ -183,6 +185,7 @@ impl AgentConnector {
             | AgentControlRequest::AccountProfileLookup { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
+            | AgentControlRequest::GroupWelcomeStatus { .. }
             | AgentControlRequest::MaintenanceStatus { .. }
             | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
             | AgentControlRequest::MaintenanceGetPolicy { .. }
@@ -208,6 +211,10 @@ impl AgentConnector {
             | AgentControlRequest::AllowlistAdd { .. }
             | AgentControlRequest::AllowlistRemove { .. }
             | AgentControlRequest::InvitePolicySet { .. } => Some("control_write"),
+            AgentControlRequest::GroupMemberAdd { .. }
+            | AgentControlRequest::GroupMemberRemove { .. }
+            | AgentControlRequest::GroupAdminAdd { .. }
+            | AgentControlRequest::GroupAdminRemove { .. } => Some("control_write"),
             _ => None,
         };
         let observation = operation.and_then(|operation| {
@@ -295,6 +302,51 @@ impl AgentConnector {
                 group_id_hex,
             } => {
                 self.leave_group_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::GroupMemberAdd {
+                account_id_hex,
+                group_id_hex,
+                members,
+                initial_admins,
+            } => {
+                self.group_member_add_response(
+                    &account_id_hex,
+                    &group_id_hex,
+                    members,
+                    initial_admins,
+                )
+                .await
+            }
+            AgentControlRequest::GroupMemberRemove {
+                account_id_hex,
+                group_id_hex,
+                members,
+            } => {
+                self.group_member_remove_response(&account_id_hex, &group_id_hex, members)
+                    .await
+            }
+            AgentControlRequest::GroupAdminAdd {
+                account_id_hex,
+                group_id_hex,
+                member,
+            } => {
+                self.group_admin_response(&account_id_hex, &group_id_hex, &member, true)
+                    .await
+            }
+            AgentControlRequest::GroupAdminRemove {
+                account_id_hex,
+                group_id_hex,
+                member,
+            } => {
+                self.group_admin_response(&account_id_hex, &group_id_hex, &member, false)
+                    .await
+            }
+            AgentControlRequest::GroupWelcomeStatus {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.group_welcome_status_response(&account_id_hex, &group_id_hex)
                     .await
             }
             AgentControlRequest::GroupInfo {
@@ -632,6 +684,7 @@ impl AgentConnector {
             other => Ok(AgentControlResponse::Error {
                 code: "unsupported_request".to_owned(),
                 message: unsupported_request_message(&other).to_owned(),
+                app_error_code: None,
                 retryable: false,
             }),
         }

@@ -3689,6 +3689,7 @@ mod tests {
                         AgentControlResponse::Error {
                             code: "download_failed".to_owned(),
                             message: "unavailable".to_owned(),
+                            app_error_code: None,
                             retryable: false,
                         },
                         false,
@@ -4060,6 +4061,7 @@ mod tests {
                         agent_control::AgentControlResponse::Error {
                             code: "temporary_failure".to_owned(),
                             message: "retry later".to_owned(),
+                            app_error_code: None,
                             retryable: false,
                         }
                     }

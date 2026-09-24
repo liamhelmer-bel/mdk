@@ -23,6 +23,9 @@ impl AgentConnector {
             .runtime
             .maintenance_status(&account.label, &group_id)
             .await?;
+        let pending_welcomes = self
+            .group_pending_welcomes(&account.label, &hex::encode(group_id.as_slice()))
+            .await?;
         let state = status.state;
         let evolution_count = |phase| {
             status
@@ -60,6 +63,7 @@ impl AgentConnector {
                     .into_iter()
                     .map(agent_obligation)
                     .collect(),
+                pending_welcomes,
                 preparing_evolutions: evolution_count(GroupEvolutionPhase::Preparing),
                 prepared_evolutions: evolution_count(GroupEvolutionPhase::Prepared),
                 attempting_evolutions: evolution_count(GroupEvolutionPhase::Attempting),

@@ -314,7 +314,8 @@ impl AppError {
         )
     }
 
-    pub(crate) fn privacy_safe_kind(&self) -> &'static str {
+    /// Stable, privacy-safe error variant for control-plane callers.
+    pub fn privacy_safe_kind(&self) -> &'static str {
         match self {
             Self::ProductAnalytics(_) => "usage_diagnostics",
             Self::Account(error) => account_error_kind(error),

@@ -446,6 +446,7 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
                 agent_control::AgentControlResponse::Error {
                     code: "server_busy".to_owned(),
                     message: "agent connector connection capacity is busy".to_owned(),
+                    app_error_code: None,
                     // Admission happens before any request frame is read, so
                     // this response cannot carry a request id. Do not promise
                     // application-level retryability on an uncorrelated frame.

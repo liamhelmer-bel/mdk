@@ -515,6 +515,9 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::InvitePolicy { .. } => "invite_policy",
         AgentControlResponse::DiagnosticStatus { .. } => "diagnostic_status",
         AgentControlResponse::GroupCreated { .. } => "group_created",
+        AgentControlResponse::GroupMembershipUpdated { .. } => "group_membership_updated",
+        AgentControlResponse::GroupAdminUpdated { .. } => "group_admin_updated",
+        AgentControlResponse::GroupWelcomeStatus { .. } => "group_welcome_status",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
