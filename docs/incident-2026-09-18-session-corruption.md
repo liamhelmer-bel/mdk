@@ -185,9 +185,12 @@ checks on private copies, two failed offline rebuilds, and the prior retained
 rebuild of unknown origin. No live database was mutated during this handoff.
 
 Installed `/home/openclaw/.local/bin/wn` and `wn-agent` both report 0.10.3 and
-have SHA-256 hashes `e7d6cfd18a16dc7259f00fbd77cf3f093431639af50b416f1091fbb4b0367c225ed11ac18e72505`
+have SHA-256 hashes `e7d6cfd18a16dc7259f00fbd77cf3f093431639af50b416f1091bfb0e0d7bb62`
 and `da2b1ae1c488fde43387d5948e7a0bebe3501fbb4b0367c225ed11ac18e72505`,
-respectively. Their file timestamps are September 19 23:40 PDT. These facts
+respectively. These values were corrected from the retained rollback
+`SHA256SUMS`; copy future binary hashes from their matching `SHA256SUMS`
+manifest to avoid transcription errors. Their file timestamps are September 19
+23:40 PDT. These facts
 do not establish the source commit used to build them. Hardening commit
 `5d48c7a1a550cb0515b6db23c3bf668bd0b44196` is present on the source
 Bead branch; no ordinary tracked remote branch contains it as of this
