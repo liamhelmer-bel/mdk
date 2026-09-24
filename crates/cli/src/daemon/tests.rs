@@ -600,7 +600,7 @@ async fn stream_compose_final_report_contains_full_transcript_text() {
 }
 
 #[test]
-fn destructive_execute_commands_are_refused_over_daemon() {
+fn reset_is_refused_over_daemon_but_logout_is_hosted() {
     let reset =
         blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Reset { confirm: true }))
             .expect("reset should be blocked");
@@ -612,13 +612,8 @@ fn destructive_execute_commands_are_refused_over_daemon() {
 
     let logout = blocked_daemon_execute_output(&daemon_test_cli(crate::Command::Logout {
         pubkey: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-    }))
-    .expect("logout should be blocked");
-    let logout_json: serde_json::Value =
-        serde_json::from_str(logout.stdout.trim()).expect("logout error JSON");
-    assert_eq!(logout.code, 1);
-    assert_eq!(logout_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(logout_json["error"]["command"], "logout");
+    }));
+    assert!(logout.is_none(), "logout must reach the hosted runtime");
 }
 
 #[test]
@@ -666,13 +661,11 @@ fn long_running_stream_execute_commands_are_refused_over_daemon() {
                 insecure_local: true,
                 background: false,
             },
-        }))
-        .expect("foreground stream watch should be blocked");
-    let foreground_watch_json: serde_json::Value =
-        serde_json::from_str(foreground_watch.stdout.trim()).expect("watch error JSON");
-    assert_eq!(foreground_watch.code, 1);
-    assert_eq!(foreground_watch_json["error"]["code"], "daemon_forbidden");
-    assert_eq!(foreground_watch_json["error"]["command"], "stream watch");
+        }));
+    assert!(
+        foreground_watch.is_none(),
+        "foreground watch must reach the hosted runtime"
+    );
 }
 
 #[tokio::test]

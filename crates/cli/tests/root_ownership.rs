@@ -4,42 +4,51 @@ use marmot_app::MarmotRootRuntimeLease;
 use std::process::Command;
 
 #[test]
-fn direct_cli_refuses_an_owned_root_and_recovers_after_release() {
+fn read_only_account_listing_survives_owned_root_but_mutation_does_not() {
     let home = tempfile::tempdir().unwrap();
     let lease = MarmotRootRuntimeLease::try_acquire(home.path()).unwrap();
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_wn"))
+    let command = |subcommand: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wn"));
+        command
             .env_remove("WN_SOCKET")
             .env_remove("WN_ACCOUNT")
             .env("WN_SECRET_STORE", "file")
-            .args([
-                "--home",
-                home.path().to_str().unwrap(),
-                "--json",
-                "accounts",
-                "list",
-            ])
-            .output()
-            .unwrap()
+            .args(["--home", home.path().to_str().unwrap(), "--json"])
+            .args(subcommand);
+        command
     };
-    let blocked = run();
+    let children = (0..6)
+        .map(|_| {
+            command(&["accounts", "list"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    for child in children {
+        let listed = child.wait_with_output().unwrap();
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+    }
+    let blocked = command(&["logout", &"aa".repeat(32)]).output().unwrap();
     assert!(!blocked.status.success());
-    assert!(
-        String::from_utf8_lossy(&blocked.stdout).contains("already in use"),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&blocked.stdout),
-        String::from_utf8_lossy(&blocked.stderr)
-    );
+    let error: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "runtime_busy");
     assert!(!home.path().join("shared.sqlite3").exists());
     // An abandoned implicit daemon socket must not turn fallback into a lease bypass.
     let socket = wn_cli::daemon::default_socket_path(home.path());
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    let fallback = run();
+    let fallback = command(&["logout", &"aa".repeat(32)]).output().unwrap();
     assert!(!fallback.status.success());
-    assert!(String::from_utf8_lossy(&fallback.stdout).contains("already in use"));
+    let fallback_error: serde_json::Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert_eq!(fallback_error["error"]["code"], "runtime_busy");
     drop(lease);
-    let released = run();
+    let released = command(&["accounts", "list"]).output().unwrap();
     assert!(
         released.status.success(),
         "{}",

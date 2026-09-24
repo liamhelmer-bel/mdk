@@ -166,17 +166,12 @@ async fn dispatch_hosted_runtime_command(
             Ok(account_home) => account_home,
             Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(err) => return Some(crate::command_output_result(cli.json, Err(err))),
-    };
+    let app = runtime.app_handle();
 
     let output = match cli.command.clone() {
+        crate::Command::Logout { pubkey } => {
+            crate::commands::account::logout_command_with_runtime(runtime, pubkey).await
+        }
         crate::Command::UsageDiagnostics { command } => {
             crate::usage_diagnostics_command(runtime, command)
         }
@@ -303,6 +298,7 @@ async fn dispatch_hosted_runtime_command(
 
 pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
+        crate::Command::Logout { .. } => true,
         crate::Command::UsageDiagnostics { .. } => true,
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
         crate::Command::Chats { command } => !matches!(

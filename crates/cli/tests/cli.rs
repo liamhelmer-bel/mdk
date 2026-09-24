@@ -6681,7 +6681,7 @@ fn daemon_refuses_reset_over_socket() {
 }
 
 #[test]
-fn daemon_running_blocks_local_logout_until_ownership_is_released() {
+fn daemon_running_accepts_implicit_logout_through_hosted_runtime() {
     let home = tempfile::tempdir().expect("tempdir");
     let socket = home.path().join("dev").join("wnd.sock");
     let account = create_local_account_id(home.path());
@@ -6711,32 +6711,66 @@ fn daemon_running_blocks_local_logout_until_ownership_is_released() {
         .output()
         .expect("wn logout should start");
 
-    stop_daemon(&socket, &mut child);
-
     assert!(
-        !logout.status.success(),
-        "implicit logout must not mutate a daemon-owned home\n{}",
+        logout.status.success(),
+        "implicit logout should use the daemon-owned runtime\n{}",
         command_output_summary(&logout)
     );
-    assert!(String::from_utf8_lossy(&logout.stdout).contains("already in use"));
-    let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
-    assert_eq!(accounts.len(), 1);
-
-    let released_logout = logout_command
-        .output()
-        .expect("wn logout should start after daemon stops");
-    assert!(
-        released_logout.status.success(),
-        "logout should succeed after ownership is released\n{}",
-        command_output_summary(&released_logout)
-    );
-    let logout_json: Value =
-        serde_json::from_slice(&released_logout.stdout).expect("logout stdout JSON");
+    let logout_json: Value = serde_json::from_slice(&logout.stdout).expect("logout stdout JSON");
     assert_eq!(logout_json["result"]["logged_out"], true);
     assert_eq!(logout_json["result"]["account_id"], account);
-
     let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
     assert_eq!(accounts.len(), 0);
+    stop_daemon(&socket, &mut child);
+}
+
+#[test]
+fn daemon_owned_multi_account_home_accepts_implicit_foreground_watch() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let watching_account = create_local_account_id(home.path());
+    let other_account = create_local_account_id(home.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .arg("--secret-store")
+        .arg("file")
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let mut watch_command = wn_without_relay(home.path());
+    watch_command.env_remove("WN_SOCKET");
+    let watch = watch_command
+        .args([
+            "--account",
+            &watching_account,
+            "stream",
+            "watch",
+            "not-a-group",
+            "--insecure-local",
+        ])
+        .output()
+        .expect("foreground watch should start");
+    let response: Value = serde_json::from_slice(&watch.stdout).expect("watch response JSON");
+    assert!(!watch.status.success(), "invalid group should be rejected");
+    assert_ne!(response["error"]["code"], "runtime_busy", "{response}");
+    assert_ne!(response["error"]["code"], "daemon_forbidden", "{response}");
+
+    let accounts = AccountHome::open(home.path()).accounts().expect("accounts");
+    assert!(
+        accounts
+            .iter()
+            .any(|account| account.account_id_hex == other_account)
+    );
+    stop_daemon(&socket, &mut child);
 }
 
 #[test]

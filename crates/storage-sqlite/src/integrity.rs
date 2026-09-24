@@ -33,12 +33,14 @@ fn probe(connection: &rusqlite::Connection, budget: Duration) -> IntegrityProbe 
     {
         return IntegrityProbe::Incomplete;
     }
+    let mut progress = ProbeProgressHandler {
+        connection,
+        armed: true,
+    };
     let result = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0));
     // Clear the connection-local callback even when SQLite rejects the query.
-    if connection
-        .progress_handler(0, None::<fn() -> bool>)
-        .is_err()
-    {
+    // If clearing fails, Drop retries before this connection can be reused.
+    if progress.disarm().is_err() {
         return IntegrityProbe::Incomplete;
     }
     match result {
@@ -50,6 +52,36 @@ fn probe(connection: &rusqlite::Connection, budget: Duration) -> IntegrityProbe 
             }
             _ => IntegrityProbe::Incomplete,
         },
+    }
+}
+
+struct ProbeProgressHandler<'a> {
+    connection: &'a rusqlite::Connection,
+    armed: bool,
+}
+
+impl ProbeProgressHandler<'_> {
+    fn disarm(&mut self) -> rusqlite::Result<()> {
+        self.connection.progress_handler(0, None::<fn() -> bool>)?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for ProbeProgressHandler<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            // A failed clear must never leave the elapsed-budget callback
+            // installed. Retry the clear and, if it still fails, replace it
+            // with a callback that cannot interrupt later queries.
+            if self
+                .connection
+                .progress_handler(0, None::<fn() -> bool>)
+                .is_err()
+            {
+                let _ = self.connection.progress_handler(100, Some(|| false));
+            }
+        }
     }
 }
 

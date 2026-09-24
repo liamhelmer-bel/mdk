@@ -2487,10 +2487,10 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
-if comparison_recovery.is_some() {
+                if comparison_recovery.is_some() {
                     continue 'worker;
                 }
-                storage_integrity.tick(&client);
+                storage_integrity.tick(&client).await;
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(

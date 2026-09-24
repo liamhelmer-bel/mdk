@@ -612,9 +612,27 @@ async fn handle_execute_connection(
         write_daemon_output(stream, &output).await;
         return Ok(());
     }
-    // run_cli_local opens its own account/session and touches no shared daemon state, so it runs
-    // entirely off the workers lock — the core head-of-line fix (#633).
-    let output = crate::run_cli_local(*cli, import_nsec).await;
+    // Reuse the owner's app and connection caches even for commands that have
+    // not yet moved to the hosted runtime dispatcher. A second app against the
+    // daemon-owned root is the same unsafe double-hydration as a second process.
+    let output = if app_runtime_enabled(defaults) {
+        let Some(runtime) =
+            reconcile_and_clone_runtime(defaults, state.clone(), events.clone(), workers).await
+        else {
+            write_daemon_output(
+                stream,
+                &crate::command_output_result(cli.json, Err(crate::WnError::MissingRelay)),
+            )
+            .await;
+            return Ok(());
+        };
+        crate::run_cli_with_hosted_app(*cli, import_nsec, runtime.app_handle()).await
+    } else {
+        // Daemon startup requires a relay, so production always uses the
+        // shared runtime above. Keep the relay-less test path off the workers
+        // lock so status and local commands avoid head-of-line blocking.
+        crate::run_cli_local(*cli, import_nsec).await
+    };
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
     }

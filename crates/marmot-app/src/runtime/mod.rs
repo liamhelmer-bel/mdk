@@ -1507,6 +1507,13 @@ impl MarmotAppRuntime {
         Self::new(app)
     }
 
+    /// The app handle owned by this runtime. Command adapters that need the
+    /// synchronous app surface must share its storage/cache identity rather
+    /// than constructing a second hydrated app for the same root.
+    pub fn app_handle(&self) -> MarmotApp {
+        self.accounts.app.clone()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<MarmotAppEvent> {
         self.events.subscribe()
     }
