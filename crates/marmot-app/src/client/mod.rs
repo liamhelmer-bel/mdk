@@ -3320,6 +3320,17 @@ impl AppClient {
         audit_context: AuditEventContext,
         wake_targets: &[String],
     ) -> Result<SendSummary, AppError> {
+        // Check the actor against the current MLS policy before validating the
+        // proposed replacement. An unauthorized caller must receive the same
+        // authority error even if its proposal would deplete the admin set.
+        let account = self.app.account_home().account(&self.state.label)?;
+        let local = admin_pubkey_from_account_id_hex(&account.account_id_hex)?;
+        if !self.runtime.admin_pubkeys(group_id)?.contains(&local) {
+            return Err(AccountError::Engine(EngineError::NotGroupAdmin {
+                group_id: group_id.clone(),
+            })
+            .into());
+        }
         let component = AppGroupAdminPolicyComponent::new(admins).to_app_component_data()?;
 
         self.sync_runtime_groups().await?;

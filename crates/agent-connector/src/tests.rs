@@ -30,7 +30,7 @@ use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
@@ -7299,6 +7299,32 @@ async fn connector_socket_manages_members_admins_and_missing_key_packages() {
         "{:?}",
         denied.payload
     );
+    for (operation, request) in [
+        (
+            "grant",
+            AgentControlRequest::GroupAdminAdd {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            },
+        ),
+        (
+            "revoke",
+            AgentControlRequest::GroupAdminRemove {
+                account_id_hex: agent.account_id_hex.clone(),
+                group_id_hex: group_id_hex.clone(),
+                member: peer.account_id_hex.clone(),
+            },
+        ),
+    ] {
+        let denied =
+            serve_control_request_once(&connector, &listener, &socket, operation, request).await;
+        assert!(
+            matches!(denied.payload, AgentControlResponse::Error { ref code, .. } if code == "not_group_admin"),
+            "{operation}: {:?}",
+            denied.payload
+        );
+    }
     assert!(matches!(
         connector
             .group_info_response(&agent.account_id_hex, &group_id_hex)
@@ -7314,16 +7340,21 @@ async fn connector_socket_manages_members_admins_and_missing_key_packages() {
 }
 
 #[derive(Debug)]
-struct ToggleWritePolicy(Arc<AtomicBool>);
+struct ToggleWritePolicy(Arc<AtomicU8>);
 
 impl WritePolicy for ToggleWritePolicy {
     fn admit_event<'a>(
         &'a self,
-        _event: &'a Event,
+        event: &'a Event,
         _addr: &'a std::net::SocketAddr,
     ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
-            if self.0.load(Ordering::SeqCst) {
+            let reject = match self.0.load(Ordering::SeqCst) {
+                1 => true,
+                2 => u16::from(event.kind) == 1059,
+                _ => false,
+            };
+            if reject {
                 PolicyResult::Reject("injected relay rejection".into())
             } else {
                 PolicyResult::Accept
@@ -7335,7 +7366,7 @@ impl WritePolicy for ToggleWritePolicy {
 #[tokio::test]
 async fn connector_socket_reports_relay_rejection_for_member_add() {
     let dir = tempfile::tempdir().unwrap();
-    let reject = Arc::new(AtomicBool::new(false));
+    let reject = Arc::new(AtomicU8::new(0));
     let relay =
         LocalRelay::new(RelayBuilder::default().write_policy(ToggleWritePolicy(reject.clone())));
     relay.run().await.unwrap();
@@ -7379,7 +7410,7 @@ async fn connector_socket_reports_relay_rejection_for_member_add() {
         panic!("expected group_created")
     };
     let listener = bind_connector_socket(&socket).unwrap();
-    reject.store(true, Ordering::SeqCst);
+    reject.store(1, Ordering::SeqCst);
     let response = serve_control_request_once(
         &connector,
         &listener,
@@ -7387,7 +7418,7 @@ async fn connector_socket_reports_relay_rejection_for_member_add() {
         "reject-member-add",
         AgentControlRequest::GroupMemberAdd {
             account_id_hex: agent.account_id_hex.clone(),
-            group_id_hex,
+            group_id_hex: group_id_hex.clone(),
             members: vec![peer.account_id_hex.clone()],
             initial_admins: vec![],
         },
@@ -7399,6 +7430,54 @@ async fn connector_socket_reports_relay_rejection_for_member_add() {
         "{:?}",
         response.payload
     );
+    reject.store(2, Ordering::SeqCst);
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "reject-welcome-only",
+        AgentControlRequest::GroupMemberAdd {
+            account_id_hex: agent.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            members: vec![peer.account_id_hex.clone()],
+            initial_admins: vec![],
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            response.payload,
+            AgentControlResponse::GroupMembershipUpdated {
+                pending_welcome_count: Some(1),
+                ..
+            }
+        ),
+        "{:?}",
+        response.payload
+    );
+    let pending = connector
+        .group_pending_welcomes(&agent.label, &group_id_hex)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "failed Welcome must remain retryable");
+    let AgentControlResponse::GroupWelcomeStatus {
+        pending: polled, ..
+    } = connector
+        .group_welcome_status_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap()
+    else {
+        panic!("expected group Welcome status")
+    };
+    assert_eq!(polled, pending);
+    let AgentControlResponse::MaintenanceStatus { status } = connector
+        .maintenance_status_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap()
+    else {
+        panic!("expected maintenance status")
+    };
+    assert_eq!(status.pending_welcomes, pending);
     connector.runtime.shutdown().await;
     peer_runtime.shutdown().await;
 }
