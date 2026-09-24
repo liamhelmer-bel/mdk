@@ -301,9 +301,9 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     }
 
-    // Listing reads only AccountHome metadata; a direct caller must remain
-    // usable while another process owns the hydrated runtime. The profile
-    // cache is omitted on this path because it lives in shared SQLite state.
+    // Listing must stay usable while another process owns the hydrated
+    // runtime. Preserve the cached profile in the usual unowned case, but
+    // fall back to AccountHome metadata when the root is already owned.
     if matches!(
         cli.command,
         Command::Account {
@@ -313,10 +313,25 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
         }
     ) || (matches!(cli.command, Command::Whoami) && cli.account.is_none())
     {
-        return command_output_result(
-            cli.json,
-            commands::account::account_list_command(&AccountHome::open(&home), None),
-        );
+        // The normal execution path validates the global relay before opening
+        // the app. A metadata-only listing must retain that CLI contract.
+        if let Err(error) = resolve_relay(cli.relay.clone()) {
+            return command_output_result(cli.json, Err(error));
+        }
+        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
+            Ok(lease) => {
+                let output = run_cli_local(cli, import_nsec).await;
+                drop(lease);
+                return output;
+            }
+            Err(marmot_app::AppError::RuntimeBusy) => {
+                return command_output_result(
+                    cli.json,
+                    commands::account::account_list_command(&AccountHome::open(&home), None),
+                );
+            }
+            Err(error) => return command_output_result(cli.json, Err(error.into())),
+        }
     }
 
     // Socket clients use the daemon's ownership. Direct storage mutation,
