@@ -270,6 +270,14 @@ def command_bundle(archive_path, root_name, report_path):
             uncompressed += info.file_size
             if uncompressed > MAX_ARCHIVE_BYTES:
                 raise ArtifactError("oversized archive")
+            # Check every member's stream and CRC, including provenance and
+            # manifests that are not otherwise read by this validator.
+            try:
+                with archive.open(info) as stream:
+                    while stream.read(1024 * 1024):
+                        pass
+            except (OSError, RuntimeError, zipfile.BadZipFile, EOFError) as error:
+                raise ArtifactError("corrupt archive") from error
         prefix = root_name + "/"
         blobs = {}
         for abi in ABI_ORDER:

@@ -294,6 +294,15 @@ class AndroidArtifactTests(unittest.TestCase):
             0,
         )
 
+        extra_corrupt = root.parent / "extra-corrupt.zip"
+        extra_corrupt.write_bytes(good.read_bytes())
+        with zipfile.ZipFile(extra_corrupt, "a") as handle:
+            handle.writestr(f"{root.name}/manifest.txt", b"corrupt-me-unique")
+        extra_corrupt.write_bytes(extra_corrupt.read_bytes().replace(b"corrupt-me-unique", b"corrupt-me-UNIQUE"))
+        self.assertIn("corrupt archive", run_validator(
+            "bundle", str(extra_corrupt), "--root", root.name, "--report", str(report)
+        ).stderr)
+
         missing = self.zip_tree(root, skip={"android-elf.json"}, label="missing-report")
         self.assertIn("missing embedded report", run_validator(
             "bundle", str(missing), "--root", root.name, "--report", str(report)
