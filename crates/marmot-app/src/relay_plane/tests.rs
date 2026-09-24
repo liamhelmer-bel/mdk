@@ -103,6 +103,16 @@ async fn set_transport_signer_arms_the_sdk_client_for_nip42_auth() {
         sdk.client().signer().await.is_ok(),
         "the transport client must hold a signer to answer NIP-42 AUTH"
     );
+    let directory_client = plane
+        .inner
+        .transport
+        .directory_client
+        .as_ref()
+        .expect("sdk-backed plane has an anonymous directory client");
+    assert!(
+        directory_client.signer().await.is_err(),
+        "directory queries must never borrow the transport signer's credentials"
+    );
 }
 
 #[test]
@@ -300,13 +310,9 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let _ = notifications.send(RelayPoolNotification::Shutdown);
     let _ = notifications.send(RelayPoolNotification::Shutdown);
 
-    let outcome = run_relay_notification_consumer(
-        receiver,
-        relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
-    )
-    .await;
+    let outcome =
+        run_relay_notification_consumer(receiver, relay_plane.inner.transport.adapter.clone())
+            .await;
 
     assert_eq!(
         outcome.exit,
@@ -317,8 +323,6 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
     let resumed = run_relay_notification_consumer(
         outcome.receiver,
         relay_plane.inner.transport.adapter.clone(),
-        relay_plane.inner.transport.directory_events.clone(),
-        relay_plane.inner.directory.clone(),
     )
     .await;
     assert_eq!(
@@ -329,7 +333,7 @@ async fn notification_consumer_reports_lag_without_silently_ending() {
 }
 
 #[tokio::test]
-async fn notification_recovery_closes_account_delivery_and_signals_directory_rebuild() {
+async fn notification_recovery_closes_only_account_delivery() {
     let relay = Arc::new(RecordingRelayClient::default());
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account = MemberId::new(vec![0xA1; 32]);
@@ -349,10 +353,12 @@ async fn notification_recovery_closes_account_delivery_and_signals_directory_reb
             .is_none(),
         "closing the producer must drive the account worker into its existing reconnect path"
     );
-    assert!(matches!(
-        directory_events.recv().await,
-        Ok(DirectoryRelayPlaneEvent::RecoveryRequired)
-    ));
+    assert!(
+        timeout(Duration::from_millis(20), directory_events.recv())
+            .await
+            .is_err(),
+        "account receiver loss must not invalidate the independent directory receiver"
+    );
 
     let health = relay_plane
         .inner
@@ -521,11 +527,8 @@ async fn notification_supervisor_restarts_after_consumer_panic() {
     let relay_plane = MarmotRelayPlane::new(Some(Duration::from_secs(30)), relay.clone());
     let account_adapter = relay_plane.account_adapter(MemberId::new(vec![0xA1; 32]), relay);
     let source = Arc::new(TestNotificationSource::panic_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         loop {
@@ -1757,15 +1760,27 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
     let sdk_subscriptions = relay_plane
         .inner
         .transport
-        .sdk_relay_client
+        .directory_client
         .as_ref()
         .unwrap()
-        .client()
         .subscriptions()
         .await;
     assert!(
         sdk_subscriptions.contains_key(&SubscriptionId::new(subscription_id.clone())),
         "the first SDK subscription must be live before the later batch fails"
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .sdk_relay_client
+            .as_ref()
+            .unwrap()
+            .client()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone())),
+        "directory read filters must never be installed on the account transport client"
     );
     assert!(
         relay_plane
@@ -1776,7 +1791,454 @@ async fn directory_sync_keeps_filter_for_subscription_created_before_later_error
         "the validation filter must be committed for every live SDK subscription"
     );
 
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: Vec::new(),
+                watched_user_count: 0,
+                batches: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .expect("empty plan removes stale directory interests");
+    assert!(
+        !relay_plane
+            .inner
+            .transport
+            .directory_client
+            .as_ref()
+            .unwrap()
+            .subscriptions()
+            .await
+            .contains_key(&SubscriptionId::new(subscription_id.clone()))
+    );
+    assert!(
+        !relay_plane
+            .inner
+            .directory
+            .accepts_live_event(&subscription_id, &author, 0)
+            .await
+    );
+
     relay_plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_endpoint_change_retries_a_batch_left_pending_by_partial_failure() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let old_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let new_relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let old_url = old_relay.url().await.to_string();
+    let new_url = new_relay.url().await.to_string();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    let plan = |endpoint: &str, bob_author: String| DirectorySyncPlan {
+        endpoints: vec![TransportEndpoint(endpoint.to_owned())],
+        watched_user_count: 2,
+        batches: vec![
+            DirectorySyncBatch {
+                subscription_id: "directory_users_alice".to_owned(),
+                authors: vec![alice.public_key().to_hex()],
+                kinds: vec![0],
+                since: None,
+            },
+            DirectorySyncBatch {
+                subscription_id: "directory_users_bob".to_owned(),
+                authors: vec![bob_author],
+                kinds: vec![0],
+                since: None,
+            },
+        ],
+    };
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&old_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    assert_eq!(
+        relay_plane
+            .sync_directory_user_subscriptions(plan(&new_url, "invalid-pubkey".to_owned()), false)
+            .await
+            .unwrap_err(),
+        "invalid directory author"
+    );
+    let desired = [
+        "directory_users_alice".to_owned(),
+        "directory_users_bob".to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    let (to_add, _) = relay_plane
+        .inner
+        .directory
+        .subscription_diff(&desired)
+        .await;
+    assert_eq!(
+        to_add,
+        ["directory_users_bob".to_owned()].into_iter().collect()
+    );
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        1
+    );
+
+    relay_plane
+        .sync_directory_user_subscriptions(plan(&new_url, bob.public_key().to_hex()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_plane
+            .inner
+            .directory
+            .stats()
+            .await
+            .active_subscriptions,
+        2
+    );
+
+    let writer = NostrSdkClient::builder().signer(bob.clone()).build();
+    let relay_url = RelayUrl::parse(&new_url).unwrap();
+    writer.add_relay(relay_url.clone()).await.unwrap();
+    writer
+        .try_connect_relay(relay_url.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"bob"}"#)
+        .sign_with_keys(&bob)
+        .unwrap();
+    writer.send_event_to([relay_url], &profile).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let DirectoryRelayPlaneEvent::Record(record) = events.recv().await.unwrap()
+                && record.event.id == profile.id.to_hex()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Bob's retried subscription must deliver from the new relay");
+    writer.shutdown().await;
+    relay_plane.shutdown().await;
+}
+
+#[tokio::test]
+async fn directory_subscribe_error_restores_filter_and_keeps_rebuild_pending() {
+    let id = "directory_users_retry";
+    let old_author = "11".repeat(32);
+    let new_author = "22".repeat(32);
+    let directory =
+        directory_plane_with_active_subscription(id, vec![old_author.clone()], vec![0]).await;
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    directory.set_subscription_endpoints(&[endpoint]).await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![new_author.clone()], vec![0]),
+        )
+        .await;
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.accepts_live_event(id, &old_author, 0).await);
+    assert!(!directory.accepts_live_event(id, &new_author, 0).await);
+}
+
+#[tokio::test]
+async fn directory_forwards_immediate_event_while_rebuild_is_pending() {
+    use nostr::prelude::{EventBuilder, Keys};
+
+    let keys = Keys::generate();
+    let id = "directory_users_immediate";
+    let endpoint = RelayUrl::parse("wss://relay.example").unwrap();
+    let directory =
+        directory_plane_with_active_subscription(id, vec![keys.public_key().to_hex()], vec![0])
+            .await;
+    directory
+        .set_subscription_endpoints(std::slice::from_ref(&endpoint))
+        .await;
+    directory
+        .mark_rebuild_pending(&[id.to_owned()].into_iter().collect())
+        .await;
+    let previous = directory
+        .record_subscription_filter(
+            id.to_owned(),
+            DirectorySubscriptionFilter::new(vec![keys.public_key().to_hex()], vec![0]),
+        )
+        .await;
+    let source = Arc::new(TestNotificationSource {
+        sender: broadcast::channel(8).0,
+        subscriptions: AtomicUsize::new(0),
+        preload_lag: false,
+        panic_first: AtomicBool::new(false),
+    });
+    let (sender, mut events) = broadcast::channel(8);
+    let forwarder =
+        spawn_directory_notification_forwarder(source.clone(), sender, directory.clone());
+    timeout(Duration::from_secs(2), async {
+        while source.subscriptions.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"immediate"}"#)
+        .sign_with_keys(&keys)
+        .unwrap();
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint.clone(),
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile.clone()),
+    });
+    let record = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DirectoryRelayPlaneEvent::Record(record) = record else {
+        panic!("immediate matching event must be forwarded while subscribe is still pending");
+    };
+    assert_eq!(record.event.id, profile.id.to_hex());
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+
+    directory
+        .restore_failed_subscription_filter(id, previous)
+        .await;
+    let (to_add, _) = directory
+        .subscription_diff(&[id.to_owned()].into_iter().collect())
+        .await;
+    assert!(to_add.contains(id));
+    assert_eq!(directory.stats().await.active_subscriptions, 0);
+    assert!(directory.mark_auth_required(id, endpoint.as_str()).await);
+    source.send(RelayPoolNotification::Event {
+        relay_url: endpoint,
+        subscription_id: SubscriptionId::new(id),
+        event: Box::new(profile),
+    });
+    source.send(RelayPoolNotification::Shutdown);
+    timeout(Duration::from_secs(2), forwarder)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+    ));
+}
+
+async fn directory_live_auth_challenge(deny_read: bool) {
+    use futures::{SinkExt, StreamExt};
+    use nostr::prelude::{EventBuilder, Keys};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let keys = Keys::generate();
+    let profile = EventBuilder::new(Kind::Metadata, r#"{"name":"jack"}"#)
+        .sign_with_keys(&keys)
+        .unwrap();
+    let expected_id = profile.id.to_hex();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = TransportEndpoint(format!("ws://{}", listener.local_addr().unwrap()));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let auth_responses = Arc::new(AtomicUsize::new(0));
+    let server = {
+        let requests = requests.clone();
+        let auth_responses = auth_responses.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if request[0] == "AUTH" {
+                    auth_responses.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                if request[0] != "REQ" {
+                    continue;
+                }
+                requests.fetch_add(1, Ordering::SeqCst);
+                let subscription = request[1].as_str().unwrap();
+                socket
+                    .send(Message::Text(r#"["AUTH","optional-challenge"]"#.into()))
+                    .await
+                    .unwrap();
+                let reply = if deny_read {
+                    serde_json::json!([
+                        "CLOSED",
+                        subscription,
+                        "auth-required: read requires login"
+                    ])
+                } else {
+                    serde_json::json!(["EVENT", subscription, profile])
+                };
+                socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .unwrap();
+                if !deny_read {
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!(["EOSE", subscription]).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+    };
+
+    let relay_plane = MarmotRelayPlane::full_history_with_loopback(true);
+    let mut events = relay_plane.subscribe_directory_events();
+    relay_plane
+        .sync_directory_user_subscriptions(
+            DirectorySyncPlan {
+                endpoints: vec![endpoint],
+                watched_user_count: 1,
+                batches: vec![DirectorySyncBatch {
+                    subscription_id: "directory_users_auth".to_owned(),
+                    authors: vec![keys.public_key().to_hex()],
+                    kinds: vec![0],
+                    since: None,
+                }],
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    if deny_read {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let stats = relay_plane.inner.directory.stats().await;
+                if stats.auth_required_routes == 1 && stats.active_subscriptions == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("auth-required CLOSE must remove healthy directory coverage");
+        assert!(
+            timeout(Duration::from_millis(200), events.recv())
+                .await
+                .is_err(),
+            "auth-required must not trigger a rebuild loop"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    } else {
+        let record = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let DirectoryRelayPlaneEvent::Record(record) = record else {
+            panic!("optional AUTH must not trigger a recovery rebuild");
+        };
+        assert_eq!(record.event.id, expected_id);
+        let stats = relay_plane.inner.directory.stats().await;
+        assert_eq!(stats.auth_required_routes, 0);
+        assert_eq!(stats.active_subscriptions, 1);
+    }
+    assert_eq!(auth_responses.load(Ordering::SeqCst), 0);
+    relay_plane.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_auth_required_is_visible_without_retry_loop() {
+    directory_live_auth_challenge(true).await;
+}
+
+#[tokio::test]
+async fn anonymous_live_directory_accepts_event_after_optional_auth() {
+    directory_live_auth_challenge(false).await;
+}
+
+#[tokio::test]
+async fn directory_notification_lag_requests_refresh() {
+    let source: Arc<dyn RelayNotificationSource> = Arc::new(TestNotificationSource::lag_once());
+    let (sender, mut receiver) = broadcast::channel(4);
+    let directory = DirectoryRelayPlane::new(Arc::new(RecordingDirectoryFetcher::default()));
+    let task = spawn_directory_notification_forwarder(source, sender, directory);
+    assert!(matches!(
+        timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        DirectoryRelayPlaneEvent::RecoveryRequired
+    ));
+    task.abort();
+    let _ = task.await;
+}
+
+#[tokio::test]
+async fn directory_auth_required_blocks_only_the_rejecting_endpoint() {
+    let author = "11".repeat(32);
+    let id = "directory_users_shared";
+    let directory =
+        directory_plane_with_active_subscription(id, vec![author.clone()], vec![0]).await;
+    let blocked = RelayUrl::parse("wss://blocked.example").unwrap();
+    let healthy = RelayUrl::parse("wss://healthy.example").unwrap();
+    assert!(
+        directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(
+        !directory
+            .set_subscription_endpoints(&[blocked.clone(), healthy.clone()])
+            .await
+    );
+    assert!(directory.mark_auth_required(id, blocked.as_str()).await);
+    assert!(
+        !directory
+            .accepts_live_event_from(id, blocked.as_str(), &author, 0)
+            .await
+    );
+    assert!(
+        directory
+            .accepts_live_event_from(id, healthy.as_str(), &author, 0)
+            .await
+    );
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 1);
+    assert_eq!(stats.active_subscriptions, 1);
+
+    assert!(directory.mark_auth_required(id, healthy.as_str()).await);
+    let stats = directory.stats().await;
+    assert_eq!(stats.auth_required_routes, 2);
+    assert_eq!(stats.active_subscriptions, 0);
 }
 
 #[tokio::test]
@@ -1938,11 +2400,8 @@ async fn supervised_notification_lag_recovers_later_inbound_exactly_once() {
         .unwrap();
 
     let source = Arc::new(TestNotificationSource::lag_once());
-    let supervisor = spawn_relay_notification_supervisor(
-        source.clone(),
-        relay_plane.inner.transport.clone(),
-        relay_plane.inner.directory.clone(),
-    );
+    let supervisor =
+        spawn_relay_notification_supervisor(source.clone(), relay_plane.inner.transport.clone());
 
     timeout(Duration::from_secs(2), async {
         while relay_plane
