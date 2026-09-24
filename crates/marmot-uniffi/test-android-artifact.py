@@ -294,6 +294,22 @@ class AndroidArtifactTests(unittest.TestCase):
             0,
         )
 
+        extra_library = root.parent / "extra-library.zip"
+        extra_library.write_bytes(good.read_bytes())
+        with zipfile.ZipFile(extra_library, "a") as handle:
+            handle.writestr(f"{root.name}/jniLibs/other/libmarmot_uniffi.so", b"rogue")
+        self.assertIn("unexpected archive library", run_validator(
+            "bundle", str(extra_library), "--root", root.name, "--report", str(report)
+        ).stderr)
+
+        outside_root = root.parent / "outside-root.zip"
+        outside_root.write_bytes(good.read_bytes())
+        with zipfile.ZipFile(outside_root, "a") as handle:
+            handle.writestr("other/manifest.txt", b"extra")
+        self.assertIn("outside bundle root", run_validator(
+            "bundle", str(outside_root), "--root", root.name, "--report", str(report)
+        ).stderr)
+
         extra_corrupt = root.parent / "extra-corrupt.zip"
         extra_corrupt.write_bytes(good.read_bytes())
         with zipfile.ZipFile(extra_corrupt, "a") as handle:

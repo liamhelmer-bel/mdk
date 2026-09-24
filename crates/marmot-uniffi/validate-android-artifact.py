@@ -255,11 +255,17 @@ def command_bundle(archive_path, root_name, report_path):
         members = archive.infolist()
         if len(members) > MAX_MEMBERS:
             raise ArtifactError("oversized archive")
+        prefix = root_name + "/"
+        expected_libraries = {prefix + library_relative(abi) for abi in ABI_ORDER}
         names = []
         uncompressed = 0
         for info in members:
             safe_member_name(info.filename)
             is_dir = member_kind(info)
+            if not info.filename.startswith(prefix):
+                raise ArtifactError("archive member outside bundle root")
+            if not is_dir and info.filename.endswith(".so") and info.filename not in expected_libraries:
+                raise ArtifactError(f"unexpected archive library: {info.filename[len(prefix):]}")
             if info.filename in names:
                 raise ArtifactError("duplicate archive member")
             names.append(info.filename)
@@ -278,7 +284,6 @@ def command_bundle(archive_path, root_name, report_path):
                         pass
             except (OSError, RuntimeError, zipfile.BadZipFile, EOFError) as error:
                 raise ArtifactError("corrupt archive") from error
-        prefix = root_name + "/"
         blobs = {}
         for abi in ABI_ORDER:
             member = prefix + library_relative(abi)
