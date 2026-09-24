@@ -732,15 +732,7 @@ pub(crate) async fn auto_watch_agent_stream_starts(
             Ok(account_home) => account_home,
             Err(_) => return,
         };
-    let app = match crate::app_for(
-        defaults.home.clone(),
-        defaults.relay.clone(),
-        defaults.discovery_relays.clone(),
-        account_home.clone(),
-    ) {
-        Ok(app) => app,
-        Err(_) => return,
-    };
+    let app = runtime.app_handle();
     for message in &summary.messages {
         let Some(start) = marmot_app::StreamStartView::from_event(message.kind, &message.tags)
         else {
