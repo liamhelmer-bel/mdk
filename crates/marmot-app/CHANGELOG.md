@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Preserve normalized line breaks in ingested kind:0 `about` text while still removing
+  unsafe controls from every known profile string. Previously flattened cached bios stay
+  until a newer event replaces them. (#1973)
+
 - Count account-scoped relay publishes on the shared device-wide publish counters.
   `relay_publish_attempts` was previously always zero in production. Success now
   requires the acknowledgement threshold, and publishes dropped in flight (such as

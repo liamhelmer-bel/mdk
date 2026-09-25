@@ -10838,6 +10838,69 @@ fn remember_directory_profile_if_newer_keeps_local_edit_on_equal_timestamp() {
 }
 
 #[test]
+fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
+    // Equal timestamps stay immutable even when the events differ only by bio
+    // line breaks: a cached `onetwo` may be a current same-second edit, not a
+    // row flattened by the pre-#1973 filter (mdk#206). Only a newer event
+    // replaces it, for peers and for accounts held on this device alike.
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let peer = format!("{:064x}", 1973);
+    let created_at = 1_700_001_973;
+    for (account_id, local) in [
+        (peer.as_str(), false),
+        (alice.account_id_hex.as_str(), true),
+    ] {
+        app.remember_directory_profile(
+            account_id,
+            &UserProfileMetadata {
+                name: Some("bob".to_owned()),
+                about: Some("onetwo".to_owned()),
+                created_at,
+                ..UserProfileMetadata::default()
+            },
+        )
+        .unwrap();
+        let ingest = |created_at: u64| {
+            let mut event = NostrTransportEvent::new_unsigned(
+                account_id.to_owned(),
+                KIND_NOSTR_METADATA,
+                Vec::new(),
+                serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
+            );
+            event.created_at = created_at;
+            app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+                endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+                event,
+            })
+            .unwrap();
+            app.directory_entry_for_account_id(account_id)
+                .unwrap()
+                .unwrap()
+        };
+
+        let same_second = ingest(created_at);
+        assert_eq!(same_second.local_account.is_some(), local);
+        assert_eq!(
+            same_second
+                .profile
+                .and_then(|profile| profile.about)
+                .as_deref(),
+            Some("onetwo"),
+            "local={local}"
+        );
+        let newer = ingest(created_at + 1);
+        assert_eq!(
+            newer.profile.and_then(|profile| profile.about).as_deref(),
+            Some("one\ntwo"),
+            "local={local}"
+        );
+    }
+}
+
+#[test]
 fn roster_labels_keep_profiles() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
@@ -11860,6 +11923,98 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         reopened.source_relays,
         vec!["wss://profiles.example".to_owned()]
     );
+}
+
+#[test]
+fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let author = format!("{:064x}", 868);
+    let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
+    let mut event = NostrTransportEvent::new_unsigned(
+        author.clone(),
+        KIND_NOSTR_METADATA,
+        Vec::new(),
+        serde_json::json!({
+            "name": payload,
+            "displayName": payload,
+            "about": payload,
+            "picture": payload,
+            "banner": payload,
+            "nip05": payload,
+            "lud16": payload,
+            "website": "https://example.test",
+            "created_at": 42,
+            "source_relays": ["wss://spoof.example"]
+        })
+        .to_string(),
+    );
+    event.created_at = 1_700_000_868;
+    app.ingest_directory_relay_event(crate::relay_plane::DirectoryRelayEventRecord {
+        endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
+        event,
+    })
+    .unwrap();
+
+    let assert_normalized = |profile: &UserProfileMetadata, source_relays: Option<&[String]>| {
+        let single = "firstsecond[2Jthird";
+        assert_eq!(profile.name.as_deref(), Some(single));
+        assert_eq!(profile.display_name.as_deref(), Some(single));
+        assert_eq!(profile.picture.as_deref(), Some(single));
+        assert_eq!(profile.banner.as_deref(), Some(single));
+        assert_eq!(profile.nip05.as_deref(), Some(single));
+        assert_eq!(profile.lud16.as_deref(), Some(single));
+        assert_eq!(profile.about.as_deref(), Some("first\nsecond[2J\n\nthird"));
+        assert_eq!(profile.created_at, 1_700_000_868);
+        assert_eq!(
+            profile.extra.get("website"),
+            Some(&serde_json::json!("https://example.test"))
+        );
+        assert!(!profile.extra.contains_key("created_at"));
+        assert!(!profile.extra.contains_key("source_relays"));
+        if let Some(source_relays) = source_relays {
+            assert_eq!(profile.source_relays, source_relays);
+        }
+    };
+
+    let cached = app
+        .directory_entry_for_account_id(&author)
+        .unwrap()
+        .expect("ingested profile is cached")
+        .profile
+        .expect("cached profile");
+    assert_normalized(&cached, Some(&["wss://profiles.example".to_owned()]));
+
+    let shared = app
+        .shared_storage()
+        .unwrap()
+        .public_directory_user(&author)
+        .unwrap()
+        .expect("shared directory row");
+    let shared_profile: UserProfileMetadata =
+        serde_json::from_str(shared.profile_json.as_ref().expect("profile_json")).unwrap();
+    assert_normalized(&shared_profile, None);
+    assert!(
+        shared_profile.source_relays.is_empty(),
+        "shared records omit source hints"
+    );
+    assert_eq!(shared_profile.about, cached.about);
+    assert!(shared.profile_json.as_ref().unwrap().contains("\\n"));
+
+    drop(app);
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let reopened = app
+        .directory_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.account_id_hex == author)
+        .expect("reopened directory_entries still lists the author")
+        .profile
+        .expect("reopened profile");
+    assert_normalized(&reopened, Some(&["wss://profiles.example".to_owned()]));
+    assert_eq!(reopened.about, cached.about);
 }
 
 #[test]
