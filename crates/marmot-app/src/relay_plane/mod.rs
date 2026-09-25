@@ -80,6 +80,18 @@ pub struct MarmotRelayPlane {
     inner: Arc<MarmotRelayPlaneInner>,
 }
 
+#[cfg(test)]
+/// Holds only this plane's router; drop always resumes it, including on a
+/// fixture panic. Production routing has no pause path.
+pub(crate) struct RouterPauseForTest(MarmotRelayPlane);
+
+#[cfg(test)]
+impl Drop for RouterPauseForTest {
+    fn drop(&mut self) {
+        self.0.spawn_router();
+    }
+}
+
 struct MarmotRelayPlaneInner {
     subscription_rebuild_lookback: Option<Duration>,
     relay_safety: RelaySafetyPolicy,
@@ -1422,6 +1434,16 @@ impl MarmotRelayPlane {
             .store(0, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pause_router_for_test(&self) -> RouterPauseForTest {
+        let handle = self.inner.transport.router.lock().await.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        RouterPauseForTest(self.clone())
+    }
+
     fn spawn_router(&self) {
         if self.inner.transport.shutting_down.load(Ordering::SeqCst) {
             return;
@@ -2335,6 +2357,17 @@ impl MarmotRelayPlaneAccountAdapter {
     /// attributed to exactly the account whose subscribes produced it.
     pub(crate) fn account_id(&self) -> &MemberId {
         &self.account_id
+    }
+
+    /// Read only the live activation ordinal for worker-owned comparison
+    /// admission. An SDK connection generation is a different lifetime.
+    pub(crate) async fn account_subscription_attempt(&self) -> Option<SubscriptionAttempt> {
+        self.relay_plane
+            .inner
+            .transport
+            .adapter
+            .account_subscription_attempt(&self.account_id)
+            .await
     }
 
     pub(crate) async fn reconcile_inbox_history(

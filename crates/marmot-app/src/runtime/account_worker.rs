@@ -2,7 +2,7 @@
 //! and the runtime-event publishing helpers the loop drives.
 
 mod attachments;
-mod bounded_recovery;
+pub(super) mod bounded_recovery;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use crate::app_telemetry::runtime::{Observation, Outcome as TelemetryOutcome};
@@ -33,8 +33,10 @@ use super::{
     wait_for_runtime_shutdown,
 };
 use crate::app_telemetry::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
+use crate::client::recovery::AttemptGrant;
 use crate::client::{
-    CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    ComparisonNetworkJob, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
+    PreparedGroupImageUploadStart,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
@@ -52,6 +54,16 @@ use crate::{
     SendSummary, SyncSummary,
 };
 use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
+use transport_nostr_adapter::SubscriptionAttempt;
+
+struct ComparisonMaintenanceJob {
+    grant: AttemptGrant,
+    subscription_attempt: SubscriptionAttempt,
+    network: ComparisonNetworkJob,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    backfill_armed: bool,
+    phase: Observation,
+}
 
 pub(crate) struct ManagedAccountWorker {
     pub(super) ready: bool,
@@ -476,6 +488,12 @@ pub(crate) enum AccountWorkerCommand {
         elapsed: Duration,
         respond: oneshot::Sender<()>,
     },
+    /// Arm a current comparison through the same serialized owner used by
+    /// production, so a fixture never writes a stale plan beside the worker.
+    #[cfg(test)]
+    RequestBoundedComparisonForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     #[cfg(any(test, feature = "test-policy-overrides"))]
     RecoveryRetrySnapshot {
         respond: oneshot::Sender<(storage_sqlite::RecoveryRetryState, Duration, bool)>,
@@ -487,6 +505,20 @@ pub(crate) enum AccountWorkerCommand {
 }
 
 impl AccountWorkerCommand {
+    /// Reads that can cross a deferred explicit catch-up without changing the
+    /// recovery grant or the order of later mutations.
+    fn readable_during_comparison_catch_up(&self) -> bool {
+        matches!(
+            self,
+            Self::Members { .. }
+                | Self::MemberIdsPage { .. }
+                | Self::GroupMlsState { .. }
+                | Self::GroupRoster { .. }
+                | Self::QuarantinedGroups { .. }
+                | Self::GroupRecoveryStatus { .. }
+        )
+    }
+
     fn needs_media_slot(&self) -> bool {
         match self {
             Self::UploadPreparedGroupImage { .. }
@@ -1043,7 +1075,7 @@ async fn run_app_runtime_account_worker(
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http) {
+    while let Some(index) = ready_command_index(&pending, &media_http, false) {
         let command = pending
             .remove(index)
             .expect("selected pending command exists");
@@ -1141,6 +1173,7 @@ async fn run_app_runtime_account_worker(
 
     let mut yield_to_convergence = false;
     let mut bounded_recovery: Option<bounded_recovery::Job> = None;
+    let mut comparison_maintenance: Option<ComparisonMaintenanceJob> = None;
     let mut yield_to_bounded_admission = false;
     let mut bounded_probe_at = TokioInstant::now();
     let mut bounded_prepare_error_reported = false;
@@ -1169,7 +1202,11 @@ async fn run_app_runtime_account_worker(
                 shared
                     .bounded_preparation_probes
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
+                bounded_recovery::prepare(
+                    &mut client,
+                    EpochBackfillExecutionSeam::Maintenance,
+                    &shared.recovery_credit_pool(),
+                )
             })();
             match probe {
                 Ok(Some(plan)) => {
@@ -1190,16 +1227,62 @@ async fn run_app_runtime_account_worker(
                 }
             }
         }
-        let ready_command = ready_command_index(&pending, &media_http);
+        let ready_command =
+            ready_command_index(&pending, &media_http, comparison_maintenance.is_some());
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
-                return;
+                break 'worker;
             }
             _ = &mut shutdown => {
-                return;
+                break 'worker;
             }
             _ = tokio::time::sleep_until(bounded_probe_at), if bounded_enabled && bounded_recovery.is_none() => {}
+            completed = async {
+                comparison_maintenance.as_mut().expect("comparison task exists").network.wait().await
+            }, if comparison_maintenance.is_some() => {
+                let job = comparison_maintenance.take().expect("completed comparison task exists");
+                let result = match completed {
+                    Ok((credit, network)) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .extend(network.outcome_kinds_for_test());
+                        // The task owned this permit until its future really
+                        // ended; keep it through owner admission/checkpoint.
+                        let _credit = credit;
+                        client.finish_comparison_grant(
+                            job.grant, job.subscription_attempt, network,
+                        ).await
+                    }
+                    Err(error) => {
+                        #[cfg(test)]
+                        shared
+                            .comparison_test_trace
+                            .lock()
+                            .unwrap()
+                            .push("task_join_error");
+                        tracing::warn!(
+                            target: "marmot_app::account_worker",
+                            method = "comparison_maintenance",
+                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
+                            "comparison task ended before worker admission"
+                        );
+                        Ok(EpochBackfillRunOutcome::Deferred)
+                    }
+                };
+                let _ = report_pending_epoch_backfill_result(
+                    result, job.backfill_armed, job.observation,
+                    &events, &account_id_hex, &account_label, &shared,
+                );
+                finish_periodic_maintenance_after_recovery(
+                    &mut client, &events, &account_id_hex, &account_label,
+                    &shared, &product_backlog, &mut scheduled_convergence,
+                ).await;
+                job.phase.finish(TelemetryOutcome::Success);
+            }
             completed = async {
                 bounded_recovery.as_mut().expect("bounded task exists").wait().await
             }, if bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::waiting) => {
@@ -1261,22 +1344,35 @@ async fn run_app_runtime_account_worker(
                             &mut client,
                         );
                     }
-                    None => return,
+                    None => break 'worker,
                 }
             }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
-                    Some(command) => Some(command),
-                    None => commands.recv().await,
+                    Some(command) => Some((command, true)),
+                    None => commands.recv().await.map(|command| (command, false)),
                 }
             }, if (!yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex))
                 && (!yield_to_bounded_admission || !bounded_recovery.as_ref().is_some_and(bounded_recovery::Job::ready)) => {
                 yield_to_convergence = true;
                 yield_to_bounded_admission = true;
                 match command {
-                    Some(command) => {
+                    Some((command, approved_pending)) => {
+                        // ready_command_index has already approved pending work
+                        // before the CatchUp barrier. Apply this extra gate only
+                        // to fresh channel arrivals, or the earlier work would
+                        // be requeued behind CatchUp after capacity returns.
+                        if comparison_maintenance.is_some() && !approved_pending
+                            && (matches!(command, AccountWorkerCommand::CatchUp { .. })
+                                || (pending.iter().any(|queued| {
+                                    matches!(queued, AccountWorkerCommand::CatchUp { .. })
+                                }) && !command.readable_during_comparison_catch_up()))
+                        {
+                            pending.push_back(command);
+                            continue;
+                        }
                         let command = match command {
                             AccountWorkerCommand::Drain { respond } => {
                                 if let Some(recovery) = &mut welcome_recovery {
@@ -1341,7 +1437,7 @@ async fn run_app_runtime_account_worker(
                             );
                         }
                     }
-                    None => return,
+                    None => break 'worker,
                 }
             }
             _ = scheduled_convergence.timer.as_mut(), if (!yield_to_bounded_admission
@@ -1663,8 +1759,8 @@ async fn run_app_runtime_account_worker(
                                 std::pin::pin!(sleep(reconnect_backoff.next_delay()));
                             loop {
                                 tokio::select! {
-                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                    _ = &mut shutdown => return,
+                                    _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                    _ = &mut shutdown => break 'worker,
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
                                         match command {
@@ -1724,7 +1820,7 @@ async fn run_app_runtime_account_worker(
                                                 shared.app_performance_telemetry().record_runtime(RuntimeOp::ReconnectCommandRejected, Duration::ZERO, TelemetryOutcome::NotReady);
                                                 drop(command);
                                             },
-                                            None => return,
+                                            None => break 'worker,
                                         }
                                     }
                                 }
@@ -1732,8 +1828,8 @@ async fn run_app_runtime_account_worker(
                             reconnect_wait.finish(TelemetryOutcome::Success);
                             let reopen = shared.app_performance_telemetry().observe(RuntimeOp::WorkerReopen);
                             let reopened_result = tokio::select! {
-                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                _ = &mut shutdown => return,
+                                _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                _ = &mut shutdown => break 'worker,
                                 result = app.runtime_local_client(&account_label, &relay_plane, lifecycle.clone()) => result,
                             };
                             reopen.finish_app(&reopened_result);
@@ -1769,8 +1865,8 @@ async fn run_app_runtime_account_worker(
                                     // required.
                                     let telemetry = shared.app_performance_telemetry();
                                     let prepare_transport = tokio::select! {
-                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => return,
-                                        _ = &mut shutdown => return,
+                                        _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => break 'worker,
+                                        _ = &mut shutdown => break 'worker,
                                         result = reopened.prepare_transport_with_telemetry(Some(&telemetry)) => result,
                                     };
                                     if let Err(transport_err) = prepare_transport {
@@ -1933,6 +2029,9 @@ async fn run_app_runtime_account_worker(
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
+                if comparison_maintenance.is_some() {
+                    continue 'worker;
+                }
                 let phase = shared.app_performance_telemetry().observe(RuntimeOp::WorkerMaintenance);
                 if client.backfill_content_reports().is_err() {
                     tracing::warn!(
@@ -2027,73 +2126,173 @@ async fn run_app_runtime_account_worker(
                     client.has_pending_runtime_group_subscription_refresh(),
                     &command_tx,
                 );
-                let _ = run_pending_epoch_backfill_reporting_arm(
+                let backfill_armed = client.has_pending_epoch_backfill();
+                let observation = backfill_armed.then(|| shared.product_analytics.begin(
+                    crate::ProductFamily::Recovery, "backfill", crate::ProductUnit::Attempt,
+                )).flatten();
+                let mut credit = bounded_recovery::try_acquire_recovery_credit(
+                    &shared.recovery_credit_pool(),
+                );
+                let selection = if credit.is_none() && client.comparison_only_waiting_for_credit().unwrap_or(false) {
+                    Ok(crate::client::PendingRecoverySelection::Deferred)
+                } else {
+                    client.select_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
+                };
+                let backfill_result = match selection {
+                    Ok(crate::client::PendingRecoverySelection::Grant(grant)) => {
+                        let grant = *grant;
+                        let eligible = credit.is_some()
+                            && client.comparison_offload_eligible(&grant).unwrap_or(false);
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push(
+                            if eligible { "grant_eligible" } else { "grant_inline" },
+                        );
+                        if eligible {
+                            match client.activate_comparison_grant(&grant).await {
+                                Ok(subscription_attempt) => match ComparisonNetworkJob::start(
+                                    &client, &grant, credit.take().expect("offloaded grant owns credit"),
+                                ) {
+                                    Ok(network) => {
+                                        #[cfg(test)]
+                                        shared.comparison_test_trace.lock().unwrap().push("task_started");
+                                        comparison_maintenance = Some(ComparisonMaintenanceJob {
+                                            grant, subscription_attempt, network,
+                                            observation, backfill_armed, phase,
+                                        });
+                                        continue 'worker;
+                                    }
+                                    Err(error) => {
+                                        #[cfg(test)]
+                                        shared.comparison_test_trace.lock().unwrap().push("task_start_error");
+                                        Some(Err(error))
+                                    }
+                                },
+                                Err(error) => {
+                                    #[cfg(test)]
+                                    shared.comparison_test_trace.lock().unwrap().push("activation_error");
+                                    Some(Err(error))
+                                }
+                            }
+                        } else {
+                            drop(credit.take());
+                            Some(client.execute_pending_epoch_backfill_grant(grant).await)
+                        }
+                    }
+                    Ok(crate::client::PendingRecoverySelection::Deferred) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("selection_deferred");
+                        Some(Ok(EpochBackfillRunOutcome::Deferred))
+                    },
+                    Ok(crate::client::PendingRecoverySelection::NotPending) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push("selection_empty");
+                        Some(Ok(EpochBackfillRunOutcome::NotPending))
+                    },
+                    Err(error) => {
+                        #[cfg(test)]
+                        shared.comparison_test_trace.lock().unwrap().push(match &error {
+                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(message))
+                                if message == "invalid recovery comparison" => "selection_invalid_comparison",
+                            AppError::Storage(cgka_traits::storage::StorageError::Serialization(_)) => "selection_storage_serialization",
+                            AppError::Storage(cgka_traits::storage::StorageError::Busy(_)) => "selection_storage_busy",
+                            AppError::Storage(_) => "selection_storage_other",
+                            AppError::Transport(_) => "selection_transport_error",
+                            AppError::Sqlite(_) => "selection_sqlite_error",
+                            _ => "selection_other_error",
+                        });
+                        Some(Err(error))
+                    },
+                };
+                drop(credit.take());
+                let _ = report_pending_epoch_backfill_result(
+                    backfill_result.expect("inline maintenance result"), backfill_armed,
+                    observation, &events, &account_id_hex, &account_label, &shared,
+                );
+                finish_periodic_maintenance_after_recovery(
                     &mut client,
                     &events,
                     &account_id_hex,
                     &account_label,
                     &shared,
-                    EpochBackfillExecutionSeam::Maintenance,
+                    &product_backlog,
+                    &mut scheduled_convergence,
                 )
                 .await;
-                if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
-                    publish_app_runtime_account_error(
-                        &events,
-                        &account_id_hex,
-                        &account_label,
-                        account_error_message("post-join maintenance subscription failed", &err),
-                    );
-                }
-                let backlog_permit = shared.product_analytics.permit();
-                match client.run_due_maintenance().await {
-                    Ok(summary) => {
-                        if let Some(permit) = &backlog_permit {
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "pending",
-                                u64::from(summary.deferred),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "ambiguous",
-                                u64::from(summary.ambiguous_exposure),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Maintenance, "failed",
-                                u64::from(client.maintenance_failed_backlog),
-                            );
-                            product_backlog.sample(
-                                permit, crate::ProductFamily::Recovery, "quarantine",
-                                client.runtime.quarantined_group_count() as u64,
-                            );
-                        }
-                        publish_client_pending_projection_updates(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        publish_client_pending_applied_summary(
-                            &mut client,
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                        );
-                        schedule_pending_convergence_groups(
-                            &mut scheduled_convergence,
-                            &mut client,
-                        );
-                    }
-                    Err(err) => {
-                        publish_app_runtime_account_error(
-                            &events,
-                            &account_id_hex,
-                            &account_label,
-                            account_error_message("scheduled maintenance failed", &err),
-                        );
-                    }
-                }
 
                 phase.finish(TelemetryOutcome::Success);
             }
+        }
+    }
+    if let Some(job) = comparison_maintenance {
+        job.network.abort_and_wait().await;
+    }
+}
+
+/// Keep the domain maintenance continuation after the recovery outcome. A
+/// suspended network comparison resumes this same tail when its worker-owned
+/// admission and checkpoint finish.
+async fn finish_periodic_maintenance_after_recovery(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+    product_backlog: &crate::product_analytics::ProductBacklogSource,
+    scheduled_convergence: &mut ScheduledConvergence,
+) {
+    if let Err(err) = client.advance_post_join_maintenance_subscriptions().await {
+        publish_app_runtime_account_error(
+            events,
+            account_id_hex,
+            account_label,
+            account_error_message("post-join maintenance subscription failed", &err),
+        );
+    }
+    let backlog_permit = shared.product_analytics.permit();
+    match client.run_due_maintenance().await {
+        Ok(summary) => {
+            if let Some(permit) = &backlog_permit {
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "pending",
+                    u64::from(summary.deferred),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "ambiguous",
+                    u64::from(summary.ambiguous_exposure),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Maintenance,
+                    "failed",
+                    u64::from(client.maintenance_failed_backlog),
+                );
+                product_backlog.sample(
+                    permit,
+                    crate::ProductFamily::Recovery,
+                    "quarantine",
+                    client.runtime.quarantined_group_count() as u64,
+                );
+            }
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+            schedule_pending_convergence_groups(scheduled_convergence, client);
+        }
+        Err(err) => {
+            publish_app_runtime_account_error(
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("scheduled maintenance failed", &err),
+            );
         }
     }
 }
@@ -2937,12 +3136,23 @@ fn spawn_media_http<T>(
 fn ready_command_index(
     pending: &VecDeque<AccountWorkerCommand>,
     media_http: &MediaHttpContext,
+    comparison_waiting: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
-    pending
-        .iter()
-        .position(|command| has_capacity || !command.needs_media_slot())
+    let deferred_catch_up = comparison_waiting
+        .then(|| {
+            pending
+                .iter()
+                .position(|command| matches!(command, AccountWorkerCommand::CatchUp { .. }))
+        })
+        .flatten();
+    pending.iter().enumerate().position(|(index, command)| {
+        (!comparison_waiting
+            || (deferred_catch_up.is_none_or(|barrier| index < barrier)
+                || command.readable_during_comparison_catch_up()))
+            && (has_capacity || !command.needs_media_slot())
+    })
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -3162,7 +3372,8 @@ fn capture_group_read_snapshot(
 /// Serve safe snapshot reads while `work` exclusively borrows the live client.
 /// Mutations stay queued FIFO behind `work`; reads continue observing the
 /// snapshot until it completes. Worker-owned catch-up runs afterward because
-/// create/invite spawn it immediately after the caller-visible reply.
+/// create/invite spawn it immediately after the caller-visible reply. Keep
+/// later deferred commands behind that catch-up in their arrival order.
 async fn serve_snapshot_reads_until<Fut>(
     read_snapshot: Option<crate::client::GroupReadSnapshot>,
     work: Fut,
@@ -3176,6 +3387,7 @@ where
 {
     let mut deferred = VecDeque::new();
     let mut follow_up = VecDeque::new();
+    let mut catch_up_seen = false;
     let mut commands_open = true;
     let mut work = std::pin::pin!(work);
     let output = loop {
@@ -3246,11 +3458,13 @@ where
                 let _ = respond.send(Ok(snapshot.quarantined_groups()));
             }
             AccountWorkerCommand::CatchUp { .. } => {
+                catch_up_seen = true;
                 follow_up.push_back(command);
             }
             AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                 let _ = respond.send(true);
             }
+            command if catch_up_seen => follow_up.push_back(command),
             command => deferred.push_back(command),
         }
     };
@@ -3397,6 +3611,11 @@ fn account_worker_command_future<'a>(
         AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond } => Box::pin(async move {
             client.recovery_owner.test_advance_clock(elapsed);
             let _ = respond.send(());
+            true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::RequestBoundedComparisonForTest { respond } => Box::pin(async move {
+            let _ = respond.send(client.request_bounded_comparison());
             true
         }),
         #[cfg(any(test, feature = "test-policy-overrides"))]
@@ -5603,6 +5822,28 @@ async fn run_pending_epoch_backfill_reporting_arm(
         })
         .flatten();
     let backfill_result = client.run_pending_epoch_backfill(seam).await;
+    report_pending_epoch_backfill_result(
+        backfill_result,
+        backfill_armed,
+        observation,
+        events,
+        account_id_hex,
+        account_label,
+        shared,
+    )
+}
+
+/// A suspended comparison reports through the same product/runtime boundary
+/// after the worker has admitted its owned result and checkpointed the grant.
+fn report_pending_epoch_backfill_result(
+    backfill_result: Result<EpochBackfillRunOutcome, AppError>,
+    backfill_armed: bool,
+    observation: Option<crate::product_analytics::ProductObservation>,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+    shared: &RuntimeSharedServices,
+) -> Result<(), AccountCatchUpFailure> {
     if let Some(observation) = observation {
         observation.finish(match &backfill_result {
             Ok(EpochBackfillRunOutcome::Completed(_)) => "success",
@@ -5903,6 +6144,7 @@ mod tests {
     mod real_sdk_progress_fairness_tests;
     mod resource_bounds_tests;
     mod selective_history_tests;
+    mod worker_comparison_resume_tests;
     mod worker_recovery_resume_tests;
     #[cfg(feature = "test-policy-overrides")]
     mod worker_wait_attribution_tests;
@@ -6034,6 +6276,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_work_preserves_catch_up_barrier_across_pending_and_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let client = app.client("alice").await.unwrap();
+        let snapshot = client.group_read_snapshot().unwrap();
+        let (commands, mut receiver) = mpsc::channel(8);
+        let mut pending = VecDeque::new();
+        let (respond, mut before) = oneshot::channel();
+        pending.push_back(AccountWorkerCommand::ConnectivityRestored { respond });
+        let (respond, mut catch_up) = oneshot::channel();
+        pending.push_back(AccountWorkerCommand::CatchUp { respond });
+        let (respond, mut after) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
+            .unwrap();
+        let (respond, mut drain) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::Drain { respond })
+            .unwrap();
+        let (respond, read) = oneshot::channel();
+        commands
+            .try_send(AccountWorkerCommand::QuarantinedGroups { respond })
+            .unwrap();
+        let (release, work) = oneshot::channel::<()>();
+        let serve = serve_snapshot_reads_until(
+            Some(snapshot),
+            work,
+            &mut receiver,
+            &mut pending,
+            &app,
+            "alice",
+        );
+        let check = async {
+            assert!(
+                timeout(Duration::from_secs(1), read)
+                    .await
+                    .expect("snapshot read remains ready while work is held")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(matches!(
+                before.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                catch_up.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                after.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(
+                drain.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(serve, check);
+        result.unwrap();
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::CatchUp { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::ConnectivityRestored { .. })
+        ));
+        assert!(matches!(
+            pending.pop_front(),
+            Some(AccountWorkerCommand::Drain { .. })
+        ));
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
     async fn bounded_known_group_acquisition_wait_keeps_worker_and_live_subscriptions_available() {
         let _bounded_fixture = BOUNDED_WORKER_FIXTURE_LOCK.lock().await;
         use storage_sqlite::RecoveryRequest;
@@ -6046,6 +6373,9 @@ mod tests {
             .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        runtime
+            .shared_services()
+            .use_private_recovery_credit_pool_for_test();
         runtime
             .shared_services()
             .bounded_group_recovery_enabled
@@ -6309,9 +6639,13 @@ mod tests {
         client.recovery_owner.test_advance_to_retry(&storage);
         let before = storage.recovery_retry_state().unwrap();
         assert!(
-            bounded_recovery::prepare(&mut client, EpochBackfillExecutionSeam::Maintenance)
-                .unwrap()
-                .is_none()
+            bounded_recovery::prepare(
+                &mut client,
+                EpochBackfillExecutionSeam::Maintenance,
+                &bounded_recovery::shared_recovery_credit_pool(),
+            )
+            .unwrap()
+            .is_none()
         );
         let after = storage.recovery_retry_state().unwrap();
         assert_eq!(after.attempt_serial, before.attempt_serial);
@@ -6354,6 +6688,19 @@ mod tests {
     }
 
     async fn bounded_known_fixture_with_delay(delay_ms: Option<u64>) -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay_and_pool(delay_ms, None).await
+    }
+
+    async fn bounded_known_fixture_with_pool(
+        pool: Arc<bounded_recovery::RecoveryCreditPool>,
+    ) -> BoundedKnownFixture {
+        bounded_known_fixture_with_delay_and_pool(None, Some(pool)).await
+    }
+
+    async fn bounded_known_fixture_with_delay_and_pool(
+        delay_ms: Option<u64>,
+        pool: Option<Arc<bounded_recovery::RecoveryCreditPool>>,
+    ) -> BoundedKnownFixture {
         use storage_sqlite::RecoveryRequest;
         let dir = tempfile::tempdir().unwrap();
         let home = AccountHome::open(dir.path());
@@ -6370,6 +6717,15 @@ mod tests {
             .with_test_relay_client(relay.clone());
         crate::tests::remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let runtime = super::super::MarmotAppRuntime::new(app.clone());
+        if let Some(pool) = pool {
+            runtime
+                .shared_services()
+                .set_recovery_credit_pool_for_test(pool);
+        } else {
+            runtime
+                .shared_services()
+                .use_private_recovery_credit_pool_for_test();
+        }
         runtime
             .shared_services()
             .bounded_group_recovery_enabled
@@ -6771,7 +7127,9 @@ mod tests {
         );
         fixture.runtime.shutdown().await;
         assert_eq!(
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(
+                &fixture.runtime.shared_services().recovery_credit_pool(),
+            ),
             bounded_recovery::MAX_CONCURRENT_JOBS
         );
         drop(storage);
@@ -6846,7 +7204,9 @@ mod tests {
         );
         fixture.runtime.shutdown().await;
         assert_eq!(
-            bounded_recovery::available_credits(),
+            bounded_recovery::available_credits(
+                &fixture.runtime.shared_services().recovery_credit_pool(),
+            ),
             bounded_recovery::MAX_CONCURRENT_JOBS
         );
         drop(storage);
