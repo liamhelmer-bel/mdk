@@ -67,6 +67,8 @@ use crate::{
 };
 
 mod audit;
+#[cfg(test)]
+pub(crate) mod audit_v5_probe;
 pub(crate) mod epoch_stall;
 mod invite_recovery;
 mod projection;
@@ -330,6 +332,8 @@ pub(crate) struct GroupRouteRefresh {
 }
 
 pub struct AppClient {
+    #[cfg(test)]
+    pub(crate) audit_v5_probe: Option<audit_v5_probe::WelcomeProbe>,
     /// Synthetic endpoint certificates for executor/completion contract tests.
     /// Never enabled by EOSE or by the production SDK adapter.
     #[cfg(test)]
@@ -3148,7 +3152,19 @@ impl AppClient {
             .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
         *group = authoritative;
         let archived = group.archived;
-        self.set_group_invite_confirmation(group_id, false, archived)
+        #[cfg(test)]
+        let audit_origin = self
+            .audit_v5_probe
+            .as_mut()
+            .and_then(|probe| probe.begin_confirmation(group));
+        let result = self.set_group_invite_confirmation(group_id, false, archived);
+        #[cfg(test)]
+        if result.is_err()
+            && let (Some(probe), Some(origin)) = (&mut self.audit_v5_probe, audit_origin)
+        {
+            probe.rollback_confirmation(origin);
+        }
+        result
     }
 
     pub async fn decline_group_invite(
