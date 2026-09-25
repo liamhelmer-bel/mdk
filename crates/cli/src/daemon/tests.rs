@@ -1,4 +1,59 @@
 use super::*;
+
+#[tokio::test]
+async fn request_client_keeps_write_half_open_until_daemon_responds() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let socket = directory.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket).expect("listen");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut reader = BufReader::new(stream);
+        let mut request = String::new();
+        reader.read_line(&mut request).await.expect("read request");
+        assert_eq!(request, "\"Status\"\n");
+        let mut stream = reader.into_inner();
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), stream.read(&mut probe))
+                .await
+                .is_err(),
+            "request client must remain connected during execution"
+        );
+        stream
+            .write_all(br#"{"code":0,"stdout":"ok","stderr":""}"#)
+            .await
+            .expect("respond");
+    });
+    let output = send_request(&socket, &DaemonRequest::Status)
+        .await
+        .expect("response");
+    server.await.expect("server task");
+    assert_eq!(output.code, 0);
+}
+
+#[tokio::test]
+async fn disconnected_foreground_client_cancels_watch_and_releases_permit() {
+    let (server, client) = UnixStream::pair().expect("socket pair");
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let (started, ready) = oneshot::channel();
+    let watch_permits = permits.clone();
+    let watch = async move {
+        let _permit = watch_permits.acquire_owned().await.expect("permit");
+        let _ = started.send(());
+        std::future::pending::<CliOutput>().await
+    };
+    let task =
+        tokio::spawn(async move { execute_until_daemon_client_closes(&server, watch).await });
+    ready.await.expect("watch started and holds permit");
+    assert_eq!(permits.available_permits(), 0);
+    drop(client);
+    let result = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("disconnect must cancel the watch")
+        .expect("watch task");
+    assert!(result.is_none());
+    assert_eq!(permits.available_permits(), 1);
+}
 use cgka_traits::GroupId;
 use cgka_traits::MessageId;
 use cgka_traits::agent_text_stream::{

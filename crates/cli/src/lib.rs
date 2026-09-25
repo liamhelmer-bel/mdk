@@ -215,15 +215,8 @@ async fn run_cli_with_import_nsec(mut cli: Cli, mut import_nsec: Option<ImportNs
     }
 
     if matches!(cli.command, Command::Tui { .. }) {
-        let home = resolve_home(cli.home.clone());
-        match marmot_app::MarmotRootRuntimeLease::try_acquire(&home) {
-            // The TUI is a subprocess shell, not a runtime owner. Keeping this
-            // startup lease would block its own wn/wnd children. Each child
-            // still acquires ownership before opening a local runtime; this
-            // check does not reserve the home for the lifetime of the UI.
-            Ok(lease) => drop(lease),
-            Err(error) => return command_output_result(cli.json, Err(error.into())),
-        }
+        // The TUI uses wn subprocesses, which route through a running wnd.
+        // Those children enforce ownership when they open local storage.
         return tui::run_tui(cli).await;
     }
 
@@ -1904,11 +1897,12 @@ mod tests {
         std::fs::create_dir_all(socket.parent().expect("socket parent")).expect("socket dir");
         let listener = tokio::net::UnixListener::bind(socket).expect("bind daemon socket");
         tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept daemon request");
-            let mut request = Vec::new();
-            use tokio::io::AsyncReadExt;
+            let (stream, _) = listener.accept().await.expect("accept daemon request");
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut request = String::new();
+            use tokio::io::AsyncBufReadExt;
             stream
-                .read_to_end(&mut request)
+                .read_line(&mut request)
                 .await
                 .expect("read daemon request");
             assert!(

@@ -6573,7 +6573,7 @@ fn daemon_socket_path_is_private() {
 
 #[test]
 #[cfg(unix)]
-fn tui_rejects_daemon_owned_home_and_reaches_terminal_after_release() {
+fn tui_uses_running_daemon_and_reaches_terminal_initialization() {
     use std::os::unix::process::CommandExt;
 
     let home = tempfile::tempdir().expect("tempdir");
@@ -6593,24 +6593,6 @@ fn tui_rejects_daemon_owned_home_and_reaches_terminal_after_release() {
         .expect("wnd should start");
     wait_for_daemon(&socket);
 
-    let blocked = wn(home.path())
-        .env_remove("WN_SOCKET")
-        .arg("tui")
-        .output()
-        .expect("TUI should start");
-    // Stop the disposable daemon before assertions so a failure cannot leak it.
-    stop_daemon(&socket, &mut child);
-    assert!(!blocked.status.success());
-    let blocked: Value = serde_json::from_slice(&blocked.stdout)
-        .expect("owned-home rejection must use the CLI JSON error contract");
-    assert_eq!(blocked["ok"], false);
-    assert!(
-        blocked["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("already in use")
-    );
-
     let mut command = wn(home.path());
     command
         .env_remove("WN_SOCKET")
@@ -6626,15 +6608,51 @@ fn tui_rejects_daemon_owned_home_and_reaches_terminal_after_release() {
             Ok(())
         });
     }
-    let released = command.output().expect("headless TUI should start");
-    assert!(!released.status.success());
+    let launched = command.output().expect("headless TUI should start");
+    stop_daemon(&socket, &mut child);
+    assert!(!launched.status.success());
     assert!(
-        String::from_utf8_lossy(&released.stderr).contains("failed to initialize terminal"),
+        String::from_utf8_lossy(&launched.stderr).contains("failed to initialize terminal"),
         "{}",
-        command_output_summary(&released)
+        command_output_summary(&launched)
     );
-    assert!(!String::from_utf8_lossy(&released.stdout).contains("already in use"));
+    assert!(!String::from_utf8_lossy(&launched.stdout).contains("already in use"));
     assert!(marmot_app::MarmotRootRuntimeLease::try_acquire(home.path()).is_ok());
+}
+
+#[test]
+fn daemon_owned_account_sync_uses_hosted_worker() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let socket = home.path().join("dev").join("wnd.sock");
+    let account_id = create_local_account_id(home.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wnd"))
+        .arg("--home")
+        .arg(home.path())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--discovery-relays")
+        .arg(test_relay_url())
+        .arg("--default-account-relays")
+        .arg(test_relay_url())
+        .args(["--secret-store", "file"])
+        .env("WN_ALLOW_LOOPBACK_RELAYS", "1")
+        .spawn()
+        .expect("wnd should start");
+    wait_for_daemon(&socket);
+
+    let output = wn(home.path())
+        .args(["--account", &account_id, "sync"])
+        .output()
+        .expect("sync should run through wnd");
+    stop_daemon(&socket, &mut child);
+    assert!(
+        output.status.success(),
+        "{}",
+        command_output_summary(&output)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("sync JSON");
+    assert_eq!(response["result"]["account_id"], account_id);
+    assert_eq!(response["ok"], true);
 }
 
 #[test]

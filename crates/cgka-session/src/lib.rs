@@ -457,14 +457,6 @@ impl AccountDeviceSession {
         Ok(self.storage.promote_legacy_message_rows(limit)?)
     }
 
-    /// Host-scheduled structural integrity check; never repairs or logs row data.
-    pub fn probe_storage_integrity(
-        &self,
-        budget: std::time::Duration,
-    ) -> SessionResult<storage_sqlite::IntegrityProbe> {
-        Ok(self.storage.probe_integrity(budget)?)
-    }
-
     /// Run the connection-bound SQLite check off the async worker thread.
     /// The caller must keep at most one probe in flight per account.
     pub fn spawn_storage_integrity_probe(

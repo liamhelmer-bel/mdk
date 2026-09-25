@@ -12,6 +12,7 @@ const INCOMPLETE_ALERT_THRESHOLD: u32 = 3;
 pub(super) struct Schedule {
     next: Instant,
     pending: Option<tokio::task::JoinHandle<Result<IntegrityProbe, SessionError>>>,
+    pending_counted_incomplete: bool,
     consecutive_incomplete: u32,
 }
 
@@ -20,6 +21,7 @@ impl Schedule {
         Self {
             next: Instant::now(),
             pending: None,
+            pending_counted_incomplete: false,
             consecutive_incomplete: 0,
         }
     }
@@ -39,6 +41,7 @@ impl Schedule {
         if self.pending.is_some() {
             if Instant::now() >= self.next {
                 self.record_incomplete();
+                self.pending_counted_incomplete = true;
                 self.next = Instant::now() + INTERVAL;
             }
             return;
@@ -53,6 +56,7 @@ impl Schedule {
                 .session()
                 .spawn_storage_integrity_probe(BUDGET),
         );
+        self.pending_counted_incomplete = false;
     }
 
     fn observe(
@@ -77,9 +81,13 @@ impl Schedule {
                 );
             }
             Ok(Err(SessionError::Storage(StorageError::Closed(_)))) => {}
-            Ok(Ok(IntegrityProbe::Incomplete)) => self.record_incomplete(),
-            Ok(Err(_)) | Err(_) => self.record_incomplete(),
+            Ok(Ok(IntegrityProbe::Incomplete)) | Ok(Err(_)) | Err(_) => {
+                if !self.pending_counted_incomplete {
+                    self.record_incomplete();
+                }
+            }
         }
+        self.pending_counted_incomplete = false;
     }
 
     fn record_incomplete(&mut self) {
@@ -118,5 +126,16 @@ mod tests {
         assert_eq!(schedule.consecutive_incomplete, INCOMPLETE_ALERT_THRESHOLD);
         schedule.observe(Ok(Ok(IntegrityProbe::Healthy)));
         assert_eq!(schedule.consecutive_incomplete, 0);
+    }
+
+    #[test]
+    fn overdue_then_incomplete_counts_as_one_interval() {
+        let mut schedule = Schedule::new();
+        schedule.record_incomplete();
+        schedule.pending_counted_incomplete = true;
+        schedule.observe(Ok(Ok(IntegrityProbe::Incomplete)));
+        assert_eq!(schedule.consecutive_incomplete, 1);
+        schedule.observe(Ok(Ok(IntegrityProbe::Incomplete)));
+        assert_eq!(schedule.consecutive_incomplete, 2);
     }
 }

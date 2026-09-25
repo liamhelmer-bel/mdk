@@ -12498,7 +12498,7 @@ fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
             &dir,
             &relay,
             backfill_drain_test_config()
-                .with_dev_epoch_backfill_execution_quantum_ms(20_000)
+                .with_dev_epoch_backfill_execution_quantum_ms(5_000)
                 .with_dev_epoch_backfill_retry_backoff_ms(15_000),
         )
         .await;

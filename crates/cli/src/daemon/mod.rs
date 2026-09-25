@@ -555,6 +555,15 @@ async fn handle_execute_connection(
     workers: &SharedDaemonWorkers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     apply_defaults(&mut cli, defaults);
+    let foreground_watch = matches!(
+        cli.command,
+        crate::Command::Stream {
+            command: crate::StreamCommand::Watch {
+                background: false,
+                ..
+            },
+        }
+    );
     if let Some(output) = blocked_daemon_execute_output(cli.as_ref()) {
         write_daemon_output(stream, &output).await;
         return Ok(());
@@ -615,7 +624,7 @@ async fn handle_execute_connection(
     // Reuse the owner's app and connection caches even for commands that have
     // not yet moved to the hosted runtime dispatcher. A second app against the
     // daemon-owned root is the same unsafe double-hydration as a second process.
-    let output = if app_runtime_enabled(defaults) {
+    let hosted_runtime = if app_runtime_enabled(defaults) {
         let Some(runtime) =
             reconcile_and_clone_runtime(defaults, state.clone(), events.clone(), workers).await
         else {
@@ -626,12 +635,27 @@ async fn handle_execute_connection(
             .await;
             return Ok(());
         };
-        crate::run_cli_with_hosted_app(*cli, import_nsec, runtime.app_handle()).await
+        Some(runtime)
     } else {
         // Daemon startup requires a relay, so production always uses the
         // shared runtime above. Keep the relay-less test path off the workers
         // lock so status and local commands avoid head-of-line blocking.
-        crate::run_cli_local(*cli, import_nsec).await
+        None
+    };
+    let execute = async move {
+        if let Some(runtime) = hosted_runtime {
+            crate::run_cli_with_hosted_app(*cli, import_nsec, runtime.app_handle()).await
+        } else {
+            crate::run_cli_local(*cli, import_nsec).await
+        }
+    };
+    let output = if foreground_watch {
+        let Some(output) = execute_until_daemon_client_closes(stream, execute).await else {
+            return Ok(());
+        };
+        output
+    } else {
+        execute.await
     };
     if output.code == 0 {
         refresh_app_runtime(defaults, state.clone(), events.clone(), workers, refresh).await;
@@ -639,6 +663,31 @@ async fn handle_execute_connection(
 
     write_daemon_output(stream, &output).await;
     Ok(())
+}
+
+async fn execute_until_daemon_client_closes(
+    stream: &UnixStream,
+    execute: impl std::future::Future<Output = CliOutput>,
+) -> Option<CliOutput> {
+    tokio::select! {
+        output = execute => Some(output),
+        _ = wait_for_daemon_client_close(stream) => None,
+    }
+}
+
+async fn wait_for_daemon_client_close(stream: &UnixStream) {
+    let mut probe = [0u8; 1];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut probe) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(_) => return,
+        }
+    }
 }
 
 #[cfg(test)]

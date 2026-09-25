@@ -175,6 +175,13 @@ async fn dispatch_hosted_runtime_command(
         crate::Command::UsageDiagnostics { command } => {
             crate::usage_diagnostics_command(runtime, command)
         }
+        crate::Command::Sync => match crate::resolve_account(&account_home, cli.account.clone()) {
+            Ok(account) => match crate::ensure_local_signing(&account) {
+                Ok(()) => crate::commands::sync::sync_command_with_runtime(runtime, account).await,
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        },
         crate::Command::Group { command } => {
             crate::commands::groups::group_command_with_runtime(
                 &account_home,
@@ -300,6 +307,7 @@ pub(crate) fn is_hosted_runtime_command(cli: &Cli) -> bool {
     match &cli.command {
         crate::Command::Logout { .. } => true,
         crate::Command::UsageDiagnostics { .. } => true,
+        crate::Command::Sync => true,
         crate::Command::Group { .. } | crate::Command::Groups { .. } => true,
         crate::Command::Chats { command } => !matches!(
             command,
