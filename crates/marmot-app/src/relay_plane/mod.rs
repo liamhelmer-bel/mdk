@@ -38,6 +38,8 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::directory::DirectorySyncPlan;
 
 mod directory;
+#[cfg(test)]
+pub(crate) mod publish_accounting_tests;
 mod safety;
 mod telemetry;
 
@@ -2731,8 +2733,12 @@ impl TransportAdapter for MarmotRelayPlaneAccountAdapter {
         let event = NostrTransportEvent::from_transport_message(&request.message)
             .map_err(|e| TransportAdapterError::Publish(format!("Nostr payload: {e}")))?;
         let outcome = self
-            .publish_client
-            .publish_event_for_account(
+            .relay_plane
+            .inner
+            .transport
+            .adapter
+            .publish_event_with_client(
+                self.publish_client.as_ref(),
                 &request.account_id,
                 request.target.endpoints(),
                 &event,
