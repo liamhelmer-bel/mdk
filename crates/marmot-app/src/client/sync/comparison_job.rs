@@ -2,6 +2,8 @@
 //! account storage, engine, session, or event-queue authority.
 
 use super::*;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
@@ -10,6 +12,32 @@ use transport_nostr_adapter::{NostrReconciliationProgress, SubscriptionAttempt};
 /// The bounded off-worker shape. A larger route retains the existing inline
 /// executor with its complete endpoint set.
 pub(crate) const MAX_COMPARISON_ENDPOINTS_PER_ROUTE: usize = 4;
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestComparisonActivityWitness {
+    pub(crate) attempt_serial: Arc<AtomicU64>,
+    pub(crate) active_jobs: Arc<AtomicUsize>,
+    pub(crate) active_requests: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+struct ActiveCounter(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl ActiveCounter {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveCounter {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 struct MemoryProgress {
     cursor: Mutex<Option<[u8; 32]>>,
@@ -97,6 +125,7 @@ impl ComparisonNetworkJob {
         client: &AppClient,
         grant: &AttemptGrant,
         credit: OwnedSemaphorePermit,
+        #[cfg(test)] witness: Option<TestComparisonActivityWitness>,
     ) -> Result<Self, AppError> {
         let storage = client.app.account_storage(&client.state.label)?;
         let routes = grant
@@ -111,7 +140,16 @@ impl ComparisonNetworkJob {
             })
             .collect::<Result<Vec<_>, AppError>>()?;
         let adapter = client.adapter.clone();
+        #[cfg(test)]
+        let attempt_serial = grant.reservation.attempt_serial;
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let _job_active = witness.as_ref().map(|witness| {
+                witness
+                    .attempt_serial
+                    .store(attempt_serial, Ordering::SeqCst);
+                ActiveCounter::new(witness.active_jobs.clone())
+            });
             let deadline = tokio::time::Instant::now() + TRANSPORT_RECONCILIATION_QUANTUM;
             let mut results = Vec::with_capacity(routes.len());
             for frozen in routes {
@@ -132,6 +170,10 @@ impl ComparisonNetworkJob {
                     cursor: Mutex::new(initial_cursor),
                 });
                 let run = async {
+                    #[cfg(test)]
+                    let _request_active = witness
+                        .as_ref()
+                        .map(|witness| ActiveCounter::new(witness.active_requests.clone()));
                     match inventory.work {
                         TransportReconciliationWork::Inbox(endpoints) => {
                             adapter
@@ -285,9 +327,10 @@ impl AppClient {
     pub(crate) async fn activate_comparison_grant(
         &mut self,
         grant: &AttemptGrant,
+        telemetry: Option<&AppPerformanceTelemetry>,
     ) -> Result<SubscriptionAttempt, AppError> {
         let mut activation = EpochBackfillActivationOutcome::Failed;
-        self.activate_recovery_grant_inner(grant, None, &mut activation)
+        self.activate_recovery_grant_inner(grant, telemetry, &mut activation)
             .await
             .map_err(|failure| failure.source)?;
         self.adapter
@@ -621,9 +664,10 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
+        let activated_subscription = fixture.client.adapter.account_subscription_attempt().await;
         let new_goals = fixture
             .client
             .comparison_route_goals(unix_now_seconds())
@@ -650,6 +694,16 @@ mod tests {
             None
         );
         assert!(fixture.storage.recovery_comparison().unwrap().pending());
+        fixture
+            .client
+            .finish_deferred_comparison_sync()
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.client.adapter.account_subscription_attempt().await,
+            activated_subscription,
+            "a stale startup comparison drains its live activation without rebuilding subscriptions"
+        );
     }
 
     #[tokio::test]
@@ -670,7 +724,7 @@ mod tests {
             .unwrap();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let before = fixture
@@ -731,7 +785,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         fixture.client.adapter.require_fresh_activation().await;
@@ -773,7 +827,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let result = fixture
@@ -809,7 +863,7 @@ mod tests {
             .expect("fixture has a selected group route");
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let event = candidate_for_route(group_route);
@@ -908,7 +962,7 @@ mod tests {
             .expect("fixture has a selected group route");
         fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let event = candidate_for_route(group_route);
@@ -991,7 +1045,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let mut network = network_result(route.clone(), Some([8; 32]));
@@ -1036,7 +1090,7 @@ mod tests {
         let route = grant.inventory.first().unwrap().route.clone();
         let attempt = fixture
             .client
-            .activate_comparison_grant(&grant)
+            .activate_comparison_grant(&grant, None)
             .await
             .unwrap();
         let mut network = network_result(route.clone(), Some([8; 32]));
