@@ -65,6 +65,23 @@ impl crate::account_identity_proof::AccountIdentityProofSigner for Signer {
         r.signature_from_signed_event(event)
     }
 }
+// The fixed fresh and resumed receiver both require routed current groups.
+// Keep this opt-in local: the generic EngineBuilder default remains unchanged.
+fn owned_routed_engine(
+    storage: SqliteAccountStorage,
+    keys: nostr::Keys,
+) -> Result<crate::Engine<SqliteAccountStorage>, ReceiverHold> {
+    use cgka_traits::app_components::{NOSTR_ROUTING_COMPONENT_ID, default_group_components};
+    let mut components = default_group_components();
+    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    EngineBuilder::new(storage)
+        .supported_app_components(components)
+        .identity(keys.public_key().to_bytes().to_vec())
+        .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
+        .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
+        .build()
+        .map_err(|_| ReceiverHold::Engine)
+}
 /// This exported *entry* has no authority-bearing arguments or constructors.
 /// Root profile + owned inherited descriptors are the only startup contract.
 pub(crate) fn entry() -> bool {
@@ -204,12 +221,7 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
     if reopened.dev() != db_meta.dev() || reopened.ino() != db_meta.ino() {
         return Err(ReceiverHold::ChangedState);
     }
-    let engine = EngineBuilder::new(storage)
-        .identity(keys.public_key().to_bytes().to_vec())
-        .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
-        .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
-        .build()
-        .map_err(|_| ReceiverHold::Engine)?;
+    let engine = owned_routed_engine(storage, keys)?;
     let group =
         GroupId::new(hex::decode(&profile.enrollment.group).map_err(|_| ReceiverHold::Malformed)?);
     let operators = profile

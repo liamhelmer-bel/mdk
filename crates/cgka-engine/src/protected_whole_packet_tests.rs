@@ -591,3 +591,115 @@ async fn unchanged_installed_producer_real_tls_then_real_mls_exchange() {
     )
     .unwrap();
 }
+
+// Disposable capability qualification only; no receiver enrollment or network.
+#[tokio::test]
+async fn owned_routing_construction_preserves_default_refusals_and_accepts_current_welcome() {
+    use cgka_traits::{
+        app_components::{
+            AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
+        },
+        engine::{CreateGroupRequest, SendResult},
+        transport::TransportEnvelope,
+    };
+    fn client(
+        storage: SqliteAccountStorage,
+        keys: nostr::Keys,
+        routing: bool,
+    ) -> Engine<SqliteAccountStorage> {
+        if routing {
+            // This is the production constructor shared by both fixed entries.
+            owned_routed_engine(storage, keys).unwrap()
+        } else {
+            EngineBuilder::new(storage)
+                .identity(keys.public_key().to_bytes().to_vec())
+                .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
+                .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
+                .build()
+                .unwrap()
+        }
+    }
+    // Both fresh-KeyPackage capability and join-time capability are varied.
+    // Reopening the same in-memory storage retains the actual private KP state.
+    for (creator_routing, kp_routing, join_routing) in [
+        (false, true, true),
+        (true, false, false),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let mut creator = client(
+            SqliteAccountStorage::in_memory().unwrap(),
+            nostr::Keys::generate(),
+            creator_routing,
+        );
+        let keys = nostr::Keys::generate();
+        let storage = SqliteAccountStorage::in_memory().unwrap();
+        let mut recipient = client(storage.clone(), keys.clone(), kp_routing);
+        let mut kp = recipient.fresh_key_package().await.unwrap();
+        kp.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: cgka_traits::types::MessageId::new(vec![4; 32]),
+        });
+        drop(recipient);
+        let mut recipient = client(storage.clone(), keys.clone(), join_routing);
+        let result = creator
+            .create_group(CreateGroupRequest {
+                name: "disposable capability qualification".into(),
+                description: String::new(),
+                members: vec![kp],
+                required_features: vec![],
+                initial_admins: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(
+                        &NostrRoutingV1::new([7; 32], vec!["wss://semantic.invalid".into()])
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                }],
+            })
+            .await;
+        match result {
+            Err(error) => {
+                println!(
+                    "creator={creator_routing} kp={kp_routing} join={join_routing}: create ERROR {error:?}"
+                );
+                assert!(
+                    !creator_routing || !kp_routing,
+                    "explicit-capability creation control must succeed"
+                );
+            }
+            Ok((group, SendResult::FoundingGroupCreated { welcomes })) => {
+                assert!(
+                    creator_routing && kp_routing,
+                    "default capabilities unexpectedly created routed group"
+                );
+                let welcome = welcomes.into_iter().find(|w| matches!(
+                    &w.envelope, TransportEnvelope::Welcome { recipient: id } if id == &recipient.self_id()
+                )).unwrap();
+                let joined = recipient.join_welcome(welcome).await;
+                println!(
+                    "creator={creator_routing} kp={kp_routing} join={join_routing}: join {joined:?}"
+                );
+                assert_eq!(joined.is_ok(), join_routing);
+                if join_routing {
+                    assert!(
+                        super::super::owned_producer::GroupBinding::read(
+                            &recipient, &group, &[7; 32]
+                        )
+                        .is_ok()
+                    );
+                    drop(recipient);
+                    // The resumed receiver uses the exact same constructor.
+                    let reopened = owned_routed_engine(storage, keys).unwrap();
+                    assert!(
+                        super::super::owned_producer::GroupBinding::read(
+                            &reopened, &group, &[7; 32]
+                        )
+                        .is_ok()
+                    );
+                }
+            }
+            Ok(_) => panic!("current profile must emit founding Welcome"),
+        }
+    }
+}

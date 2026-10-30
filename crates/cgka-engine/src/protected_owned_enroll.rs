@@ -272,12 +272,7 @@ async fn run(
     if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err(ReceiverHold::ChangedState);
     }
-    let mut engine = EngineBuilder::new(storage)
-        .identity(keys.public_key().to_bytes().to_vec())
-        .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
-        .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
-        .build()
-        .map_err(|_| ReceiverHold::Engine)?;
+    let mut engine = owned_routed_engine(storage, keys)?;
     check_cache_devices(
         &cache_directory,
         &[
