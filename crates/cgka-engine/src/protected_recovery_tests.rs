@@ -397,7 +397,7 @@ pub(crate) fn catalog_terminal_fixture(j: &mut Journal, index: u64, policy: &str
     );
     source(
         TransitionKind::Outcome,
-        json!({"schema":"receiver-outcome.v1","sequence":index+1,"message_id":hex::encode(message_id.as_slice()),"outcome":cgka_traits::ingest::IngestOutcome::Processed,"candidate":candidate,"pending_application_ids":[message_id],"pending_application_projections":[{"group":group,"message_id":message_id,"sender":sender,"source_epoch":1,"payload_sha256":hex::encode(Sha256::digest(payload))}],"native_merge":null}),
+        json!({"schema":"receiver-outcome.v1","sequence":index+1,"message_id":hex::encode(message_id.as_slice()),"outcome":cgka_traits::ingest::IngestOutcome::Processed,"candidate":candidate,"pending_application_ids":[message_id],"pending_application_projections":[{"group":group,"message_id":message_id,"sender":sender,"source_epoch":1,"payload_sha256":hex::encode(Sha256::digest(&payload)),"application_sha256":hex::encode(Sha256::digest(&payload))}],"native_merge":null}),
     );
     source(
         TransitionKind::Conflict,

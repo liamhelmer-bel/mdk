@@ -307,6 +307,14 @@ impl Catalog {
             .read::<CandidateReference>(Space::Candidate, id)?
             .is_some())
     }
+    pub(super) fn check_retained_candidate(
+        &self,
+        journal: &Journal,
+        candidate: &serde_json::Value,
+    ) -> Result<()> {
+        self.checkpoint_file()?;
+        validate_candidate(&self.disk, journal, candidate)
+    }
     pub(super) fn retained_target(&self, id: &str) -> Result<Option<String>> {
         self.checkpoint_file()?;
         Ok(self.disk.read::<Target>(Space::Target, id)?.map(|t| t.ask))
@@ -908,16 +916,17 @@ fn hex_digest(value: &serde_json::Value, key: &str) -> Result<String> {
     }
     Ok(digest(&bytes))
 }
-fn validate_candidate(
-    disk: &Disk,
-    _journal: &Journal,
-    candidate: &serde_json::Value,
-) -> Result<()> {
+fn validate_candidate(disk: &Disk, journal: &Journal, candidate: &serde_json::Value) -> Result<()> {
     let retained = disk
         .read::<CandidateReference>(Space::Candidate, text(candidate, "message_id")?)?
         .ok_or(ReceiverHold::ChangedState)?;
-    if retained.sha256
-        != digest(&serde_json::to_vec(candidate).map_err(|_| ReceiverHold::Malformed)?)
+    let source = journal
+        .source_at(retained.sequence)
+        .map_err(|_| ReceiverHold::Journal)?;
+    if source.body["value"]["schema"] != "receiver-outcome.v1"
+        || &source.body["value"]["candidate"] != candidate
+        || retained.sha256
+            != digest(&serde_json::to_vec(candidate).map_err(|_| ReceiverHold::Malformed)?)
     {
         return Err(ReceiverHold::ChangedState);
     }

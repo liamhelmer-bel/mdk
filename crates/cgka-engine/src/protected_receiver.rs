@@ -69,6 +69,9 @@ impl RetainedCandidate {
                         && hex::encode(p.message_id.as_slice()) == self.message_id
                         && p.source_epoch == self.source_epoch
                         && p.sender == self.sender
+                        && self.application.encode().is_ok_and(|bytes| {
+                            p.application_sha256 == hex::encode(Sha256::digest(bytes))
+                        })
                 })
                 .count()
                 == 1
@@ -85,6 +88,9 @@ pub(super) struct PendingApplicationProjection {
     sender: MemberId,
     source_epoch: u64,
     payload_sha256: String,
+    // Canonical semantic payload hash captured from the actual native plaintext.
+    // Raw payload may contain valid noncanonical JSON; retain both bindings.
+    application_sha256: String,
 }
 impl PendingApplicationProjection {
     pub(super) fn matches_id(&self, id: &MessageId) -> bool {
@@ -105,6 +111,9 @@ impl PendingApplicationProjection {
                 sender: sender.clone(),
                 source_epoch: epoch.0,
                 payload_sha256: hex::encode(Sha256::digest(payload)),
+                application_sha256: hex::encode(Sha256::digest(
+                    MarmotAppEvent::decode(payload).ok()?.encode().ok()?,
+                )),
             }),
             _ => None,
         }

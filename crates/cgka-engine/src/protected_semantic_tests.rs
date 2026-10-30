@@ -1670,3 +1670,121 @@ async fn actual_owner_unknown_pending_refuses_before_recovered_decision_write() 
     );
     assert_eq!(relay.wires.lock().unwrap().len(), published);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn altered_terminal_cache_cannot_borrow_another_asks_approval() {
+    let (mut f, mut operator, root, relay) = fresh_recovery_factory().await;
+    for id in ["ask3", "ask4"] {
+        f.post(finite_original(id, &f.receiver.group))
+            .await
+            .unwrap();
+        let target = f.asks[id].app_ids[0].clone();
+        let yes = reaction(&mut operator, &f, &target, "👍").await;
+        f.ingest(yes).await.unwrap();
+    }
+    let catalog = f.catalog.as_ref().unwrap();
+    let ask3 = catalog.retained_ask("ask3").unwrap().unwrap();
+    let ask4 = catalog.retained_ask("ask4").unwrap().unwrap();
+    let path = root.path().join("initial-cache").join(digest(b"ask\0ask3"));
+    let correct = std::fs::read(&path).unwrap();
+    let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    let published = relay.wires.lock().unwrap().len();
+    for mode in 0..3 {
+        let mut altered = serde_json::to_value(&ask3).unwrap();
+        match mode {
+            0 => altered["decision_sequence"] = serde_json::json!(ask4.decision_sequence),
+            1 => altered["original_sequence"] = serde_json::json!(ask4.original_sequence),
+            _ => altered["id"] = serde_json::json!("ask4"),
+        }
+        std::fs::write(&path, serde_json::to_vec(&altered).unwrap()).unwrap();
+        f.asks.clear();
+        assert!(matches!(
+            f.consume("ask3", &ask3.original_sha256),
+            Err(ReceiverHold::ChangedState)
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("receiver/journal")).unwrap(),
+            journal
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+            anchor
+        );
+        assert_eq!(relay.wires.lock().unwrap().len(), published);
+    }
+    std::fs::write(path, correct).unwrap();
+    f.asks.clear();
+    f.consume("ask3", &ask3.original_sha256).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn changed_candidate_plaintext_refuses_reopen_without_ack_or_projection() {
+    use cgka_traits::MessageStorage;
+    let (mut f, mut operator, root, relay) = fresh_recovery_factory().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let no = reaction(&mut operator, &f, &target, "👎").await;
+    let received = f.ordered().unwrap().checked_now().unwrap();
+    // Deliberately corrupt the private recording boundary in this fixture only:
+    // real native MLS authenticates NO, but retained candidate claims YES.
+    let outcome = f.receiver.engine.ingest(no.clone()).await.unwrap();
+    let events = f.receiver.engine.drain_events();
+    let event = events
+        .iter()
+        .find(|e| matches!(e, cgka_traits::GroupEvent::MessageReceived { .. }))
+        .unwrap();
+    let projection = super::super::PendingApplicationProjection::capture(event).unwrap();
+    let cgka_traits::GroupEvent::MessageReceived {
+        group_id,
+        message_id,
+        sender,
+        epoch,
+        payload,
+        ..
+    } = event
+    else {
+        unreachable!()
+    };
+    let actual = MarmotAppEvent::decode(payload).unwrap();
+    let changed = MarmotAppEvent::new(
+        actual.pubkey.clone(),
+        actual.created_at,
+        actual.kind,
+        actual.tags.clone(),
+        "👍",
+    );
+    assert_ne!(actual, changed);
+    let candidate = serde_json::json!({"sequence":1,"received_at_unix_ms":received,"group":group_id,
+        "message_id":hex::encode(message_id.as_slice()),"source_epoch":epoch.0,"sender":sender,"application":changed});
+    f.receiver.record(serde_json::json!({"schema":"receiver-wire.v1","sequence":1,"received_at_unix_ms":received,"wire":no})).unwrap();
+    f.receiver.record(serde_json::json!({"schema":"receiver-outcome.v1","sequence":1,"message_id":hex::encode(no.id.as_slice()),
+        "outcome":outcome,"candidate":candidate,"pending_application_ids":[message_id],
+        "pending_application_projections":[projection],"native_merge":null})).unwrap();
+    let storage = f.receiver.engine.storage.clone();
+    let before = serde_json::to_vec(&storage.list_pending_application_events().unwrap()).unwrap();
+    let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    let published = relay.wires.lock().unwrap().len();
+    assert!(matches!(
+        restart_factory(f, root.path(), relay.clone(), "forged-cache").await,
+        Err(ReceiverHold::ChangedState)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        journal
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+        anchor
+    );
+    assert_eq!(
+        serde_json::to_vec(&storage.list_pending_application_events().unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(relay.wires.lock().unwrap().len(), published);
+}

@@ -129,7 +129,16 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .ordered()?
             .source_at(ask.original_sequence)
             .map_err(|_| ReceiverHold::Journal)?;
-        let o = &record.body["value"]["original"];
+        let value = &record.body["value"];
+        let o = &value["original"];
+        if ask.id != id
+            || value["schema"] != "semantic-original.v2"
+            || o["ask_id"].as_str() != Some(id)
+            || value["policy_sha256"].as_str() != Some(ask.policy_sha256.as_str())
+            || value["expires_at_unix_ms"].as_u64() != Some(ask.expiry)
+        {
+            return Err(ReceiverHold::ChangedState);
+        }
         let bytes = |key: &str| {
             hex::decode(o[key].as_str().ok_or(ReceiverHold::Malformed)?)
                 .map_err(|_| ReceiverHold::Malformed)
@@ -160,11 +169,30 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                 .source_at(sequence)
                 .map_err(|_| ReceiverHold::Journal)?;
             let r = &source.body["value"]["receipt"];
+            if source.body["value"]["schema"] != "semantic-decision.v1"
+                || r["ask_id"].as_str() != Some(id)
+                || r["operation_sha256"].as_str() != Some(ask.original_sha256.as_str())
+                || r["packet_sha256"].as_str() != Some(ask.packet_sha256.as_str())
+                || r["request_sha256"].as_str() != Some(ask.request_sha256.as_str())
+                || r["cards_sha256"].as_str() != Some(ask.cards_sha256.as_str())
+                || r["policy_sha256"].as_str() != Some(ask.policy_sha256.as_str())
+            {
+                return Err(ReceiverHold::ChangedState);
+            }
+            catalog.check_retained_candidate(self.ordered()?, &r["authenticated_candidate"])?;
             // Readback remains confined to this fully checked owning path. No
             // public Deserialize or constructor can turn a DTO into authority.
             let c: super::super::RetainedCandidate =
                 serde_json::from_value(r["authenticated_candidate"].clone())
                     .map_err(|_| ReceiverHold::Malformed)?;
+            if c.group != self.receiver.group
+                || !self.receiver.operators.contains(&c.sender)
+                || r["operator"]
+                    != serde_json::to_value(&c.sender).map_err(|_| ReceiverHold::Malformed)?
+                || r["sequence"].as_u64() != Some(c.sequence)
+            {
+                return Err(ReceiverHold::ChangedState);
+            }
             Some(SemanticReceipt {
                 sequence: c.sequence,
                 ask_id: ask.id.clone(),
