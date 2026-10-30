@@ -1106,6 +1106,8 @@ impl<S: StorageProvider> Engine<S> {
         // discoverable group record, joined-epoch recovery anchor, capability
         // cache, and both durable Welcome dispositions in one transaction.
         let mut pending_rejoin = None;
+        #[cfg(unix)]
+        let mut owned_join_capture = self.receiver_join_capture.take();
         let result = self.storage.with_transaction(|storage| {
             let provider = EngineOpenMlsProvider::<S>::new(&self.crypto, storage.mls_storage());
             // Match in the same order OpenMLS uses: the first Welcome
@@ -1484,6 +1486,11 @@ impl<S: StorageProvider> Engine<S> {
                 .filter(|group| group.removed)
                 .map(|group| group.epoch);
 
+            #[cfg(unix)]
+            if let Some(capture) = &mut owned_join_capture {
+                capture.prepare_commit(&group_id, &welcome_sender_id, &consumed_key_package_ref)?;
+            }
+
             Ok::<_, EngineError>((
                 group_id,
                 mls_group,
@@ -1493,6 +1500,10 @@ impl<S: StorageProvider> Engine<S> {
                 reopen_refused_rows_at_or_above,
             ))
         });
+        #[cfg(unix)]
+        {
+            self.receiver_join_capture = owned_join_capture;
+        }
         if let Some(candidate) = pending_rejoin {
             // Bound stored offers; retain the exact first copy/revision on duplicates.
             let existing = self.storage.list_welcomes()?;

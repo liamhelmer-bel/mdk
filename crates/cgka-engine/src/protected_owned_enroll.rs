@@ -1,6 +1,6 @@
 //! Fresh-only live Welcome composition. Descriptor publisher/custody is not installed.
 use super::*;
-use crate::protected_join::JoinIntent;
+use crate::protected_join::{JoinConstraint, JoinEvidence, JoinIntent};
 use crate::protected_receiver::ReceiverJournal;
 use cgka_traits::TransportEnvelope;
 
@@ -14,6 +14,9 @@ struct FreshProfile {
     group: String,
     operators: Vec<String>,
     storage_generation: String,
+    // Exact native KeyPackageRef selected by this fresh enrollment, not the
+    // outer Nostr event id. Historical invitations for other packages refuse.
+    key_package_ref: String,
     endpoints: Vec<TransportEndpoint>,
     wait_seconds: u32,
 }
@@ -31,6 +34,7 @@ impl FreshProfile {
             || !crate::protected_recovery::valid_group(&self.group)
             || !event_id_is_valid(&self.account)
             || !event_id_is_valid(&self.storage_generation)
+            || !event_id_is_valid(&self.key_package_ref)
             || self.operators.is_empty()
             || self.operators.len() > 64
             || self
@@ -68,7 +72,7 @@ pub(super) fn entry() -> bool {
         let profile: FreshProfile =
             serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         profile.check()?;
-        let files: [File; 11] = (4..=14)
+        let files: [File; 12] = (4..=15)
             .map(inherited)
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
@@ -84,6 +88,7 @@ pub(super) fn entry() -> bool {
 }
 
 /// Native evidence, rather than caller hashes, determines the enrolled baseline.
+#[cfg(test)]
 async fn finish<S: StorageProvider + 'static>(
     mut engine: crate::Engine<S>,
     profile: &FreshProfile,
@@ -94,7 +99,6 @@ async fn finish<S: StorageProvider + 'static>(
 ) -> Result<ProtectedReceiver<S>, ReceiverHold> {
     profile.check()?;
     let files = Journal::prepare_fresh(files).map_err(|_| ReceiverHold::Journal)?;
-    let group = GroupId::new(hex::decode(&profile.group).map_err(|_| ReceiverHold::Malformed)?);
     let operators = profile
         .operators
         .iter()
@@ -133,10 +137,42 @@ async fn finish<S: StorageProvider + 'static>(
     {
         return Err(ReceiverHold::ChangedState);
     }
+    check_intent_alias(&files, &intent)?;
     let evidence = engine
-        .receiver_join_owned(wire, intent)
+        .receiver_join_enrolled(wire, intent, constraint(profile)?)
         .await
-        .map_err(|_| ReceiverHold::Engine)?;
+        .map_err(|_| ReceiverHold::Engine)?
+        .ok_or(ReceiverHold::ChangedState)?;
+    enroll_joined(engine, profile, profile_sha, files, evidence)
+}
+
+fn constraint(profile: &FreshProfile) -> Result<JoinConstraint, ReceiverHold> {
+    Ok(JoinConstraint {
+        group: GroupId::new(hex::decode(&profile.group).map_err(|_| ReceiverHold::Malformed)?),
+        operators: profile
+            .operators
+            .iter()
+            .map(|key| {
+                hex::decode(key)
+                    .map(MemberId::new)
+                    .map_err(|_| ReceiverHold::Malformed)
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        key_package_ref: hex::decode(&profile.key_package_ref)
+            .map_err(|_| ReceiverHold::Malformed)?,
+    })
+}
+
+fn enroll_joined<S: StorageProvider + 'static>(
+    engine: crate::Engine<S>,
+    profile: &FreshProfile,
+    profile_sha: &str,
+    files: OwnedFiles,
+    evidence: JoinEvidence,
+) -> Result<ProtectedReceiver<S>, ReceiverHold> {
+    let expected = constraint(profile)?;
+    let group = expected.group;
+    let operators = expected.operators;
     if evidence.group != group {
         return Err(ReceiverHold::ChangedState);
     }
@@ -158,7 +194,7 @@ async fn finish<S: StorageProvider + 'static>(
 async fn run(
     profile: FreshProfile,
     profile_sha: String,
-    files: [File; 11],
+    files: [File; 12],
 ) -> Result<(), ReceiverHold> {
     let [
         key_file,
@@ -172,6 +208,7 @@ async fn run(
         intent_directory,
         account_dir,
         peer,
+        cache_directory,
     ] = files;
     // Keep the original storage lease through account opening, join and shutdown.
     storage_lease
@@ -191,18 +228,19 @@ async fn run(
     let mut nonce = [0; 32];
     peer.read_exact(&mut nonce)
         .map_err(|_| ReceiverHold::Configuration)?;
-    let mut key = read(&key_file, 64)?;
-    let mut dbkey = read(&dbkey_file, 64)?;
+    let key = zeroize::Zeroizing::new(read(&key_file, 64)?);
+    let dbkey = zeroize::Zeroizing::new(read(&dbkey_file, 64)?);
     if key.len() != 32 || dbkey.len() != 32 {
         return Err(ReceiverHold::Configuration);
     }
-    let keys = nostr::Keys::parse(&hex::encode(&key)).map_err(|_| ReceiverHold::Configuration)?;
-    key.fill(0);
+    let secret = nostr::SecretKey::from_slice(&key).map_err(|_| ReceiverHold::Configuration)?;
+    let keys = nostr::Keys::new(secret);
     if keys.public_key().to_hex() != profile.account {
         return Err(ReceiverHold::ChangedState);
     }
-    let sqlkey = SqlCipherKey::new(hex::encode(&dbkey)).map_err(|_| ReceiverHold::Configuration)?;
-    dbkey.fill(0);
+    let sqlkey =
+        SqlCipherKey::new(hex::encode(&*dbkey)).map_err(|_| ReceiverHold::Configuration)?;
+    drop((key, dbkey));
     let fd = unsafe {
         libc::openat(
             account_dir.as_raw_fd(),
@@ -234,24 +272,38 @@ async fn run(
     if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err(ReceiverHold::ChangedState);
     }
-    let engine = EngineBuilder::new(storage)
+    let mut engine = EngineBuilder::new(storage)
         .identity(keys.public_key().to_bytes().to_vec())
         .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
         .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
         .build()
         .map_err(|_| ReceiverHold::Engine)?;
-    let spool = relay_spool::anonymous(&journal_directory)?;
-    let files = OwnedFiles {
+    // Ephemeral untrusted traffic must not share the journal's filesystem.
+    if cache_directory
+        .metadata()
+        .map_err(|_| ReceiverHold::Configuration)?
+        .dev()
+        == journal_directory
+            .metadata()
+            .map_err(|_| ReceiverHold::Configuration)?
+            .dev()
+    {
+        return Err(ReceiverHold::Configuration);
+    }
+    let spool = relay_spool::anonymous(&cache_directory)?;
+    let files = Journal::prepare_fresh(OwnedFiles {
         journal,
         journal_directory,
         storage_lease,
         anchor,
         anchor_directory,
-    };
+    })
+    .map_err(|_| ReceiverHold::Journal)?;
     let intent = JoinIntent {
         file: intent,
         directory: intent_directory,
     };
+    check_intent_alias(&files, &intent)?;
     let sdk = nostr_sdk::Client::builder().build();
     let adapter = NostrTransportAdapter::new(Arc::new(NostrSdkRelayClient::new(sdk.clone())));
     let forwarder = forward(sdk.clone(), adapter.clone(), spool);
@@ -260,16 +312,19 @@ async fn run(
             account_id: engine.self_id(), inbox_endpoints: profile.endpoints.clone(), group_subscriptions:vec![], since:None,
         })).await.map_err(|_| ReceiverHold::Engine)?.map_err(|_| ReceiverHold::Engine)?;
         let deadline = tokio::time::Instant::now()+Duration::from_secs(u64::from(profile.wait_seconds));
-        let wire = loop {
+        let evidence = loop {
             if forwarder.is_finished() || tokio::time::Instant::now() >= deadline { return Err(ReceiverHold::Engine); }
             let wait = deadline.min(tokio::time::Instant::now()+Duration::from_secs(1));
             if let Ok(delivery) = tokio::time::timeout_at(wait, adapter.receive()).await {
                 let Some(delivery) = delivery.map_err(|_| ReceiverHold::Engine)? else { return Err(ReceiverHold::Engine); };
                 if delivery.account_id != engine.self_id() { return Err(ReceiverHold::ChangedState); }
-                if matches!(&delivery.message.envelope, TransportEnvelope::Welcome {recipient} if recipient == &engine.self_id()) { break delivery.message; }
+                if matches!(&delivery.message.envelope, TransportEnvelope::Welcome {recipient} if recipient == &engine.self_id()) {
+                    let attempt = JoinIntent { file: intent.file.try_clone().map_err(|_| ReceiverHold::Journal)?, directory: intent.directory.try_clone().map_err(|_| ReceiverHold::Journal)? };
+                    if let Some(evidence) = engine.receiver_join_enrolled(delivery.message, attempt, constraint(&profile)?).await.map_err(|_| ReceiverHold::Engine)? { break evidence; }
+                }
             }
         };
-        let receiver = finish(engine, &profile, &profile_sha, files, intent, wire).await?;
+        let receiver = enroll_joined(engine, &profile, &profile_sha, files, evidence)?;
         if forwarder.is_finished() { return Err(ReceiverHold::Engine); }
         let ReceiverJournal::Ordered(journal) = &receiver.journal else { return Err(ReceiverHold::Journal); };
         let enrolled = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
@@ -283,6 +338,17 @@ async fn run(
         // Receiver owns actual account/journal until after finite SDK shutdown.
         Ok(receiver)
     }.await;
+    if result.is_err() {
+        // Conservative on purpose: no failure response authorizes a retry or
+        // asserts that native state stayed unchanged, even before intent.
+        let output = serde_json::to_vec(&serde_json::json!({
+            "schema":"heterodyne-owned-fresh-enrollment-hold.v1", "nonce_hex":hex::encode(nonce),
+            "startup_profile_sha256":profile_sha, "requires_reconciliation":true,
+            "automatic_replay_forbidden":true,"native_effects_may_be_unknown":true,
+        }))
+        .map_err(|_| ReceiverHold::Malformed)?;
+        let _ = write_frame(&mut peer, &output);
+    }
     forwarder.abort();
     let _ = forwarder.await;
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
@@ -291,6 +357,22 @@ async fn run(
         return Err(ReceiverHold::Engine);
     }
     result.map(|_| ())
+}
+
+fn check_intent_alias(files: &OwnedFiles, intent: &JoinIntent) -> Result<(), ReceiverHold> {
+    let key = |file: &File| {
+        file.metadata()
+            .map(|m| (m.dev(), m.ino()))
+            .map_err(|_| ReceiverHold::Configuration)
+    };
+    let own = key(&intent.file)?;
+    if [&files.journal, &files.anchor, &files.storage_lease]
+        .into_iter()
+        .any(|file| key(file).map_or(true, |id| id == own))
+    {
+        return Err(ReceiverHold::Configuration);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,6 +385,7 @@ mod tests {
         engine: &crate::Engine<SqliteAccountStorage>,
         group: &GroupId,
         operator: &MemberId,
+        wire: &cgka_traits::TransportMessage,
     ) -> FreshProfile {
         FreshProfile {
             schema: "heterodyne-protected-receiver-fresh.v1".into(),
@@ -312,6 +395,7 @@ mod tests {
             group: hex::encode(group.as_slice()),
             operators: vec![hex::encode(operator.as_slice())],
             storage_generation: "55".repeat(32),
+            key_package_ref: crate::protected_join::tests::key_package_ref(wire),
             endpoints: vec![TransportEndpoint("wss://fixture.invalid".into())],
             wait_seconds: 1,
         }
@@ -321,7 +405,7 @@ mod tests {
     async fn fresh_entry_derives_native_enrollment_retains_original_then_reopens() {
         let (engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
-        let profile = profile(&engine, &group, &operator);
+        let profile = profile(&engine, &group, &operator, &wire);
         let profile_sha = digest(
             &serde_json::to_vec(&serde_json::json!({"synthetic":"profile custody"})).unwrap(),
         );
@@ -385,7 +469,7 @@ mod tests {
         for invalid_policy in [false, true] {
             let (engine, storage, wire, group, operator) = invitation().await;
             let root = tempfile::tempdir().unwrap();
-            let mut p = profile(&engine, &group, &operator);
+            let mut p = profile(&engine, &group, &operator, &wire);
             let mut files = recovery_files(root.path());
             if invalid_policy {
                 p.operators.push(p.operators[0].clone());
@@ -409,10 +493,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_actual_group_retains_join_intent_and_pending_without_enrolling() {
+    async fn aliased_intent_refuses_before_native_join() {
+        for alias in ["journal", "anchor", "lease"] {
+            let (engine, storage, wire, group, operator) = invitation().await;
+            let root = tempfile::tempdir().unwrap();
+            let p = profile(&engine, &group, &operator, &wire);
+            let files = recovery_files(root.path());
+            let file = match alias {
+                "journal" => &files.journal,
+                "anchor" => &files.anchor,
+                _ => &files.storage_lease,
+            };
+            let intent = JoinIntent {
+                file: file.try_clone().unwrap(),
+                directory: File::open(root.path()).unwrap(),
+            };
+            assert!(matches!(
+                finish(engine, &p, &"66".repeat(32), files, intent, wire).await,
+                Err(ReceiverHold::Configuration)
+            ));
+            assert!(storage.list_groups().unwrap().is_empty());
+            assert!(
+                storage
+                    .list_pending_application_events()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_actual_group_rolls_back_without_burning_keypackage_or_intent() {
         let (engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
-        let mut p = profile(&engine, &group, &operator);
+        let mut p = profile(&engine, &group, &operator, &wire);
         p.group = "77".repeat(16);
         assert!(
             finish(
@@ -427,11 +541,17 @@ mod tests {
             .is_err()
         );
         assert!(
-            !std::fs::read(root.path().join("join-intent"))
+            std::fs::read(root.path().join("join-intent"))
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
+        assert!(
+            storage
+                .list_pending_application_events()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(storage.list_groups().unwrap().is_empty());
         assert!(
             std::fs::read(root.path().join("receiver/journal"))
                 .unwrap()
@@ -447,7 +567,7 @@ mod tests {
     async fn journal_write_failure_after_join_keeps_pending_welcome_and_original_intent() {
         let (engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
-        let p = profile(&engine, &group, &operator);
+        let p = profile(&engine, &group, &operator, &wire);
         let mut files = recovery_files(root.path());
         files.journal = std::fs::OpenOptions::new()
             .read(true)

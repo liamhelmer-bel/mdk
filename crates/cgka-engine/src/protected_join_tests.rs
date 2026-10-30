@@ -7,14 +7,7 @@ fn build_client(
     Engine<storage_sqlite::SqliteAccountStorage>,
     storage_sqlite::SqliteAccountStorage,
 ) {
-    let key = (0u64..)
-        .find_map(|i| {
-            let mut h = Sha256::new();
-            h.update(seed);
-            h.update(i.to_be_bytes());
-            k256::schnorr::SigningKey::from_bytes(&h.finalize()).ok()
-        })
-        .unwrap();
+    let key = fixture_key(seed);
     let storage = storage_sqlite::SqliteAccountStorage::in_memory().unwrap();
     let engine = crate::EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
@@ -24,6 +17,16 @@ fn build_client(
         .build()
         .unwrap();
     (engine, storage)
+}
+fn fixture_key(seed: &[u8]) -> k256::schnorr::SigningKey {
+    (0u64..)
+        .find_map(|i| {
+            let mut h = Sha256::new();
+            h.update(seed);
+            h.update(i.to_be_bytes());
+            k256::schnorr::SigningKey::from_bytes(&h.finalize()).ok()
+        })
+        .unwrap()
 }
 use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use std::fs::OpenOptions;
@@ -83,8 +86,12 @@ async fn live_join_captures_original_and_native_identity_without_acknowledging()
     let (mut recipient, storage, mut wire, group, inviter) = invitation().await;
     wire.id = MessageId::new(vec![0x73; 32]);
     let root = tempfile::tempdir().unwrap();
+    let mut actual_intent = intent(root.path());
+    // The inherited file description's cursor is not authority. Retain exact
+    // original bytes at offset zero even if its publisher left a stale cursor.
+    std::io::Seek::seek(&mut actual_intent.file, std::io::SeekFrom::Start(123)).unwrap();
     let evidence = recipient
-        .receiver_join_owned(wire.clone(), intent(root.path()))
+        .receiver_join_owned(wire.clone(), actual_intent)
         .await
         .unwrap();
     assert_eq!(evidence.group, group);
@@ -107,7 +114,7 @@ async fn live_join_captures_original_and_native_identity_without_acknowledging()
     assert_eq!(recipient.storage.list_groups().unwrap(), vec![group]);
 }
 #[tokio::test]
-async fn failed_native_join_keeps_original_and_cannot_reuse_nonempty_intent() {
+async fn rejected_native_welcome_does_not_burn_intent() {
     let (mut recipient, storage, mut wire, _, _) = invitation().await;
     wire.payload = vec![0xff; 13];
     let root = tempfile::tempdir().unwrap();
@@ -117,9 +124,10 @@ async fn failed_native_join_keeps_original_and_cannot_reuse_nonempty_intent() {
             .await
             .is_err()
     );
-    assert_eq!(
-        std::fs::read(root.path().join("join-intent")).unwrap(),
-        serde_json::to_vec(&wire).unwrap()
+    assert!(
+        std::fs::read(root.path().join("join-intent"))
+            .unwrap()
+            .is_empty()
     );
     assert!(storage.list_groups().unwrap().is_empty());
     assert!(
@@ -304,11 +312,16 @@ async fn failed_postcommit_capture_still_finalizes_actual_native_join() {
     let (mut recipient, storage, wire, group, _) = invitation().await;
     let mut wrong_wire = wire.clone();
     wrong_wire.id = MessageId::new(vec![0x19; 32]);
+    let root = tempfile::tempdir().unwrap();
     recipient.receiver_join_capture = Some(Capture {
         wire: wrong_wire,
         wire_sha256: "00".repeat(32),
         evidence: None,
         failed: false,
+        intent: intent(root.path()),
+        intent_attempted: false,
+        constraint: None,
+        policy_rejected: false,
     });
     // Deliberately invalid capture fails only after the actual join commits.
     recipient.join_welcome(wire).await.unwrap();
@@ -319,4 +332,180 @@ async fn failed_postcommit_capture_still_finalizes_actual_native_join() {
     assert!(recipient.group_authority(&group).is_ok());
     assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
     assert!(!recipient.drain_events().is_empty());
+}
+
+#[tokio::test]
+async fn enrolled_group_operator_and_keypackage_are_checked_before_durable_intent() {
+    for wrong in ["group", "operator", "keypackage", "malformed"] {
+        let (mut recipient, storage, wire, group, operator) = invitation().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = intent(root.path());
+        let retained = || JoinIntent {
+            file: original.file.try_clone().unwrap(),
+            directory: original.directory.try_clone().unwrap(),
+        };
+        let expected = || JoinConstraint {
+            group: group.clone(),
+            operators: vec![operator.clone()],
+            key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
+        };
+        let mut constraint = expected();
+        let mut candidate = wire.clone();
+        match wrong {
+            "group" => constraint.group = GroupId::new(vec![77; 16]),
+            "operator" => constraint.operators = vec![MemberId::new(vec![88; 32])],
+            "keypackage" => constraint.key_package_ref = vec![99; 32],
+            _ => {
+                candidate.payload = vec![0xff; 13];
+                candidate.id = MessageId::new(vec![0x41; 32]);
+            }
+        }
+        assert!(
+            recipient
+                .receiver_join_enrolled(candidate, retained(), constraint)
+                .await
+                .unwrap()
+                .is_none(),
+            "{wrong}"
+        );
+        assert_eq!(original.file.metadata().unwrap().len(), 0, "{wrong}");
+        assert!(storage.list_groups().unwrap().is_empty(), "{wrong}");
+        assert!(
+            storage
+                .list_pending_application_events()
+                .unwrap()
+                .is_empty(),
+            "{wrong}"
+        );
+        // Identical actual Welcome still works: rollback restored the consumed
+        // KeyPackage, and no unauthenticated/foreign input spent the intent.
+        let joined = recipient
+            .receiver_join_enrolled(wire.clone(), retained(), expected())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.group, group);
+        assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read(root.path().join("join-intent")).unwrap(),
+            serde_json::to_vec(&wire).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn intent_io_failure_rolls_back_native_join_but_preserves_unknown() {
+    let (mut recipient, storage, wire, group, operator) = invitation().await;
+    let root = tempfile::tempdir().unwrap();
+    let original = intent(root.path());
+    let read_only = JoinIntent {
+        file: File::open(root.path().join("join-intent")).unwrap(),
+        directory: original.directory.try_clone().unwrap(),
+    };
+    let result = recipient
+        .receiver_join_enrolled(
+            wire.clone(),
+            read_only,
+            JoinConstraint {
+                group,
+                operators: vec![operator],
+                key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(EngineError::Backend(_))));
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    // Empty bytes do not imply safe retry: write was actually attempted, so
+    // the owning entry treats this typed error as reconciliation-only HOLD.
+    assert_eq!(original.file.metadata().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn forged_nip59_giftwrap_does_not_spend_real_welcome_attempt() {
+    use cgka_traits::peeler::TransportPeeler;
+    use cgka_traits::transport::EncryptedPayload;
+    use transport_nostr_peeler::NostrMlsPeeler;
+    let (mut recipient, storage, raw, group, operator) = invitation().await;
+    let sender = nostr::Keys::new(
+        nostr::SecretKey::from_slice(&fixture_key(b"owned-join-inviter").to_bytes()).unwrap(),
+    );
+    let receiver = nostr::Keys::new(
+        nostr::SecretKey::from_slice(&fixture_key(b"owned-join-recipient").to_bytes()).unwrap(),
+    );
+    assert_eq!(
+        receiver.public_key().to_bytes().as_slice(),
+        recipient.self_id().as_slice()
+    );
+    recipient.peeler = Box::new(NostrMlsPeeler::new().with_welcome_signer(receiver));
+    let valid = NostrMlsPeeler::new()
+        .with_welcome_signer(sender)
+        .wrap_welcome_with_metadata(
+            &EncryptedPayload {
+                ciphertext: raw.payload.clone(),
+                aad: vec![],
+            },
+            &recipient.self_id(),
+            &cgka_traits::engine::WelcomeMetadata {
+                key_package_event_id: MessageId::new(vec![44; 32]),
+                relays: vec![cgka_traits::TransportEndpoint(
+                    "wss://fixture.invalid".into(),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+    let mut forged = valid.clone();
+    let mut event: serde_json::Value = serde_json::from_slice(&valid.payload).unwrap();
+    event["sig"] = serde_json::json!("00".repeat(64));
+    forged.payload = serde_json::to_vec(&event).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let original = intent(root.path());
+    let retained = || JoinIntent {
+        file: original.file.try_clone().unwrap(),
+        directory: original.directory.try_clone().unwrap(),
+    };
+    let expected = || JoinConstraint {
+        group: group.clone(),
+        operators: vec![operator.clone()],
+        key_package_ref: hex::decode(key_package_ref(&raw)).unwrap(),
+    };
+    assert!(
+        recipient
+            .receiver_join_enrolled(forged, retained(), expected())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(original.file.metadata().unwrap().len(), 0);
+    assert!(storage.list_groups().unwrap().is_empty());
+    let evidence = recipient
+        .receiver_join_enrolled(valid.clone(), retained(), expected())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.group, group);
+    assert_eq!(evidence.authenticated_welcomer, operator);
+    assert_eq!(
+        std::fs::read(root.path().join("join-intent")).unwrap(),
+        serde_json::to_vec(&valid).unwrap()
+    );
+    assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
+}
+
+/// Test fixture only: recover the actual native KeyPackageRef in this raw MLS
+/// Welcome. The production profile is retained by the enrollment publisher.
+pub(crate) fn key_package_ref(wire: &TransportMessage) -> String {
+    use tls_codec::Deserialize;
+    let message =
+        openmls::prelude::MlsMessageIn::tls_deserialize_exact(wire.payload.as_slice()).unwrap();
+    let openmls::prelude::MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
+        panic!("welcome")
+    };
+    hex::encode(welcome.secrets()[0].new_member().as_slice())
 }

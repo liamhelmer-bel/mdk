@@ -10,7 +10,7 @@ use cgka_traits::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{fs::File, io::Write};
+use std::{fs::File, os::unix::fs::FileExt};
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JoinEvidence {
@@ -37,8 +37,48 @@ pub(crate) struct Capture {
     wire_sha256: String,
     evidence: Option<JoinEvidence>,
     failed: bool,
+    intent: JoinIntent,
+    intent_attempted: bool,
+    constraint: Option<JoinConstraint>,
+    policy_rejected: bool,
+}
+
+pub(super) struct JoinConstraint {
+    pub(super) group: GroupId,
+    pub(super) operators: Vec<MemberId>,
+    pub(super) key_package_ref: Vec<u8>,
 }
 impl Capture {
+    /// Called inside the rollbackable native join transaction, after all native
+    /// Welcome checks. No unverified transport label can consume this intent.
+    pub(crate) fn prepare_commit(
+        &mut self,
+        group: &GroupId,
+        welcomer: &MemberId,
+        key_package_ref: &[u8],
+    ) -> Result<(), EngineError> {
+        if self.constraint.as_ref().is_some_and(|expected| {
+            &expected.group != group
+                || !expected.operators.contains(welcomer)
+                || expected.key_package_ref != key_package_ref
+        }) {
+            self.policy_rejected = true;
+            // An enrollment policy refusal is not an invalid native Welcome:
+            // do not terminally deduplicate valid invitation bytes.
+            return Err(EngineError::Other("enrollment invitation mismatch".into()));
+        }
+        // Set before the first write. Any partial write/fsync/commit failure is
+        // UNKNOWN, even when the native transaction subsequently rolls back.
+        self.intent_attempted = true;
+        let bytes =
+            serde_json::to_vec(&self.wire).map_err(|e| EngineError::Serialize(e.to_string()))?;
+        self.intent
+            .file
+            .write_all_at(&bytes, 0)
+            .and_then(|_| self.intent.file.sync_all())
+            .and_then(|_| self.intent.directory.sync_all())
+            .map_err(|e| EngineError::Backend(format!("join intent: {e}")))
+    }
     pub(crate) fn invalidate(&mut self) {
         self.failed = true;
         self.evidence = None;
@@ -74,13 +114,37 @@ pub(super) struct JoinIntent {
 }
 
 impl<S: StorageProvider + 'static> Engine<S> {
-    /// Fresh native join only: positively retain original wire before consuming
-    /// the KeyPackage. Any later failure keeps the intent and never retries it.
+    /// Test-only unconstrained seam; the owning runtime always supplies the
+    /// enrolled group/operator/KeyPackage constraint below.
+    #[cfg(test)]
     pub(super) async fn receiver_join_owned(
         &mut self,
         wire: TransportMessage,
-        mut intent: JoinIntent,
+        intent: JoinIntent,
     ) -> Result<JoinEvidence, EngineError> {
+        self.receiver_join_attempt(wire, intent, None)
+            .await?
+            .ok_or(EngineError::InvalidWelcome)
+    }
+
+    /// Only positively rejected input returns None. All backend or post-intent
+    /// failures remain errors and must stop the one-shot enrollment.
+    pub(super) async fn receiver_join_enrolled(
+        &mut self,
+        wire: TransportMessage,
+        intent: JoinIntent,
+        constraint: JoinConstraint,
+    ) -> Result<Option<JoinEvidence>, EngineError> {
+        self.receiver_join_attempt(wire, intent, Some(constraint))
+            .await
+    }
+
+    async fn receiver_join_attempt(
+        &mut self,
+        wire: TransportMessage,
+        intent: JoinIntent,
+        constraint: Option<JoinConstraint>,
+    ) -> Result<Option<JoinEvidence>, EngineError> {
         use std::os::unix::fs::MetadataExt;
         let fail = || EngineError::Other("receiver enrollment held".into());
         let metadata = intent.file.metadata().map_err(|_| fail())?;
@@ -103,21 +167,28 @@ impl<S: StorageProvider + 'static> Engine<S> {
         if bytes.len() > 1024 * 1024 {
             return Err(fail());
         }
-        intent
-            .file
-            .write_all(&bytes)
-            .and_then(|_| intent.file.sync_all())
-            .and_then(|_| intent.directory.sync_all())
-            .map_err(|_| fail())?;
         self.receiver_join_capture = Some(Capture {
             wire: wire.clone(),
             wire_sha256: hex::encode(Sha256::digest(bytes)),
             evidence: None,
             failed: false,
+            intent,
+            intent_attempted: false,
+            constraint,
+            policy_rejected: false,
         });
         let result = self.join_welcome(wire).await;
         let captured = self.receiver_join_capture.take().ok_or_else(fail)?;
-        let group = result?;
+        let group = match result {
+            Ok(group) => group,
+            Err(error)
+                if !captured.intent_attempted
+                    && (captured.policy_rejected || rejected_welcome(&error)) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if captured.failed {
             return Err(fail());
         }
@@ -140,8 +211,12 @@ impl<S: StorageProvider + 'static> Engine<S> {
         }
         // No acknowledgment here. The owner must first bind this original live
         // evidence into its durable protected header + independent anchor.
-        Ok(evidence)
+        Ok(Some(evidence))
     }
+}
+
+fn rejected_welcome(error: &EngineError) -> bool {
+    crate::group_lifecycle::terminal_welcome_error(error)
 }
 
 #[cfg(test)]

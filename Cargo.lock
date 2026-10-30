@@ -950,6 +950,7 @@ dependencies = [
  "transport-nostr-adapter",
  "transport-nostr-peeler",
  "web-time",
+ "zeroize",
 ]
 
 [[package]]
