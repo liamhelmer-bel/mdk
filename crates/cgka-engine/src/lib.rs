@@ -68,6 +68,9 @@ pub mod own_commit_intent;
 pub mod pending_commit_guard;
 #[allow(dead_code)]
 mod protected_receiver;
+#[cfg(unix)]
+#[allow(dead_code)]
+mod protected_recovery;
 pub mod provider;
 pub mod publish;
 pub mod self_update;
