@@ -60,6 +60,7 @@ enum TransitionKind {
     Conflict,
     Expired,
     NativeUpdate,
+    Enrollment,
     Consumed,
 }
 
@@ -177,7 +178,7 @@ fn append(file: &mut File, value: &impl Serialize) -> Result<()> {
     io(file.sync_all())
 }
 fn next<T: for<'a> Deserialize<'a> + Serialize>(
-    reader: &mut BufReader<&File>,
+    reader: &mut BufReader<impl Read>,
 ) -> Result<Option<T>> {
     let mut line = Vec::new();
     io(reader
@@ -205,6 +206,67 @@ fn anchor_digest(a: &Anchor) -> Result<String> {
         &a.previous_anchor_sha256,
         &a.use_key,
     ))
+}
+
+/// Non-authoritative readback from this exclusively owned, anchored journal.
+/// Original source bytes remain on disk; each allocation is bounded by MAX_LINE.
+pub(super) struct SourceRecord {
+    pub(super) sequence: u64,
+    pub(super) local_unix_ms: u64,
+    pub(super) body: serde_json::Value,
+}
+struct Positioned {
+    file: File,
+    offset: u64,
+}
+impl Read for Positioned {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        let length = self.file.read_at(buffer, self.offset)?;
+        self.offset = self
+            .offset
+            .checked_add(length as u64)
+            .ok_or_else(|| std::io::Error::other("journal offset"))?;
+        Ok(length)
+    }
+}
+pub(super) struct SourceCursor {
+    reader: BufReader<Positioned>,
+    sequence: u64,
+    digest: String,
+    tail: (u64, String),
+}
+impl SourceCursor {
+    pub(super) fn offset(&self) -> u64 {
+        self.reader.get_ref().offset - self.reader.buffer().len() as u64
+    }
+    pub(super) fn next(&mut self) -> Result<Option<SourceRecord>> {
+        let Some(record) = next::<Record>(&mut self.reader)? else {
+            if (self.sequence, self.digest.clone()) != self.tail {
+                return Err(Hold::Changed);
+            }
+            return Ok(None);
+        };
+        if record.sequence != self.sequence.checked_add(1).ok_or(Hold::Changed)?
+            || record.previous_sha256 != self.digest
+            || record_digest(&record)? != record.sha256
+            || record.sequence > self.tail.0
+        {
+            return Err(Hold::Changed);
+        }
+        self.sequence = record.sequence;
+        self.digest = record.sha256;
+        let body = match record.body {
+            Body::Transition { payload_hex, .. } => serde_json::json!({"kind":"source", "value":
+                serde_json::from_slice::<serde_json::Value>(&hex::decode(payload_hex).map_err(|_|Hold::Encoding)?).map_err(|_|Hold::Encoding)?}),
+            other => serde_json::to_value(other).map_err(|_| Hold::Encoding)?,
+        };
+        Ok(Some(SourceRecord {
+            sequence: record.sequence,
+            local_unix_ms: record.local_unix_ms,
+            body,
+        }))
+    }
 }
 
 impl Journal {
@@ -410,6 +472,104 @@ impl Journal {
         Ok(())
     }
 
+    /// Fixed fresh native enrollment; the original authenticated Welcome remains
+    /// retained in this chain before native pending plaintext can be acknowledged.
+    pub(super) fn retain_join(
+        &mut self,
+        evidence: &crate::protected_join::JoinEvidence,
+    ) -> Result<()> {
+        if self.sequence != 1 || self.latched {
+            return Err(Hold::Changed);
+        }
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let header =
+            next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
+        let Body::Header { enrollment, .. } = header.body else {
+            return Err(Hold::Changed);
+        };
+        if enrollment.welcome_provenance_sha256 != evidence.digest().map_err(|_| Hold::Changed)? {
+            return Err(Hold::Changed);
+        }
+        self.record_source(
+            serde_json::json!({"schema":"receiver-enrollment.v1", "native_join":evidence}),
+        )
+    }
+
+    pub(super) fn source_cursor(&self) -> Result<SourceCursor> {
+        if self.latched {
+            return Err(Hold::Latched);
+        }
+        Ok(SourceCursor {
+            reader: BufReader::new(Positioned {
+                file: io(self.files.journal.try_clone())?,
+                offset: 0,
+            }),
+            sequence: 0,
+            digest: String::new(),
+            tail: self.checkpoint(),
+        })
+    }
+    /// Continuation selected only by the owned derived catalog's prior verified
+    /// cursor. These scalar values cannot themselves establish journal authority.
+    pub(super) fn source_after(
+        &self,
+        sequence: u64,
+        digest: String,
+        offset: u64,
+    ) -> Result<SourceCursor> {
+        if self.latched || sequence > self.sequence || offset > self.length()? {
+            return Err(Hold::Changed);
+        }
+        Ok(SourceCursor {
+            reader: BufReader::new(Positioned {
+                file: io(self.files.journal.try_clone())?,
+                offset,
+            }),
+            sequence,
+            digest,
+            tail: self.checkpoint(),
+        })
+    }
+    pub(super) fn enrollment(&self) -> Result<Enrollment> {
+        let record = self.source_at(1)?;
+        serde_json::from_value(record.body["enrollment"].clone()).map_err(|_| Hold::Encoding)
+    }
+    pub(super) fn header_hash(&self) -> &str {
+        &self.header_digest
+    }
+    pub(super) fn checkpoint(&self) -> (u64, String) {
+        (self.sequence, self.digest.clone())
+    }
+    pub(super) fn source_at(&self, sequence: u64) -> Result<SourceRecord> {
+        let mut cursor = self.source_cursor()?;
+        while let Some(record) = cursor.next()? {
+            if record.sequence == sequence {
+                return Ok(record);
+            }
+        }
+        Err(Hold::Changed)
+    }
+
+    pub(super) fn checked_now(&self) -> Result<u64> {
+        if self.latched {
+            return Err(Hold::Latched);
+        }
+        let time = now()?;
+        if time < self.last_time {
+            return Err(Hold::Clock);
+        }
+        Ok(time)
+    }
+    pub(super) fn profile_hash(&self) -> Result<String> {
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let header =
+            next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
+        let Body::Header { enrollment, .. } = header.body else {
+            return Err(Hold::Changed);
+        };
+        Ok(enrollment.source_profile_sha256)
+    }
+
     pub(super) fn length(&self) -> Result<u64> {
         Ok(io(self.files.journal.metadata())?.len())
     }
@@ -440,9 +600,11 @@ impl Journal {
     /// recovery validator and cannot turn a supplied decoded object into authority.
     pub(super) fn record_source(&mut self, value: serde_json::Value) -> Result<()> {
         let transition = match value.get("schema").and_then(|v| v.as_str()) {
+            Some("receiver-enrollment.v1") => TransitionKind::Enrollment,
             Some("receiver-wire.v1") => TransitionKind::Wire,
             Some("receiver-outcome.v1") => TransitionKind::Outcome,
-            Some("semantic-original.v1") => TransitionKind::Original,
+            Some("semantic-original.v1" | "semantic-original.v2") => TransitionKind::Original,
+            Some("semantic-expired.v1") => TransitionKind::Expired,
             Some("semantic-outbound.v1") => TransitionKind::Outbound,
             Some("semantic-published.v1" | "semantic-card-complete.v1") => {
                 TransitionKind::Published
@@ -517,7 +679,10 @@ impl Journal {
             let value: serde_json::Value =
                 serde_json::from_slice(&hex::decode(payload_hex).map_err(|_| Hold::Encoding)?)
                     .map_err(|_| Hold::Encoding)?;
-            if value.get("schema").and_then(|v| v.as_str()) != Some("semantic-original.v1") {
+            if !matches!(
+                value.get("schema").and_then(|v| v.as_str()),
+                Some("semantic-original.v1" | "semantic-original.v2")
+            ) {
                 return Err(Hold::Encoding);
             }
             let original = value.get("original").ok_or(Hold::Encoding)?;
@@ -684,4 +849,4 @@ fn valid_ask(id: &str) -> bool {
 
 #[cfg(test)]
 #[path = "protected_recovery_tests.rs"]
-mod tests;
+pub(super) mod tests;

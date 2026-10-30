@@ -1,0 +1,81 @@
+use super::*;
+use crate::protected_recovery::{Enrollment, OwnedFiles};
+use std::{os::unix::fs::DirBuilderExt, path::Path};
+fn files(root: &Path) -> OwnedFiles {
+    let receiver = root.join("receiver");
+    let consumer = root.join("consumer");
+    std::fs::create_dir_all(&receiver).unwrap();
+    std::fs::create_dir_all(&consumer).unwrap();
+    let open = |p| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(p)
+            .unwrap()
+    };
+    OwnedFiles {
+        journal: open(receiver.join("journal")),
+        journal_directory: File::open(&receiver).unwrap(),
+        storage_lease: open(receiver.join("lease")),
+        anchor: open(consumer.join("anchor")),
+        anchor_directory: File::open(&consumer).unwrap(),
+    }
+}
+#[test]
+#[ignore = "explicit long-running anchored fsync history qualification"]
+fn terminal_history_above_ten_thousand_and_32mib_rebuilds_with_bounded_live_projection() {
+    let root = tempfile::tempdir().unwrap();
+    let enrollment = Enrollment {
+        account: "11".repeat(32),
+        group: "22".repeat(32),
+        operators: vec!["33".repeat(32)],
+        source_profile_sha256: "44".repeat(32),
+        storage_generation: "55".repeat(32),
+        initial_native_state_sha256: "66".repeat(32),
+        welcome_provenance_sha256: "77".repeat(32),
+    };
+    let policy = "88".repeat(32);
+    let mut journal = Journal::enroll(files(root.path()), enrollment.clone()).unwrap();
+    let mut last = String::new();
+    for i in 0..10001 {
+        last = crate::protected_recovery::tests::catalog_terminal_fixture(&mut journal, i, &policy);
+    }
+    assert!(journal.length().unwrap() > 32 * 1024 * 1024);
+    drop(journal);
+    let journal = Journal::reopen(files(root.path()), &enrollment).unwrap();
+    let path = root.path().join("cache");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    let catalog = Catalog::rebuild(
+        &journal,
+        File::open(&path).unwrap(),
+        &policy,
+        &[TransportEndpoint::from("wss://mechanical.invalid")],
+    )
+    .unwrap();
+    assert!(catalog.unanswered.is_empty());
+    assert_eq!(catalog.high_water_unanswered, 1);
+    assert_eq!(catalog.receiver_sequence, 10001);
+    assert_eq!(
+        catalog.ask(&journal, &last).unwrap().unwrap().disposition,
+        Disposition::Conflicted
+    );
+    assert_eq!(
+        catalog.ask(&journal, "2222").unwrap().unwrap().disposition,
+        Disposition::Conflicted
+    );
+    assert!(
+        Catalog::rebuild(
+            &journal,
+            File::open(&path).unwrap(),
+            &policy,
+            &[TransportEndpoint::from("wss://mechanical.invalid")]
+        )
+        .is_err()
+    );
+}

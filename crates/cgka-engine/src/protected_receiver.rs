@@ -204,6 +204,79 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         })
     }
 
+    /// Owned fresh join continuation. The actual native evidence is retained in
+    /// the anchored chain before positively acknowledging exactly its Welcome.
+    /// No production path opener or custody authority is supplied here.
+    #[cfg(unix)]
+    pub(super) fn from_native_join(
+        mut engine: Engine<S>,
+        group: GroupId,
+        operators: Vec<MemberId>,
+        mut journal: crate::protected_recovery::Journal,
+        evidence: crate::protected_join::JoinEvidence,
+    ) -> Result<Self, ReceiverHold> {
+        let projection = engine
+            .with_mls_group(&group, |native| {
+                if !engine.receiver_group_quiet(&group, native)? {
+                    return Err(EngineError::Other("receiver join not quiet".into()));
+                }
+                crate::protected_merge::Projection::read(native)
+            })
+            .map_err(|_| ReceiverHold::ChangedState)?;
+        let native = hex::encode(Sha256::digest(
+            serde_json::to_vec(&projection).map_err(|_| ReceiverHold::Malformed)?,
+        ));
+        let pending = engine
+            .storage
+            .list_pending_application_events()
+            .map_err(|_| ReceiverHold::Engine)?;
+        if operators.is_empty()
+            || operators.len() > 64
+            || operators.contains(&engine.self_id())
+            || operators
+                .iter()
+                .map(|m| hex::encode(m.as_slice()))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != operators.len()
+            || evidence.group != group
+            || evidence.joined != projection
+            || pending.len() != 1
+            || !evidence.matches_pending(&pending[0])
+            || engine.events_buf.len() != 1
+            || !evidence.matches_pending(&engine.events_buf[0])
+            || !journal
+                .binds_native(
+                    &hex::encode(engine.self_id().as_slice()),
+                    &hex::encode(group.as_slice()),
+                    &operators
+                        .iter()
+                        .map(|m| hex::encode(m.as_slice()))
+                        .collect::<Vec<_>>(),
+                    &native,
+                )
+                .map_err(|_| ReceiverHold::Journal)?
+        {
+            return Err(ReceiverHold::ChangedState);
+        }
+        journal
+            .retain_join(&evidence)
+            .map_err(|_| ReceiverHold::Journal)?;
+        engine
+            .storage
+            .delete_pending_application_events(std::slice::from_ref(&evidence.original_wire.id))
+            .map_err(|_| ReceiverHold::Journal)?;
+        engine.events_buf.clear(); // Exactly the positively matched singleton above.
+        Ok(Self {
+            engine,
+            group,
+            operators,
+            journal: ReceiverJournal::Ordered(journal),
+            sequence: 0,
+            latched: false,
+        })
+    }
+
     /// Private fresh ordered sink; not an authenticated file opener or restart API.
     #[cfg(unix)]
     fn from_ordered(
@@ -282,6 +355,20 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .map_err(|_| ReceiverHold::Journal)
     }
 
+    fn checked_now(&self) -> Result<u64, ReceiverHold> {
+        match &self.journal {
+            #[cfg(unix)]
+            ReceiverJournal::Ordered(journal) => {
+                journal.checked_now().map_err(|_| ReceiverHold::Journal)
+            }
+            ReceiverJournal::Fresh(_) => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ReceiverHold::Journal)?
+                .as_millis()
+                .try_into()
+                .map_err(|_| ReceiverHold::Journal),
+        }
+    }
     fn record(&mut self, value: impl Serialize) -> Result<(), ReceiverHold> {
         let mut bytes = serde_json::to_vec(&value).map_err(|_| ReceiverHold::Journal)?;
         if bytes.len() > MAX_RECORD {
@@ -480,3 +567,7 @@ pub(crate) fn capture_receiver_content(
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "protected_semantic.rs"]
 mod semantic;
+
+#[cfg(unix)]
+#[path = "protected_reopen.rs"]
+mod reopen;

@@ -50,12 +50,15 @@ fn client(seed: &[u8]) -> Engine<SqliteAccountStorage> {
     let (engine, _) = build_client(seed);
     // Reuse actual Engine identity/signature fixture, but real kind-445/NIP59 peeler.
     let storage = engine.storage.clone();
+    restart_client(seed, storage)
+}
+fn restart_client(seed: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAccountStorage> {
     let mut supported = default_group_components();
     supported.insert(NOSTR_ROUTING_COMPONENT_ID);
     crate::EngineBuilder::new(storage)
         .supported_app_components(supported)
         .legacy_compatibility_profile()
-        .identity(engine.self_id().as_slice().to_vec())
+        .identity(key(seed).verifying_key().to_bytes().to_vec())
         .account_identity_proof_signer(Arc::new(
             crate::distributed_convergence::tests::TestProofSigner(key(seed)),
         ))
@@ -670,4 +673,745 @@ async fn ordered_actual_post_reply_and_consume_bind_native_card_to_independent_u
         records[0]["sha256"]
     );
     assert_eq!(anchors.last().unwrap()["use_key"], consumed["body"]["key"]);
+}
+
+#[cfg(unix)]
+async fn finite_fixture() -> (
+    SemanticFactory<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    Arc<Relay>,
+) {
+    finite_fixture_lifetime(100).await
+}
+#[cfg(unix)]
+async fn finite_fixture_lifetime(
+    lifetime: u64,
+) -> (
+    SemanticFactory<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    Arc<Relay>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut f, op, _, relay) = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    let bytes = serde_json::to_vec(&serde_json::json!({"schema":"heterodyne-receiver-expiry.v1", "max_approval_lifetime_ms":lifetime})).unwrap();
+    std::fs::write(root.path().join("profile"), &bytes).unwrap();
+    std::fs::set_permissions(
+        root.path().join("profile"),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    let (journal, _) = crate::protected_receiver::tests::ordered_fixture_profile(
+        root.path(),
+        &f.receiver.engine,
+        &f.receiver.group,
+        &f.receiver.operators,
+        digest(&bytes),
+    );
+    f.receiver.journal = crate::protected_receiver::ReceiverJournal::Ordered(journal);
+    let f = f
+        .with_expiry_profile(std::fs::File::open(root.path().join("profile")).unwrap())
+        .unwrap();
+    (f, op, root, relay)
+}
+#[cfg(unix)]
+fn finite_original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
+    let mut ask = original(id, group);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    ask.operation_canonical = serde_json::to_vec(&serde_json::json!({
+        "schema":"heterodyne-protected-deployment.v1",
+        "release":{"not_before_ns":now-1_000_000_000u128,"deadline_ns":now+60_000_000_000u128},
+        "outage":{"not_before_ns":now-1_000_000_000u128,"deadline_ns":now+30_000_000_000u128,
+            "recovery_deadline_ns":now+120_000_000_000u128}
+    }))
+    .unwrap(); // Only expiry extraction fixture; not full validated Product/custody evidence.
+    ask
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn finite_expiry_is_durable_and_late_response_does_not_revive_or_conflict() {
+    let (mut f, mut op, root, _) = finite_fixture().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let wire = reaction(&mut op, &f, &target, "👍").await;
+    assert_eq!(f.ingest(wire).await.unwrap(), None);
+    assert!(f.asks["ask3"].expired);
+    assert!(!f.asks["ask3"].conflicted);
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    f.post(finite_original("ask4", &f.receiver.group))
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(root.path().join("receiver/journal")).unwrap();
+    let sources: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["body"]["payload_hex"]
+                .as_str()
+                .map(|h| serde_json::from_slice(&hex::decode(h).unwrap()).unwrap())
+        })
+        .collect();
+    let original = sources
+        .iter()
+        .find(|v| v["schema"] == "semantic-original.v2")
+        .unwrap();
+    assert!(original["expires_at_unix_ms"].as_u64().is_some());
+    assert!(
+        sources
+            .iter()
+            .any(|v| v["schema"] == "semantic-expired.v1" && v["ask_id"] == "ask3")
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn absent_finite_operation_or_changed_actual_profile_refuses_before_publish() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut f, _, root, relay) = finite_fixture().await;
+    assert!(f.post(original("ask3", &f.receiver.group)).await.is_err());
+    assert!(relay.wires.lock().unwrap().is_empty());
+    assert!(!f.held);
+    std::fs::set_permissions(
+        root.path().join("profile"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("profile"), b"changed policy").unwrap();
+    std::fs::set_permissions(
+        root.path().join("profile"),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    assert!(
+        f.post(finite_original("ask3", &f.receiver.group))
+            .await
+            .is_err()
+    );
+    assert!(relay.wires.lock().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+fn cache(root: &std::path::Path, name: &str) -> std::fs::File {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = root.join(name);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&path)
+        .unwrap();
+    std::fs::File::open(path).unwrap()
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_semantics_rebuilds_terminal_lookup_candidates_and_conflict_without_replaying_wire()
+{
+    let (mut f, mut op, root, relay) = finite_fixture_lifetime(20000).await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let wire = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(wire).await.unwrap();
+    let candidate = f.asks["ask3"]
+        .receipt
+        .as_ref()
+        .unwrap()
+        .authenticated_candidate
+        .message_id
+        .clone();
+    let policy = f.policy().unwrap();
+    let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
+        panic!("ordered")
+    };
+    let catalog =
+        catalog::Catalog::rebuild(journal, cache(root.path(), "cache1"), &policy, &f.endpoints)
+            .unwrap();
+    assert!(catalog.unanswered.is_empty());
+    assert_eq!(
+        catalog.ask(journal, "ask3").unwrap().unwrap().disposition,
+        catalog::Disposition::Approved
+    );
+    assert!(catalog.candidate_seen(journal, &candidate).unwrap());
+    assert_eq!(
+        catalog.target(journal, &target).unwrap(),
+        Some("ask3".into())
+    );
+    assert_eq!(relay.wires.lock().unwrap().len(), 2);
+    let wire = reaction(&mut op, &f, &target, "👎").await;
+    f.ingest(wire).await.unwrap();
+    let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
+        panic!("ordered")
+    };
+    assert!(catalog.ask(journal, "ask3").is_err()); // Stale derived checkpoint is never authority.
+    let catalog =
+        catalog::Catalog::rebuild(journal, cache(root.path(), "cache2"), &policy, &f.endpoints)
+            .unwrap();
+    assert_eq!(
+        catalog.ask(journal, "ask3").unwrap().unwrap().disposition,
+        catalog::Disposition::Conflicted
+    );
+    assert!(catalog.unanswered.is_empty());
+    assert_eq!(relay.wires.lock().unwrap().len(), 2); // Rebuild performs no publishing.
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn unprojected_actual_contrary_candidate_cannot_restore_earlier_approval() {
+    let (mut f, mut op, root, _) = finite_fixture_lifetime(20000).await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(yes).await.unwrap();
+    let no = reaction(&mut op, &f, &target, "👎").await;
+    assert!(f.receiver.ingest(no).await.unwrap().is_some()); // Actual native commit/outcome, crash before semantic projection.
+    let policy = f.policy().unwrap();
+    let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
+        panic!("ordered")
+    };
+    assert!(
+        catalog::Catalog::rebuild(journal, cache(root.path(), "cache"), &policy, &f.endpoints)
+            .is_err()
+    );
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_unrelated_removal_reconstructs_scoped_disk_tombstone() {
+    let (mut f, mut op, root, _) = finite_fixture_lifetime(20000).await;
+    let target = "ab".repeat(32);
+    let wire = app_wire(
+        &mut op,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".into(), target.clone()]],
+        "",
+    )
+    .await;
+    assert_eq!(f.ingest(wire).await.unwrap(), None);
+    let policy = f.policy().unwrap();
+    let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
+        panic!("ordered")
+    };
+    let catalog =
+        catalog::Catalog::rebuild(journal, cache(root.path(), "cache"), &policy, &f.endpoints)
+            .unwrap();
+    assert!(
+        catalog
+            .removed(
+                journal,
+                &serde_json::to_value(op.self_id()).unwrap(),
+                &target
+            )
+            .unwrap()
+    );
+    assert!(
+        !catalog
+            .removed(
+                journal,
+                &serde_json::to_value(cgka_traits::types::MemberId::new(vec![9; 32])).unwrap(),
+                &target
+            )
+            .unwrap()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_owned_files(root: &std::path::Path) -> crate::protected_recovery::OwnedFiles {
+    use std::os::unix::fs::OpenOptionsExt;
+    let receiver = root.join("receiver");
+    let consumer = root.join("consumer");
+    std::fs::create_dir_all(&receiver).unwrap();
+    std::fs::create_dir_all(&consumer).unwrap();
+    let open = |p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(p)
+            .unwrap()
+    };
+    crate::protected_recovery::OwnedFiles {
+        journal: open(receiver.join("journal")),
+        journal_directory: std::fs::File::open(&receiver).unwrap(),
+        storage_lease: open(receiver.join("lease")),
+        anchor: open(consumer.join("anchor")),
+        anchor_directory: std::fs::File::open(&consumer).unwrap(),
+    }
+}
+#[cfg(target_os = "linux")]
+async fn fresh_recovery_factory() -> (
+    SemanticFactory<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    Arc<Relay>,
+) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut operator = client(b"semantic-operator");
+    let mut controller = client(b"semantic-controller");
+    let mut kp = controller.fresh_key_package().await.unwrap();
+    kp.source = Some(cgka_traits::engine::KeyPackageSource {
+        event_id: cgka_traits::types::MessageId::new(vec![4; 32]),
+    });
+    let route = NostrRoutingV1::new([7; 32], vec!["wss://semantic.invalid".into()]).unwrap();
+    let (group, created) = operator
+        .create_group(CreateGroupRequest {
+            name: "recovery".into(),
+            description: String::new(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: vec![AppComponentData {
+                component_id: NOSTR_ROUTING_COMPONENT_ID,
+                data: encode_nostr_routing_v1(&route).unwrap(),
+            }],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated {
+        pending,
+        mut welcomes,
+    } = created
+    else {
+        panic!("fixture")
+    };
+    operator.confirm_published(pending).await.unwrap();
+    operator.drain_events();
+    controller.drain_events();
+    let root = tempfile::tempdir().unwrap();
+    let intent = crate::protected_join::JoinIntent {
+        file: std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(root.path().join("join-intent"))
+            .unwrap(),
+        directory: std::fs::File::open(root.path()).unwrap(),
+    };
+    let join = controller
+        .receiver_join_owned(welcomes.remove(0), intent)
+        .await
+        .unwrap();
+    let profile=serde_json::to_vec(&serde_json::json!({"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":30000})).unwrap();
+    std::fs::write(root.path().join("profile"), &profile).unwrap();
+    std::fs::set_permissions(
+        root.path().join("profile"),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    let enrollment = crate::protected_recovery::Enrollment {
+        account: hex::encode(controller.self_id().as_slice()),
+        group: hex::encode(group.as_slice()),
+        operators: vec![hex::encode(operator.self_id().as_slice())],
+        source_profile_sha256: digest(&profile),
+        storage_generation: "66".repeat(32),
+        initial_native_state_sha256: digest(&serde_json::to_vec(&join.joined).unwrap()),
+        welcome_provenance_sha256: join.digest().unwrap(),
+    };
+    let journal =
+        crate::protected_recovery::Journal::enroll(recovery_owned_files(root.path()), enrollment)
+            .unwrap();
+    let receiver = ProtectedReceiver::from_native_join(
+        controller,
+        group,
+        vec![operator.self_id()],
+        journal,
+        join,
+    )
+    .unwrap();
+    let relay = Arc::new(Relay::default());
+    let transport = NostrTransportAdapter::new(relay.clone());
+    transport
+        .activate_account(TransportAccountActivation {
+            account_id: receiver.engine.self_id(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut factory = SemanticFactory::new(
+        receiver,
+        transport,
+        vec![TransportEndpoint::from("wss://semantic.invalid")],
+    )
+    .unwrap()
+    .with_expiry_profile(std::fs::File::open(root.path().join("profile")).unwrap())
+    .unwrap();
+    factory
+        .enable_catalog(cache(root.path(), "initial-cache"))
+        .unwrap();
+    (factory, operator, root, relay)
+}
+#[cfg(target_os = "linux")]
+async fn restart_factory(
+    f: SemanticFactory<SqliteAccountStorage>,
+    root: &std::path::Path,
+    relay: Arc<Relay>,
+    cache_name: &str,
+) -> Result<SemanticFactory<SqliteAccountStorage>, ReceiverHold> {
+    let storage = f.receiver.engine.storage.clone();
+    let group = f.receiver.group.clone();
+    let operators = f.receiver.operators.clone();
+    let enrollment = f.ordered().unwrap().enrollment().unwrap();
+    drop(f);
+    // Real Engine rehydration from the same actual SQLite account state. Fixture
+    // signer/peeler identities are synthetic; no production custody is asserted.
+    let engine = restart_client(b"semantic-controller", storage);
+    let journal =
+        crate::protected_recovery::Journal::reopen(recovery_owned_files(root), &enrollment)
+            .map_err(|_| ReceiverHold::Journal)?;
+    let transport = NostrTransportAdapter::new(relay);
+    transport
+        .activate_account(TransportAccountActivation {
+            account_id: engine.self_id(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    SemanticFactory::reopen(
+        engine,
+        group,
+        operators,
+        journal,
+        transport,
+        vec![TransportEndpoint::from("wss://semantic.invalid")],
+        super::reopen::ReopenFiles {
+            expiry: std::fs::File::open(root.join("profile")).unwrap(),
+            cache: cache(root, cache_name),
+        },
+    )
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_approval_restart_consumes_once_and_continues_unanswered() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(yes).await.unwrap();
+    let published = relay.wires.lock().unwrap().len();
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart1")
+        .await
+        .unwrap();
+    assert!(f.asks.is_empty());
+    assert_eq!(relay.wires.lock().unwrap().len(), published);
+    assert_eq!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .unwrap()
+            .decision,
+        Decision::Approve
+    );
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart2")
+        .await
+        .unwrap();
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    f.post(finite_original("ask4", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask4"].app_ids[0].clone();
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart3")
+        .await
+        .unwrap();
+    assert_eq!(f.asks.len(), 1);
+    assert!(f.asks.contains_key("ask4"));
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(yes).await.unwrap();
+    f.consume("ask4", &digest(b"exact source-only operation"))
+        .unwrap();
+    assert_eq!(f.catalog.as_ref().unwrap().unanswered.len(), 0);
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_restart_contrary_and_removal_preserve_scoped_conflicts() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(yes).await.unwrap();
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart1")
+        .await
+        .unwrap();
+    let no = reaction(&mut op, &f, &target, "👎").await;
+    f.ingest(no).await.unwrap();
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    f.post(finite_original("ask4", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask4"].app_ids[0].clone();
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.ingest(yes).await.unwrap();
+    let inner = f.asks["ask4"]
+        .receipt
+        .as_ref()
+        .unwrap()
+        .authenticated_candidate
+        .application
+        .id
+        .clone();
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart2")
+        .await
+        .unwrap();
+    let remove = app_wire(
+        &mut op,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".into(), inner]],
+        "",
+    )
+    .await;
+    f.ingest(remove).await.unwrap();
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart3")
+        .await
+        .unwrap();
+    assert!(
+        f.consume("ask4", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    f.post(finite_original("ask5", &f.receiver.group))
+        .await
+        .unwrap();
+    assert_eq!(f.catalog.as_ref().unwrap().unanswered.len(), 1);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_disk_targets_ignore_unrelated_reaction_and_scope_multiask_removal() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    let mut cards = Vec::new();
+    let mut inner = String::new();
+    for id in ["ask3", "ask4"] {
+        f.post(finite_original(id, &f.receiver.group))
+            .await
+            .unwrap();
+        let target = f.asks[id].app_ids[0].clone();
+        let yes = reaction(&mut op, &f, &target, "👍").await;
+        f.ingest(yes).await.unwrap();
+        inner = f.asks[id]
+            .receipt
+            .as_ref()
+            .unwrap()
+            .authenticated_candidate
+            .application
+            .id
+            .clone();
+        cards.push(target);
+    }
+    let mut f = restart_factory(f, root.path(), relay.clone(), "restart1")
+        .await
+        .unwrap();
+    // A reaction to a decision is not a reaction to its original card. The
+    // terminal lookup must not reinterpret that reference as another consent.
+    let unrelated = reaction(&mut op, &f, &inner, "👎").await;
+    f.ingest(unrelated).await.unwrap();
+    assert!(!f.held);
+    assert!(f.asks.is_empty());
+    assert_eq!(
+        f.catalog
+            .as_ref()
+            .unwrap()
+            .retained_ask("ask4")
+            .unwrap()
+            .unwrap()
+            .disposition,
+        catalog::Disposition::Approved
+    );
+    // One actual message targeting two known cards makes a bounded, durable
+    // scoped conflict without loading both historical full-card payloads.
+    let remove = app_wire(
+        &mut op,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        cards.into_iter().map(|id| vec!["e".into(), id]).collect(),
+        "",
+    )
+    .await;
+    f.ingest(remove).await.unwrap();
+    assert!(!f.held);
+    assert!(f.asks.is_empty());
+    let mut f = restart_factory(f, root.path(), relay, "restart2")
+        .await
+        .unwrap();
+    for id in ["ask3", "ask4"] {
+        assert!(
+            f.consume(id, &digest(b"exact source-only operation"))
+                .is_err()
+        );
+    }
+    f.post(finite_original("ask5", &f.receiver.group))
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_final_native_reply_is_classified_once_without_reingest() {
+    for contrary in [false, true] {
+        let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+        f.post(finite_original("ask3", &f.receiver.group))
+            .await
+            .unwrap();
+        let target = f.asks["ask3"].app_ids[0].clone();
+        if contrary {
+            let yes = reaction(&mut op, &f, &target, "👍").await;
+            f.ingest(yes).await.unwrap();
+        }
+        let reply = reaction(&mut op, &f, &target, if contrary { "👎" } else { "👍" }).await;
+        // Actual native ingest + complete anchored outcome, then crash before
+        // its semantic projection. The retained wire must never be re-ingested.
+        f.receiver.ingest(reply).await.unwrap().unwrap();
+        let sequence = f.receiver.sequence;
+        let published = relay.wires.lock().unwrap().len();
+        let mut f = restart_factory(f, root.path(), relay.clone(), "restart1")
+            .await
+            .unwrap();
+        assert_eq!(f.receiver.sequence, sequence);
+        assert_eq!(relay.wires.lock().unwrap().len(), published);
+        if contrary {
+            assert!(
+                f.consume("ask3", &digest(b"exact source-only operation"))
+                    .is_err()
+            );
+        } else {
+            f.consume("ask3", &digest(b"exact source-only operation"))
+                .unwrap();
+        }
+        let mut f = restart_factory(f, root.path(), relay, "restart2")
+            .await
+            .unwrap();
+        assert!(
+            f.consume("ask3", &digest(b"exact source-only operation"))
+                .is_err()
+        );
+    }
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_refuses_unretained_native_plaintext_and_partial_publication() {
+    use cgka_traits::MessageStorage;
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let reply = reaction(&mut op, &f, &target, "👍").await;
+    f.receiver.engine.ingest(reply).await.unwrap(); // Deliberately outside owned ingress.
+    let storage = f.receiver.engine.storage.clone();
+    let pending = storage.list_pending_application_events().unwrap();
+    assert!(!pending.is_empty());
+    assert!(
+        restart_factory(f, root.path(), relay, "restart1")
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        storage.list_pending_application_events().unwrap().len(),
+        pending.len()
+    );
+    let (mut f, _, root, relay) = fresh_recovery_factory().await;
+    *relay.fail_at.lock().unwrap() = Some(1);
+    assert!(
+        f.post(finite_original("ask3", &f.receiver.group))
+            .await
+            .is_err()
+    );
+    let published = relay.wires.lock().unwrap().len();
+    assert!(
+        restart_factory(f, root.path(), relay.clone(), "restart1")
+            .await
+            .is_err()
+    );
+    assert_eq!(relay.wires.lock().unwrap().len(), published);
+}
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_expiry_is_not_extended_by_restart() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    let mut original = finite_original("ask3", &f.receiver.group);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&original.operation_canonical).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    value["outage"]["deadline_ns"] = serde_json::json!(now + 2_000_000_000u128);
+    original.operation_canonical = serde_json::to_vec(&value).unwrap();
+    f.post(original).await.unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let original_expiry = f.asks["ask3"].expires_at_unix_ms;
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let mut f = restart_factory(f, root.path(), relay, "restart1")
+        .await
+        .unwrap();
+    assert_eq!(f.asks["ask3"].expires_at_unix_ms, original_expiry);
+    assert!(f.asks["ask3"].expired);
+    assert!(f.catalog.as_ref().unwrap().unanswered.is_empty());
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    assert!(f.ingest(yes).await.unwrap().is_none());
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_reopens_only_retained_direct_unchanged_policy_update() {
+    for retained in [true, false] {
+        let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+        let SendResult::GroupEvolution { msg, pending, .. } = op
+            .send(SendIntent::SelfUpdate {
+                group_id: f.receiver.group.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("update")
+        };
+        op.confirm_published(pending).await.unwrap();
+        op.drain_events();
+        if retained {
+            assert!(f.ingest(msg).await.unwrap().is_none());
+        } else {
+            f.receiver.engine.ingest(msg).await.unwrap();
+        }
+        let result = restart_factory(f, root.path(), relay, "restart1").await;
+        if retained {
+            let mut f = result.unwrap();
+            f.post(finite_original("ask3", &f.receiver.group))
+                .await
+                .unwrap();
+            let target = f.asks["ask3"].app_ids[0].clone();
+            let yes = reaction(&mut op, &f, &target, "👍").await;
+            f.ingest(yes).await.unwrap();
+            f.consume("ask3", &digest(b"exact source-only operation"))
+                .unwrap();
+        } else {
+            assert!(result.is_err());
+        }
+    }
 }

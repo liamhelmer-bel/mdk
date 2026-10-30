@@ -100,3 +100,7 @@ const _: fn(Box<dyn cgka_traits::CgkaEngine + Send + Sync>) = |_| {};
 
 #[allow(dead_code)]
 mod protected_merge;
+
+#[cfg(unix)]
+#[allow(dead_code)]
+mod protected_join;

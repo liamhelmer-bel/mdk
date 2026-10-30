@@ -169,10 +169,17 @@ impl<S: cgka_traits::storage::StorageProvider> crate::Engine<S> {
                     && !capture.convergence_entered
                     && capture.direct.is_none()
             })
-            && matches!(
-                self.epoch_manager.state(group),
-                Some(cgka_traits::engine_state::EpochState::Stable { .. })
-            )
+            && self.receiver_group_quiet(group, native)?)
+    }
+    pub(crate) fn receiver_group_quiet(
+        &self,
+        group: &GroupId,
+        native: &MlsGroup,
+    ) -> Result<bool, EngineError> {
+        Ok(matches!(
+            self.epoch_manager.state(group),
+            Some(cgka_traits::engine_state::EpochState::Stable { .. })
+        ) && !self.quarantined_groups().iter().any(|(id, _)| id == group)
             && self.auto_publish_buf.is_empty()
             && self.auto_proposal_buf.is_empty()
             && self.epoch_manager.pending_refs_for_group(group).is_empty()

@@ -60,6 +60,8 @@ struct RetainedAsk {
     receipt: Option<SemanticReceipt>,
     consumed: bool,
     conflicted: bool,
+    expires_at_unix_ms: Option<u64>,
+    expired: bool,
 }
 /// All methods remain private; no plaintext evidence import or delivery flag.
 struct SemanticFactory<S: StorageProvider + 'static> {
@@ -71,6 +73,10 @@ struct SemanticFactory<S: StorageProvider + 'static> {
     // Authenticated inner-event removals survive arrival before their target.
     removals: BTreeSet<(Option<String>, String)>,
     held: bool,
+    #[cfg(unix)]
+    expiry_profile: Option<expiry::Profile>,
+    #[cfg(target_os = "linux")]
+    catalog: Option<catalog::Catalog>,
 }
 impl<S: StorageProvider + 'static> SemanticFactory<S> {
     fn new(
@@ -92,7 +98,25 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             seen_candidates: BTreeSet::new(),
             removals: BTreeSet::new(),
             held: false,
+            #[cfg(unix)]
+            expiry_profile: None,
+            #[cfg(target_os = "linux")]
+            catalog: None,
         })
+    }
+    #[cfg(unix)]
+    fn with_expiry_profile(mut self, file: std::fs::File) -> Result<Self, ReceiverHold> {
+        if !self.asks.is_empty() || self.held {
+            return Err(ReceiverHold::Configuration);
+        }
+        let super::ReceiverJournal::Ordered(journal) = &self.receiver.journal else {
+            return Err(ReceiverHold::Configuration);
+        };
+        self.expiry_profile = Some(expiry::Profile::open(
+            file,
+            &journal.profile_hash().map_err(|_| ReceiverHold::Journal)?,
+        )?);
+        Ok(self)
     }
     fn policy(&self) -> Result<String, ReceiverHold> {
         // Exact protected configured policy, not a caller revision/current flag.
@@ -119,10 +143,18 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         if self.held || self.receiver.latched {
             return Err(ReceiverHold::Latched);
         }
+        #[cfg(target_os = "linux")]
+        self.catalog_start()?;
+        self.expire()?;
+        #[cfg(target_os = "linux")]
+        if self.catalog_has_ask(&original.ask_id)? {
+            return Err(ReceiverHold::Configuration);
+        }
+        let expires_at_unix_ms = self.expiry_for(&original)?;
         if self
             .asks
             .values()
-            .filter(|a| a.receipt.is_none() && !a.conflicted)
+            .filter(|a| a.receipt.is_none() && !a.conflicted && !a.expired)
             .count()
             >= 100
             || original.expected_group != self.receiver.group
@@ -179,10 +211,18 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             }
             events.push(event);
         }
+        if expires_at_unix_ms.is_some_and(|expiry| {
+            self.receiver
+                .checked_now()
+                .map_or(true, |now| now >= expiry)
+        }) {
+            return Err(ReceiverHold::ChangedState);
+        }
         self.held = true;
-        self.receiver
-            .record(serde_json::json!({"schema":"semantic-original.v1",
-            "original":original,"policy_sha256":policy}))?;
+        self.receiver.record(if let Some(expiry) = expires_at_unix_ms {
+            serde_json::json!({"schema":"semantic-original.v2", "original":original,
+                "policy_sha256":policy, "expires_at_unix_ms":expiry})
+        } else { serde_json::json!({"schema":"semantic-original.v1", "original":original,"policy_sha256":policy}) })?;
         let mut app_ids = Vec::new();
         for (index, event) in events.into_iter().enumerate() {
             let payload = event.encode().map_err(|_| ReceiverHold::Malformed)?;
@@ -266,15 +306,22 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                 receipt: None,
                 consumed: false,
                 conflicted: false,
+                expires_at_unix_ms,
+                expired: false,
             },
         );
         self.held = false;
+        #[cfg(target_os = "linux")]
+        self.sync_catalog()?;
         Ok(())
     }
     async fn ingest(&mut self, wire: TransportMessage) -> Result<Option<String>, ReceiverHold> {
         if self.held {
             return Err(ReceiverHold::Latched);
         }
+        #[cfg(target_os = "linux")]
+        self.catalog_start()?;
+        self.expire()?;
         self.held = true;
         let result = self.receiver.ingest(wire).await;
         // A bounded refusal before the native boundary has no uncertain effect.
@@ -284,8 +331,22 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         }
         let Some(candidate) = result? else {
             self.held = false;
+            #[cfg(target_os = "linux")]
+            self.sync_catalog()?;
             return Ok(None);
         };
+        #[cfg(target_os = "linux")]
+        if !self.hydrate_candidate(&candidate)? {
+            return Ok(None);
+        }
+        self.classify(candidate)
+    }
+    /// New live native candidate or an exact final candidate restored only by
+    /// the owning protected journal validator. No transport replay occurs here.
+    fn classify(
+        &mut self,
+        candidate: AuthenticatedCandidate,
+    ) -> Result<Option<String>, ReceiverHold> {
         // A receipt is made only by this actual ingestion path, never from a DTO.
         if !self.seen_candidates.insert(candidate.message_id.clone()) {
             return Err(ReceiverHold::ChangedState);
@@ -341,29 +402,33 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .asks
             .iter()
             .filter(|(id, r)| {
-                command_id.as_ref() == Some(*id)
-                    || targets
-                        .iter()
-                        .any(|t| r.app_ids.iter().any(|id| id.eq_ignore_ascii_case(t)))
-                    || (matches!(
-                        app.kind,
-                        MARMOT_APP_EVENT_KIND_DELETE
-                            | MARMOT_APP_EVENT_KIND_EDIT
-                            | MARMOT_APP_EVENT_KIND_REMOVE
-                    ) && r.receipt.as_ref().is_some_and(|r| {
-                        (r.operator == candidate.sender || app.kind == MARMOT_APP_EVENT_KIND_REMOVE)
-                            && targets.iter().any(|t| {
-                                r.authenticated_candidate
-                                    .application
-                                    .id
-                                    .eq_ignore_ascii_case(t)
-                            })
-                    }))
+                !r.expired
+                    && (command_id.as_ref() == Some(*id)
+                        || targets
+                            .iter()
+                            .any(|t| r.app_ids.iter().any(|id| id.eq_ignore_ascii_case(t)))
+                        || (matches!(
+                            app.kind,
+                            MARMOT_APP_EVENT_KIND_DELETE
+                                | MARMOT_APP_EVENT_KIND_EDIT
+                                | MARMOT_APP_EVENT_KIND_REMOVE
+                        ) && r.receipt.as_ref().is_some_and(|r| {
+                            (r.operator == candidate.sender
+                                || app.kind == MARMOT_APP_EVENT_KIND_REMOVE)
+                                && targets.iter().any(|t| {
+                                    r.authenticated_candidate
+                                        .application
+                                        .id
+                                        .eq_ignore_ascii_case(t)
+                                })
+                        })))
             })
             .map(|(id, _)| id.clone())
             .collect();
         if matches.is_empty() {
             self.held = false;
+            #[cfg(target_os = "linux")]
+            self.sync_catalog()?;
             return Ok(None);
         }
         // A relevant unsupported reply/deletion or ambiguous target is a scoped
@@ -387,10 +452,14 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                     .conflicted = true;
             }
             self.held = false;
+            #[cfg(target_os = "linux")]
+            self.sync_catalog()?;
             return Ok(None);
         }
         let Some(decision) = decision else {
             self.held = false;
+            #[cfg(target_os = "linux")]
+            self.sync_catalog()?;
             return Ok(None);
         };
         let policy = self.policy()?;
@@ -425,8 +494,46 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .get_mut(key)
             .ok_or(ReceiverHold::ChangedState)?
             .receipt = Some(receipt);
+        let answer = key.clone();
         self.held = false;
-        Ok(Some(key.clone()))
+        #[cfg(target_os = "linux")]
+        self.sync_catalog()?;
+        Ok(Some(answer))
+    }
+    fn expiry_for(&self, original: &OriginalAsk) -> Result<Option<u64>, ReceiverHold> {
+        #[cfg(unix)]
+        if let Some(profile) = &self.expiry_profile {
+            return profile
+                .expiry(&original.operation_canonical, self.receiver.checked_now()?)
+                .map(Some);
+        }
+        let _ = original;
+        Ok(None) // Legacy dormant source seam has no recovery/finite-expiry qualification.
+    }
+    fn expire(&mut self) -> Result<(), ReceiverHold> {
+        #[cfg(unix)]
+        if let Some(profile) = &self.expiry_profile {
+            profile.check()?;
+        }
+        let now = self.receiver.checked_now()?;
+        let expired: Vec<_> = self
+            .asks
+            .iter()
+            .filter(|(_, a)| !a.expired && a.expires_at_unix_ms.is_some_and(|e| now >= e))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for ask in expired {
+            self.held = true;
+            self.receiver.record(
+                serde_json::json!({"schema":"semantic-expired.v1", "ask_id":ask, "at_unix_ms":now}),
+            )?;
+            self.asks
+                .get_mut(&ask)
+                .ok_or(ReceiverHold::ChangedState)?
+                .expired = true;
+            self.held = false;
+        }
+        Ok(())
     }
     /// One-use evidence lookup. Caller IDs/digests select retained facts; they do not create them.
     fn consume(
@@ -437,10 +544,17 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         if self.held || self.receiver.latched {
             return Err(ReceiverHold::Latched);
         }
+        #[cfg(target_os = "linux")]
+        {
+            self.catalog_start()?;
+            self.load_retained(ask_id)?;
+        }
+        self.expire()?;
         let policy = self.policy()?;
         let ask = self.asks.get(ask_id).ok_or(ReceiverHold::Configuration)?;
         let r = ask.receipt.as_ref().ok_or(ReceiverHold::ChangedState)?;
         if ask.conflicted
+            || ask.expired
             || ask.consumed
             || r.decision != Decision::Approve
             || r.policy_sha256 != policy
@@ -459,7 +573,12 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .ok_or(ReceiverHold::ChangedState)?;
         ask.consumed = true;
         self.held = false;
-        ask.receipt.as_ref().ok_or(ReceiverHold::ChangedState)
+        #[cfg(target_os = "linux")]
+        self.sync_catalog()?;
+        self.asks
+            .get(ask_id)
+            .and_then(|a| a.receipt.as_ref())
+            .ok_or(ReceiverHold::ChangedState)
     }
 }
 fn serialize_hex<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -491,3 +610,15 @@ fn emoji_action(s: &str) -> Option<Decision> {
 #[cfg(test)]
 #[path = "protected_semantic_tests.rs"]
 mod tests;
+
+#[cfg(unix)]
+#[path = "protected_expiry.rs"]
+mod expiry;
+
+#[cfg(target_os = "linux")]
+#[path = "protected_catalog.rs"]
+mod catalog;
+
+#[cfg(target_os = "linux")]
+#[path = "protected_semantic_reopen.rs"]
+mod reopen;

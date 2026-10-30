@@ -283,3 +283,125 @@ fn actual_directory_fsync_failure_cannot_return_an_enrolled_owner_or_retry_heade
         Err(Hold::Changed)
     ));
 }
+
+/// Mechanical synthetic history fixture only. Uses actual journal/anchor fsync
+/// and chain construction; it does not assert these synthetic MLS fields were
+/// authenticated. Actual native causal tests qualify that separate boundary.
+pub(crate) fn catalog_terminal_fixture(j: &mut Journal, index: u64, policy: &str) -> String {
+    use cgka_traits::{
+        app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent},
+        transport::{Timestamp, TransportEnvelope, TransportMessage, TransportSource},
+        types::{GroupId, MemberId, MessageId},
+    };
+    use serde_json::json;
+    let alphabet = b"23456789abcdefghjkmnpqrstuvwxyz";
+    let mut n = index;
+    let mut id = String::new();
+    for _ in 0..4 {
+        id.push(alphabet[(n % alphabet.len() as u64) as usize] as char);
+        n /= alphabet.len() as u64;
+    }
+    let group = GroupId::new(vec![0x22; 32]);
+    let sender = MemberId::new(vec![0x33; 32]);
+    let op = b"original operation";
+    let original_sha = hex::encode(Sha256::digest(op));
+    let received = now().unwrap();
+    let mut source = |kind, value: serde_json::Value| {
+        j.write(Body::Transition {
+            transition: kind,
+            payload_hex: hex::encode(serde_json::to_vec(&value).unwrap()),
+        })
+        .unwrap();
+    };
+    let appid = hex::encode(Sha256::digest(id.as_bytes()));
+    let wire = TransportMessage {
+        id: MessageId::new(hex::decode(&appid).unwrap()),
+        payload: vec![0],
+        timestamp: Timestamp(0),
+        causal_deps: vec![],
+        source: TransportSource("mechanical-only".into()),
+        envelope: TransportEnvelope::GroupMessage {
+            transport_group_id: group.as_slice().to_vec(),
+        },
+    };
+    source(
+        TransitionKind::Original,
+        json!({"schema":"semantic-original.v2","original":{"ask_id":id,"expected_group":group,"operation":hex::encode(op),"operation_canonical":hex::encode(b"canonical"),"original_request":hex::encode(b"request"),"card_chunks":["x".repeat(1200)]},"policy_sha256":policy,"expires_at_unix_ms":received+60000}),
+    );
+    source(
+        TransitionKind::Outbound,
+        json!({"schema":"semantic-outbound.v1","ask_id":id,"part":0,"app_event_id":appid,"wire":wire}),
+    );
+    source(
+        TransitionKind::Published,
+        json!({"schema":"semantic-published.v1","ask_id":id,"part":0,"report":{"message_id":wire.id,"accepted":[{"endpoint":"wss://mechanical.invalid","accepted_at":null}],"failed":[],"required_acks":1}}),
+    );
+    source(
+        TransitionKind::Published,
+        json!({"schema":"semantic-card-complete.v1","ask_id":id,"app_ids":[appid],"policy_sha256":policy}),
+    );
+    // Mechanical reconstruction fixture only: unique IDs are generated above.
+    // Avoid the production card_unused full-history lookup while generating
+    // this large synthetic history. Exact record + independent anchor bytes,
+    // hash chains and actual file/directory fsyncs still use production append.
+    let mut record = Record {
+        sequence: j.sequence + 1,
+        previous_sha256: j.digest.clone(),
+        local_unix_ms: now().unwrap(),
+        body: Body::CardComplete {
+            ask_id: id.clone(),
+            original_operation_sha256: original_sha,
+        },
+        sha256: String::new(),
+    };
+    record.sha256 = record_digest(&record).unwrap();
+    let mut anchor = Anchor {
+        sequence: record.sequence,
+        journal_sha256: record.sha256.clone(),
+        previous_anchor_sha256: j.anchor_digest.clone(),
+        use_key: None,
+        sha256: String::new(),
+    };
+    anchor.sha256 = anchor_digest(&anchor).unwrap();
+    append(&mut j.files.journal, &record).unwrap();
+    append(&mut j.files.anchor, &anchor).unwrap();
+    j.sequence = record.sequence;
+    j.digest = record.sha256;
+    j.anchor_digest = anchor.sha256;
+    j.last_time = record.local_unix_ms;
+    let app = MarmotAppEvent::new(
+        hex::encode(sender.as_slice()),
+        1700000000 + index,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        format!("!answer {id} no"),
+    );
+    let payload = app.encode().unwrap();
+    let message_id = MessageId::new(Sha256::digest(&payload).to_vec());
+    let incoming = TransportMessage {
+        id: message_id.clone(),
+        payload: payload.clone(),
+        ..wire
+    };
+    let candidate = json!({"sequence":index+1,"received_at_unix_ms":received,"group":group,"message_id":hex::encode(message_id.as_slice()),"source_epoch":1,"sender":sender,"application":app});
+    let mut source = |kind, value: serde_json::Value| {
+        j.write(Body::Transition {
+            transition: kind,
+            payload_hex: hex::encode(serde_json::to_vec(&value).unwrap()),
+        })
+        .unwrap();
+    };
+    source(
+        TransitionKind::Wire,
+        json!({"schema":"receiver-wire.v1","sequence":index+1,"received_at_unix_ms":received,"wire":incoming}),
+    );
+    source(
+        TransitionKind::Outcome,
+        json!({"schema":"receiver-outcome.v1","sequence":index+1,"message_id":hex::encode(message_id.as_slice()),"outcome":cgka_traits::ingest::IngestOutcome::Processed,"candidate":candidate,"pending_application_ids":[message_id],"pending_application_projections":[{"group":group,"message_id":message_id,"sender":sender,"source_epoch":1,"payload_sha256":hex::encode(Sha256::digest(payload))}],"native_merge":null}),
+    );
+    source(
+        TransitionKind::Conflict,
+        json!({"schema":"semantic-conflict.v1","ask_ids":[id],"authenticated_candidate":candidate}),
+    );
+    id
+}

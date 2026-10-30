@@ -829,6 +829,19 @@ pub(super) fn ordered_fixture(
     crate::protected_recovery::Journal,
     crate::protected_recovery::Enrollment,
 ) {
+    ordered_fixture_profile(root, engine, group, operators, "55".repeat(32))
+}
+#[cfg(unix)]
+pub(super) fn ordered_fixture_profile(
+    root: &std::path::Path,
+    engine: &Engine<SqliteAccountStorage>,
+    group: &GroupId,
+    operators: &[MemberId],
+    profile: String,
+) -> (
+    crate::protected_recovery::Journal,
+    crate::protected_recovery::Enrollment,
+) {
     use crate::protected_recovery::{Enrollment, Journal, OwnedFiles};
     use std::{
         fs::{File, OpenOptions},
@@ -860,7 +873,7 @@ pub(super) fn ordered_fixture(
             .collect(),
         // Synthetic installation and welcome pins: these tests qualify actual
         // native/journal mechanics, not a production enrollment or custody.
-        source_profile_sha256: "55".repeat(32),
+        source_profile_sha256: profile,
         storage_generation: "66".repeat(32),
         initial_native_state_sha256: hex::encode(Sha256::digest(
             serde_json::to_vec(&projection).unwrap(),

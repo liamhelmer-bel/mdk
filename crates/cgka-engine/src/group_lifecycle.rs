@@ -1547,6 +1547,17 @@ impl<S: StorageProvider> Engine<S> {
             reopen_refused_rows_at_or_above,
         ) = result?;
 
+        #[cfg(unix)]
+        if let Some(capture) = &mut self.receiver_join_capture {
+            capture.committed(
+                group_id.clone(),
+                &welcome_id,
+                content_id.clone(),
+                welcome_sender_id.clone(),
+                crate::protected_merge::Projection::read(&mls_group)?,
+            )?;
+        }
+
         // #740: index this joined group's transport routing id for O(1) inbound
         // resolution (see `Engine::transport_group_id_index`).
         if let Ok(transport_group_id) =
