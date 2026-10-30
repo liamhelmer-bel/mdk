@@ -2,6 +2,7 @@
 //! are explicit fixtures. No runtime custody, operator or deployment authority.
 use super::*;
 use crate::Engine;
+use cgka_traits::GroupId;
 use nostr::base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::process::Command;
 
@@ -26,7 +27,7 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         .output()
         .unwrap();
     assert!(status.status.success() && status.stdout.is_empty());
-    let (mut factory, mut operator, root, relay) = current_routed_fixture().await;
+    let (factory, operator, root, relay) = current_routed_fixture().await;
     assert_eq!(factory.receiver.group.as_slice().len(), 16);
     let transport_group = [7; 32];
     let binding = super::super::owned_producer::GroupBinding::read(
@@ -103,21 +104,46 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     let wrong_raw = STANDARD
         .decode(wrong_payload["output_original_base64"].as_str().unwrap())
         .unwrap();
+    // The same genuinely generated routing-domain card passes a deliberately
+    // matching native=routing control, isolating the actual native16 mismatch.
+    super::super::owned_producer::qualification_correspondence_control(
+        &wrong_raw,
+        GroupId::new(transport_group.to_vec()),
+        transport_group,
+    )
+    .expect("matching-domain mechanical control");
     assert!(matches!(
         super::super::owned_producer::qualification_original(&wrong_raw, &binding),
         Err(ReceiverHold::ChangedState)
     ));
+    assert_eq!(
+        digest(&ask.operation),
+        payload["output"]["operation_original_sha256"]
+    );
+    assert_eq!(
+        digest(&ask.operation_canonical),
+        payload["output"]["packet_sha256"]
+    );
+    assert_eq!(
+        digest(&ask.original_request),
+        payload["output"]["request_sha256"]
+    );
+    qualify_owned_exchange(factory, operator, root, relay, ask).await;
+}
+
+async fn qualify_owned_exchange(
+    mut factory: SemanticFactory<SqliteAccountStorage>,
+    mut operator: Engine<SqliteAccountStorage>,
+    root: tempfile::TempDir,
+    relay: Arc<super::super::tests::Relay>,
+    ask: OriginalAsk,
+) -> serde_json::Value {
+    let transport_group = [7; 32];
     let expected = serde_json::to_value(&ask).unwrap();
     let operation = digest(&ask.operation);
     let canonical = digest(&ask.operation_canonical);
     let id = ask.ask_id.clone();
     assert_ne!(ask.operation, ask.operation_canonical);
-    assert_eq!(operation, payload["output"]["operation_original_sha256"]);
-    assert_eq!(canonical, payload["output"]["packet_sha256"]);
-    assert_eq!(
-        digest(&ask.original_request),
-        payload["output"]["request_sha256"]
-    );
     assert_eq!(ask.card_chunks.len(), 1);
     assert!(ask.card_chunks[0].contains("OUTAGE"));
     let packet: serde_json::Value = serde_json::from_slice(&ask.operation_canonical).unwrap();
@@ -140,20 +166,29 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     let (mut sender, mut consumer) = UnixStream::pair().unwrap();
     let mut before_eose = consumer.try_clone().unwrap();
     let subscriptions_before = relay.subscriptions.lock().unwrap().len();
+    let expected_card = ask.card_chunks[0].clone();
     let driver = tokio::spawn(async move {
-        let wire = loop {
-            if let Some(wire) = relay.wires.lock().unwrap().first().cloned() {
-                break wire;
+        let wire = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(wire) = relay.wires.lock().unwrap().first().cloned() {
+                    break wire;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        };
+        })
+        .await
+        .expect("bounded actual card publication");
         operator.ingest(wire).await.unwrap();
         let target = operator
             .drain_events()
             .into_iter()
             .find_map(|event| match event {
-                cgka_traits::GroupEvent::MessageReceived { payload, .. } => {
+                cgka_traits::GroupEvent::MessageReceived {
+                    group_id, payload, ..
+                } => {
+                    assert_eq!(group_id, native);
                     let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    assert_eq!(value["content"], expected_card);
                     Some(value["id"].as_str().unwrap().to_owned())
                 }
                 _ => None,
@@ -279,11 +314,7 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     drop(keepalive);
     forwarder.abort();
     assert!(factory.asks[&id].consumed); // lost reply never reverses durable one-use.
-    eprintln!(
-        "TEST ONLY: actual Product {} child/Git + real MLS approve/consume/frame PASS; synthetic HTTPS/render/relay ACK; generated fixture SHA256 {}",
-        PRODUCT_HEAD,
-        digest(&fixture_bytes)
-    );
+    result
 }
 
 // Current profile, actual Schnorr account proof signer and NIP-59/445 peeler.
@@ -486,4 +517,77 @@ async fn owned_exchange_refuses_wrong_native_or_transport_before_external_public
         assert_eq!(hold["automatic_replay_permitted"], false);
         forwarder.abort();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable namespace with unchanged Product closure and verified loopback TLS"]
+async fn unchanged_installed_producer_real_tls_then_real_mls_exchange() {
+    use super::super::owned_producer::{Inputs, InstalledProducer};
+    let fixture = std::path::Path::new("/opt/producer-qualification");
+    let original = std::fs::read(fixture.join("original.json")).unwrap();
+    let closure =
+        serde_json::from_slice(&std::fs::read(fixture.join("closure.json")).unwrap()).unwrap();
+    let inputs = Inputs {
+        profile: File::open(fixture.join("profile.json")).unwrap(),
+        archive: File::open(fixture.join("archive.tar")).unwrap(),
+        commit: File::open(fixture.join("commit.object")).unwrap(),
+    };
+    let producer = InstalledProducer {
+        python: fixture.join("python/bin/python3"),
+        source: fixture.join("src"),
+        purelib: fixture.join("purelib"),
+        closure,
+    };
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert_eq!(unsafe { libc::setgroups(0, std::ptr::null()) }, 0);
+    assert_eq!(unsafe { libc::setgid(1) }, 0);
+    assert_eq!(unsafe { libc::setuid(1) }, 0);
+    let (factory, operator, root, relay) = current_routed_fixture().await;
+    let binding = super::super::owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &factory.receiver.group,
+        &[7; 32],
+    )
+    .unwrap();
+    assert_eq!(factory.receiver.group.as_slice().len(), 16);
+    assert!(
+        super::super::owned_producer::GroupBinding::read(
+            &factory.receiver.engine,
+            &factory.receiver.group,
+            &[8; 32],
+        )
+        .is_err()
+    );
+    // Explicit test-only root fixture prepares its profile from this actual
+    // Engine group's native identity. This handshake is not a deployment permit.
+    std::fs::write(
+        "/run/heterodyne-deploy-publication/group-request",
+        hex::encode(factory.receiver.group.as_slice()),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new("/run/heterodyne-deploy-publication/profile-ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bounded fixture root preparation"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let ask = producer
+        .produce(inputs, &original, &binding)
+        .expect("unchanged producer actual TLS/Git/render");
+    assert_eq!(ask.expected_group, factory.receiver.group);
+    let frame = qualify_owned_exchange(factory, operator, root, relay, ask).await;
+    std::fs::write(
+        "/run/heterodyne-deploy-publication/qualification-output.json",
+        serde_json::to_vec(&serde_json::json!({
+            "actual_unchanged_installed_producer": true,
+            "actual_engine_native_routing_binding": true,
+            "actual_mls_notification_eose_durable_consume_frame": true,
+            "frame": frame,
+            "installed_authority": false,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
 }

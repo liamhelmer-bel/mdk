@@ -456,7 +456,24 @@ async fn exchange_inner<S: StorageProvider + 'static>(
                 &factory.receiver.group,
                 &session.transport_group,
             )?;
+            // Qualification controls execute only after an actual retained approval,
+            // while the original operation is still unconsumed.
+            #[cfg(test)]
+            let qualification_canonical =
+                digest(&factory.asks[&ask_id].original.operation_canonical);
+            #[cfg(test)]
+            if qualification_canonical != operation_sha {
+                assert!(matches!(
+                    factory.consume(&ask_id, &qualification_canonical),
+                    Err(ReceiverHold::ChangedState)
+                ));
+                assert!(!factory.asks[&ask_id].consumed);
+            }
             factory.consume(&ask_id, &operation_sha)?;
+            #[cfg(test)]
+            if qualification_canonical != operation_sha {
+                assert!(consumed_key(factory, &ask_id, &qualification_canonical).is_err());
+            }
             let consumption_key = consumed_key(factory, &ask_id, &operation_sha)?;
             let receipt = factory.asks[&ask_id]
                 .receipt

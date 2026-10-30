@@ -292,6 +292,16 @@ fn correlate(
 }
 
 #[cfg(test)]
+pub(super) fn qualification_correspondence_control(
+    raw: &[u8],
+    native: GroupId,
+    transport: [u8; 32],
+) -> Result<OriginalAsk, ReceiverHold> {
+    // Deliberately constructed matching-domain control, never Engine authority.
+    qualification_original(raw, &GroupBinding { native, transport })
+}
+
+#[cfg(test)]
 pub(super) fn qualification_original(
     raw: &[u8],
     binding: &GroupBinding,
