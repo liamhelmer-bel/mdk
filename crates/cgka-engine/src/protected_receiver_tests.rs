@@ -286,7 +286,7 @@ async fn receiver_refuses_reopening_unreconciled_original_wire() {
 }
 
 #[tokio::test]
-async fn receiver_oversize_input_latches_without_partial_wire_record() {
+async fn receiver_oversize_input_refuses_without_latching_or_partial_record() {
     let (mut alice, _, bob, group) = fixture().await;
     let mut wire = send_app(&mut alice, &group, b"approve".to_vec()).await;
     wire.payload = vec![0; 1024 * 1024];
@@ -294,14 +294,12 @@ async fn receiver_oversize_input_latches_without_partial_wire_record() {
     let mut receiver =
         ProtectedReceiver::new(bob, group, vec![alice.self_id()], file.reopen().unwrap()).unwrap();
     assert_eq!(
-        receiver.ingest(wire.clone()).await.unwrap_err(),
+        receiver.ingest(wire).await.unwrap_err(),
         ReceiverHold::Capacity
     );
-    assert_eq!(
-        receiver.ingest(wire).await.unwrap_err(),
-        ReceiverHold::Latched
-    );
-    assert!(records(&file).is_empty());
+    let valid = send_app(&mut alice, &receiver.group, b"next valid input".to_vec()).await;
+    assert!(receiver.ingest(valid).await.unwrap().is_some());
+    assert_eq!(records(&file).len(), 2);
 }
 
 #[tokio::test]
@@ -359,4 +357,74 @@ async fn receiver_skips_authenticated_nonoperator_malformed_inner_without_latchi
     assert!(matches!(receiver.ingest(wire).await, Ok(None)));
     assert!(!receiver.latched);
     assert!(records(&file)[1]["candidate"].is_null());
+}
+
+#[tokio::test]
+async fn receiver_acknowledges_only_after_durable_outcome() {
+    use cgka_traits::storage::MessageStorage;
+    let (mut alice, _, bob, group) = fixture().await;
+    let storage = bob.storage.clone();
+    // The fixture deliberately drained its Welcome but never projected/acked it.
+    let welcome_ids: Vec<_> = storage
+        .list_pending_application_events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| {
+            if let GroupEvent::GroupJoined { via_welcome, .. } = e {
+                Some(via_welcome)
+            } else {
+                None
+            }
+        })
+        .collect();
+    storage
+        .delete_pending_application_events(&welcome_ids)
+        .unwrap();
+    let wire = send_app(&mut alice, &group, b"durable approval".to_vec()).await;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut receiver =
+        ProtectedReceiver::new(bob, group, vec![alice.self_id()], file.reopen().unwrap()).unwrap();
+    let candidate = receiver.ingest(wire).await.unwrap().unwrap();
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    let rows = records(&file);
+    assert_eq!(rows[1]["candidate"]["message_id"], candidate.message_id);
+    assert_eq!(
+        rows[1]["pending_application_ids"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn receiver_durable_nonoperator_projection_also_acknowledges_plaintext() {
+    use cgka_traits::storage::MessageStorage;
+    let (mut alice, _, bob, group) = fixture().await;
+    let storage = bob.storage.clone();
+    let wire = send_app(&mut alice, &group, b"ordinary group chat".to_vec()).await;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut receiver = ProtectedReceiver::new(
+        bob,
+        group,
+        vec![MemberId::new(pad32(b"not-alice"))],
+        file.reopen().unwrap(),
+    )
+    .unwrap();
+    assert!(receiver.ingest(wire).await.unwrap().is_none());
+    assert!(
+        !storage
+            .list_pending_application_events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, GroupEvent::MessageReceived { .. }))
+    );
+    let rows = records(&file);
+    assert!(rows[1]["candidate"].is_null());
+    assert_eq!(
+        rows[1]["pending_application_ids"].as_array().unwrap().len(),
+        1
+    );
 }

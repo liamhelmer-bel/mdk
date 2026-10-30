@@ -21,7 +21,6 @@ test-conformance-snapshot = []
 
 [dependencies]
 cgka-traits.workspace = true
-transport-nostr-adapter.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
 openmls_memory_storage.workspace = true
@@ -46,6 +45,7 @@ web-time.workspace = true
 k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+transport-nostr-adapter.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]

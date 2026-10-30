@@ -3,7 +3,10 @@
 use super::{AuthenticatedCandidate, ProtectedReceiver, ReceiverHold};
 use cgka_traits::{
     TransportAdapter, TransportEndpoint, TransportPublishRequest, TransportPublishTarget,
-    app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent},
+    app_event::{
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+        MarmotAppEvent,
+    },
     engine::{CgkaEngine, SendIntent, SendResult},
     storage::StorageProvider,
     transport::TransportMessage,
@@ -24,8 +27,11 @@ fn digest(bytes: &[u8]) -> String {
 struct OriginalAsk {
     ask_id: String,
     expected_group: cgka_traits::types::GroupId,
+    #[serde(serialize_with = "serialize_hex")]
     operation: Vec<u8>,
+    #[serde(serialize_with = "serialize_hex")]
     operation_canonical: Vec<u8>,
+    #[serde(serialize_with = "serialize_hex")]
     original_request: Vec<u8>,
     card_chunks: Vec<String>,
 }
@@ -53,6 +59,7 @@ struct RetainedAsk {
     app_ids: Vec<String>,
     receipt: Option<SemanticReceipt>,
     consumed: bool,
+    conflicted: bool,
 }
 /// All methods remain private; no plaintext evidence import or delivery flag.
 struct SemanticFactory<S: StorageProvider + 'static> {
@@ -129,8 +136,16 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         {
             return Err(ReceiverHold::Configuration);
         }
-        self.held = true;
         let policy = self.policy()?;
+        // Validate the largest retained input before sending or latching.
+        if serde_json::to_vec(&original)
+            .map_err(|_| ReceiverHold::Malformed)?
+            .len()
+            > super::MAX_RECORD
+        {
+            return Err(ReceiverHold::Capacity);
+        }
+        self.held = true;
         self.receiver
             .record(serde_json::json!({"schema":"semantic-original.v1",
             "original":original,"policy_sha256":policy}))?;
@@ -146,6 +161,14 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                 vec![],
                 text.clone(),
             );
+            if self
+                .asks
+                .values()
+                .any(|ask| ask.app_ids.contains(&event.id))
+                || app_ids.contains(&event.id)
+            {
+                return Err(ReceiverHold::ChangedState);
+            }
             let payload = event.encode().map_err(|_| ReceiverHold::Malformed)?;
             let result = self
                 .receiver
@@ -226,6 +249,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                 app_ids,
                 receipt: None,
                 consumed: false,
+                conflicted: false,
             },
         );
         self.held = false;
@@ -236,7 +260,13 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             return Err(ReceiverHold::Latched);
         }
         self.held = true;
-        let Some(candidate) = self.receiver.ingest(wire).await? else {
+        let result = self.receiver.ingest(wire).await;
+        // A bounded refusal before the native boundary has no uncertain effect.
+        // Do not turn oversized unrelated transport input into a global lock.
+        if result.is_err() && !self.receiver.latched {
+            self.held = false;
+        }
+        let Some(candidate) = result? else {
             self.held = false;
             return Ok(None);
         };
@@ -245,37 +275,79 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             return Err(ReceiverHold::ChangedState);
         }
         let app = &candidate.application;
-        if app.kind != MARMOT_APP_EVENT_KIND_REACTION {
-            self.held = false;
-            return Ok(None); // Replies/commands are not implemented by this finite seam.
-        }
+        // Determine relevance before validating tag shape. Optional relay hints
+        // and hex case are not authority; unrelated traffic must not latch asks.
         let targets: Vec<_> = app
             .tags
             .iter()
             .filter(|t| t.first().is_some_and(|s| s == "e"))
+            .filter_map(|t| t.get(1))
+            .map(|s| s.to_ascii_lowercase())
             .collect();
-        if targets.len() != 1 || targets[0].len() != 2 {
-            return Err(ReceiverHold::Malformed);
+        let command_id = if app.kind == MARMOT_APP_EVENT_KIND_CHAT {
+            let mut words = app.content.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("!answer"), Some(id)) => Some(id.to_ascii_lowercase()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let matches: Vec<_> = self
+            .asks
+            .iter()
+            .filter(|(id, r)| {
+                command_id.as_ref() == Some(*id)
+                    || targets
+                        .iter()
+                        .any(|t| r.app_ids.iter().any(|id| id.eq_ignore_ascii_case(t)))
+                    || (app.kind == MARMOT_APP_EVENT_KIND_DELETE
+                        && r.receipt.as_ref().is_some_and(|r| {
+                            r.operator == candidate.sender
+                                && targets.iter().any(|t| {
+                                    r.authenticated_candidate
+                                        .application
+                                        .id
+                                        .eq_ignore_ascii_case(t)
+                                })
+                        }))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if matches.is_empty() {
+            self.held = false;
+            return Ok(None);
         }
-        let target = &targets[0][1];
-        let Some(decision) = emoji_action(&app.content) else {
+        // A relevant unsupported reply/deletion or ambiguous target is a scoped
+        // conflict, never silent permission to use an earlier approval. It does
+        // not impose a global latch on unrelated asks.
+        let supported_reaction =
+            app.kind == MARMOT_APP_EVENT_KIND_REACTION && targets.len() == 1 && matches.len() == 1;
+        let decision = emoji_action(&app.content);
+        if !supported_reaction
+            || (self.asks[&matches[0]].receipt.is_some() || self.asks[&matches[0]].conflicted)
+        {
+            self.receiver
+                .record(serde_json::json!({"schema":"semantic-conflict.v1",
+                "ask_ids":matches,"authenticated_candidate":candidate}))?;
+            for id in &matches {
+                self.asks
+                    .get_mut(id)
+                    .ok_or(ReceiverHold::ChangedState)?
+                    .conflicted = true;
+            }
+            self.held = false;
+            return Ok(None);
+        }
+        let Some(decision) = decision else {
             self.held = false;
             return Ok(None);
         };
         let policy = self.policy()?;
-        let matches: Vec<_> = self
-            .asks
-            .iter()
-            .filter(|(_, r)| r.app_ids.contains(target))
-            .map(|(k, _)| k.clone())
-            .collect();
-        if matches.len() != 1 {
-            self.held = false;
-            return Ok(None);
-        }
         let key = &matches[0];
         let ask = &self.asks[key];
-        if ask.receipt.is_some()
+        if ask.conflicted
+            || ask.receipt.is_some()
             || ask.consumed
             || ask.policy_sha256 != policy
             || !self.receiver.operators.contains(&candidate.sender)
@@ -318,7 +390,8 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         let policy = self.policy()?;
         let ask = self.asks.get(ask_id).ok_or(ReceiverHold::Configuration)?;
         let r = ask.receipt.as_ref().ok_or(ReceiverHold::ChangedState)?;
-        if ask.consumed
+        if ask.conflicted
+            || ask.consumed
             || r.decision != Decision::Approve
             || r.policy_sha256 != policy
             || r.operation_sha256 != expected_operation_sha256
@@ -338,6 +411,9 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         self.held = false;
         ask.receipt.as_ref().ok_or(ReceiverHold::ChangedState)
     }
+}
+fn serialize_hex<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex::encode(bytes))
 }
 fn valid_ask_id(s: &str) -> bool {
     s.len() == 4

@@ -4,7 +4,10 @@
 use crate::Engine;
 use cgka_traits::{
     EngineError,
-    app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent},
+    app_event::{
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
+        MarmotAppEvent,
+    },
     engine::{CgkaEngine, GroupEvent},
     ingest::IngestOutcome,
     storage::StorageProvider,
@@ -20,7 +23,6 @@ use std::{
 
 const MAX_WIRE: usize = 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
-const MAX_JOURNAL: u64 = 32 * 1024 * 1024;
 
 /// Evidence only. Construction is confined to the owned real-engine path.
 #[derive(Debug, Serialize)]
@@ -98,10 +100,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .metadata()
             .map_err(|_| ReceiverHold::Journal)?
             .len();
-        if length
-            .checked_add(bytes.len() as u64)
-            .is_none_or(|n| n > MAX_JOURNAL)
-        {
+        if length.checked_add(bytes.len() as u64).is_none() {
             return Err(ReceiverHold::Capacity);
         }
         self.journal
@@ -117,12 +116,26 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         if self.latched {
             return Err(ReceiverHold::Latched);
         }
-        // Latch before any fallible effect; only a fully journalled outcome clears it.
-        self.latched = true;
         let encoded = serde_json::to_vec(&wire).map_err(|_| ReceiverHold::Malformed)?;
         if encoded.len() > MAX_WIRE {
             return Err(ReceiverHold::Capacity);
         }
+        // Refuse bounded resource exhaustion before touching native state. Reserve
+        // the largest permitted outcome as well as this exact wire record. A real
+        // filesystem failure can still hold; there is no lifetime journal cap.
+        let available = self
+            .journal
+            .metadata()
+            .map_err(|_| ReceiverHold::Journal)?
+            .len();
+        if available
+            .checked_add(encoded.len() as u64 + MAX_RECORD as u64 + 1024)
+            .is_none()
+        {
+            return Err(ReceiverHold::Capacity);
+        }
+        // Latch only once ingress may cross a durable/effect boundary.
+        self.latched = true;
         let received = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ReceiverHold::Journal)?
@@ -149,6 +162,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             return Err(ReceiverHold::ChangedState);
         }
         let mut candidate = None;
+        let mut pending_ids = Vec::new();
         for event in self.engine.drain_events() {
             match event {
                 GroupEvent::MessageReceived {
@@ -159,6 +173,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                     payload,
                     ..
                 } if group_id == self.group && Some(&message_id) == content_id.as_ref() => {
+                    pending_ids.push(message_id.clone());
                     // Eligibility derives from the authenticated MLS credential. An
                     // unrelated member's malformed inner event is not operator input.
                     if sender == self.engine.self_id() || !self.operators.contains(&sender) {
@@ -170,7 +185,9 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                         .map_err(|_| ReceiverHold::Malformed)?;
                     if !matches!(
                         app.kind,
-                        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+                        MARMOT_APP_EVENT_KIND_CHAT
+                            | MARMOT_APP_EVENT_KIND_REACTION
+                            | MARMOT_APP_EVENT_KIND_DELETE
                     ) {
                         continue;
                     }
@@ -193,7 +210,13 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             }
         }
         self.record(serde_json::json!({"schema":"receiver-outcome.v1", "sequence":self.sequence,
-            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate}))?;
+            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate,"pending_application_ids":pending_ids}))?;
+        // Native pending plaintext may be dropped only after the complete durable
+        // receiver projection exists. Deletion is idempotent; failure stays held.
+        self.engine
+            .storage
+            .delete_pending_application_events(&pending_ids)
+            .map_err(|_| ReceiverHold::Journal)?;
         self.latched = false;
         Ok(candidate)
     }
@@ -225,5 +248,6 @@ pub(crate) fn capture_receiver_content(
     Ok(())
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "protected_semantic.rs"]
 mod semantic;

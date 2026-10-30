@@ -139,8 +139,8 @@ fn original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
         operation_canonical: b"canonical source-only operation".to_vec(),
         original_request: b"exact original admind input bytes".to_vec(),
         card_chunks: vec![
-            "existing producer exact card part one".into(),
-            "existing producer exact card part two".into(),
+            format!("{id}: existing producer exact card part one"),
+            format!("{id}: existing producer exact card part two"),
         ],
     }
 }
@@ -150,25 +150,14 @@ async fn reaction(
     target: &str,
     emoji: &str,
 ) -> TransportMessage {
-    let app = MarmotAppEvent::new(
-        hex::encode(operator.self_id().as_slice()),
-        1,
+    app_wire(
+        operator,
+        factory,
         MARMOT_APP_EVENT_KIND_REACTION,
         vec![vec!["e".into(), target.into()]],
         emoji,
-    );
-    let SendResult::ApplicationMessage { msg, .. } = operator
-        .send(SendIntent::AppMessage {
-            group_id: factory.receiver.group.clone(),
-            payload: app.encode().unwrap(),
-            expected_epoch: None,
-        })
-        .await
-        .unwrap()
-    else {
-        panic!("app")
-    };
-    msg
+    )
+    .await
 }
 #[tokio::test]
 async fn real_owned_send_publish_multipart_mls_decision_and_one_use() {
@@ -219,7 +208,12 @@ async fn uncertain_second_publish_never_completes_card_or_replays() {
     assert!(f.post(original("ask3", &f.receiver.group)).await.is_err());
     assert!(f.held);
     assert!(f.asks.is_empty());
-    assert!(f.post(original("ask2", &f.receiver.group)).await.is_err());
+    assert_eq!(
+        f.post(original("ask2", &f.receiver.group))
+            .await
+            .unwrap_err(),
+        ReceiverHold::Latched
+    );
     assert_eq!(relay.wires.lock().unwrap().len(), 2);
     assert!(
         !std::fs::read_to_string(file.path())
@@ -304,4 +298,180 @@ async fn product_owned_fixture_preserves_original_digest_and_refuses_wrong_group
     );
     assert!(!f.held);
     assert!(relay.wires.lock().unwrap().is_empty());
+}
+
+async fn app_wire(
+    operator: &mut Engine<SqliteAccountStorage>,
+    f: &SemanticFactory<SqliteAccountStorage>,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    text: &str,
+) -> TransportMessage {
+    let app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1,
+        kind,
+        tags,
+        text,
+    );
+    let SendResult::ApplicationMessage { msg, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: f.receiver.group.clone(),
+            payload: app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("app")
+    };
+    msg
+}
+async fn approve(
+    f: &mut SemanticFactory<SqliteAccountStorage>,
+    operator: &mut Engine<SqliteAccountStorage>,
+    id: &str,
+) {
+    f.post(original(id, &f.receiver.group)).await.unwrap();
+    let target = f.asks[id].app_ids[0].clone();
+    let wire = reaction(operator, f, &target, "👍").await;
+    assert_eq!(f.ingest(wire).await.unwrap(), Some(id.into()));
+}
+#[tokio::test]
+async fn contrary_chat_and_reaction_removal_block_only_relevant_approval() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    approve(&mut f, &mut operator, "ask3").await;
+    let wire = app_wire(
+        &mut operator,
+        &f,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "!answer ask3 no",
+    )
+    .await;
+    assert_eq!(f.ingest(wire).await.unwrap(), None);
+    assert!(!f.held);
+    assert_eq!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .unwrap_err(),
+        ReceiverHold::ChangedState
+    );
+    approve(&mut f, &mut operator, "ask2").await;
+    let receipt = &f.asks["ask2"]
+        .receipt
+        .as_ref()
+        .unwrap()
+        .authenticated_candidate
+        .application
+        .id;
+    let wire = app_wire(
+        &mut operator,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".into(), receipt.clone()]],
+        "",
+    )
+    .await;
+    assert_eq!(f.ingest(wire).await.unwrap(), None);
+    assert!(!f.held);
+    assert_eq!(
+        f.consume("ask2", &digest(b"exact source-only operation"))
+            .unwrap_err(),
+        ReceiverHold::ChangedState
+    );
+    // A third unrelated exact ask still posts and produces its own receipt.
+    approve(&mut f, &mut operator, "ask4").await;
+    f.consume("ask4", &digest(b"exact source-only operation"))
+        .unwrap();
+}
+#[tokio::test]
+async fn unrelated_hinted_multitarget_reaction_does_not_latch_and_hex_case_matches() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    f.post(original("ask3", &f.receiver.group)).await.unwrap();
+    let unrelated = app_wire(
+        &mut operator,
+        &f,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![
+            vec!["e".into(), "00".repeat(32), "wss://hint.invalid".into()],
+            vec!["e".into(), "11".repeat(32)],
+        ],
+        "👍",
+    )
+    .await;
+    assert_eq!(f.ingest(unrelated).await.unwrap(), None);
+    assert!(!f.held);
+    let target = f.asks["ask3"].app_ids[0].to_ascii_uppercase();
+    let actual = app_wire(
+        &mut operator,
+        &f,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![vec!["e".into(), target, "wss://hint.invalid".into()]],
+        "👍",
+    )
+    .await;
+    assert_eq!(f.ingest(actual).await.unwrap(), Some("ask3".into()));
+    let contrary = reaction(&mut operator, &f, &f.asks["ask3"].app_ids[0], "👎").await;
+    assert_eq!(f.ingest(contrary).await.unwrap(), None);
+    assert!(!f.held);
+    assert_eq!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .unwrap_err(),
+        ReceiverHold::ChangedState
+    );
+}
+#[tokio::test]
+async fn policy_changed_after_retained_approval_refuses_consumption() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    approve(&mut f, &mut operator, "ask3").await;
+    f.receiver.operators.push(MemberId::new(vec![9; 32]));
+    assert_eq!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .unwrap_err(),
+        ReceiverHold::ChangedState
+    );
+}
+#[tokio::test]
+async fn completed_history_crosses_former_32mib_cap_and_new_ask_still_posts() {
+    let (mut f, mut operator, file, _) = fixture().await;
+    let alphabet = b"23456789abcdefghjkmnpqrstuvwxyz";
+    for i in 0..80 {
+        let id = format!(
+            "ab{}{}",
+            alphabet[i / alphabet.len()] as char,
+            alphabet[i % alphabet.len()] as char
+        );
+        let mut input = original(&id, &f.receiver.group);
+        input.operation = vec![0x5a; 64 * 1024];
+        input.operation_canonical = vec![0x5b; 64 * 1024];
+        input.original_request = vec![0x5c; 64 * 1024];
+        input.card_chunks = vec![format!("{id} {}", "z".repeat(23000))];
+        f.post(input).await.unwrap();
+        let target = f.asks[&id].app_ids[0].clone();
+        let deny = reaction(&mut operator, &f, &target, "👎").await;
+        assert_eq!(f.ingest(deny).await.unwrap(), Some(id));
+    }
+    assert!(file.as_file().metadata().unwrap().len() > 32 * 1024 * 1024);
+    assert_eq!(f.asks.values().filter(|a| a.receipt.is_none()).count(), 0);
+    f.post(original("ask3", &f.receiver.group)).await.unwrap();
+    assert!(!f.held);
+}
+
+#[tokio::test]
+async fn oversized_pre_effect_input_does_not_lock_factory_or_consume_original() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    f.post(original("ask3", &f.receiver.group)).await.unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let wire = reaction(&mut operator, &f, &target, "👍").await;
+    let mut oversized = wire.clone();
+    oversized.payload = vec![0; super::super::MAX_WIRE];
+    assert_eq!(
+        f.ingest(oversized).await.unwrap_err(),
+        ReceiverHold::Capacity
+    );
+    assert!(!f.held);
+    assert!(!f.receiver.latched);
+    assert_eq!(f.ingest(wire).await.unwrap(), Some("ask3".into()));
+    f.consume("ask3", &digest(b"exact source-only operation"))
+        .unwrap();
 }
