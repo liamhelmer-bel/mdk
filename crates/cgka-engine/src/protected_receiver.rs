@@ -147,12 +147,20 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             "received_at_unix_ms":received, "wire":wire}),
         )?;
         self.engine.receiver_ingress_capture = Some((wire.id.clone(), None));
+        self.engine.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(
+            self.group.clone(),
+        ));
         let result = self.engine.ingest(wire.clone()).await;
         let content_id = self
             .engine
             .receiver_ingress_capture
             .take()
             .and_then(|(_, value)| value);
+        let merge = self
+            .engine
+            .receiver_merge_capture
+            .take()
+            .ok_or(ReceiverHold::ChangedState)?;
         let outcome = result.map_err(|_| ReceiverHold::Engine)?;
         if !matches!(
             outcome,
@@ -207,13 +215,37 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                         application: app,
                     });
                 }
+                GroupEvent::EpochChanged { group_id, from, to }
+                    if content_id.as_ref().is_some_and(|content| {
+                        merge.matches_epoch(&group_id, from.0, to.0, content)
+                    }) && group_id == self.group =>
+                {
+                    let current = self
+                        .engine
+                        .group_authority(&self.group)
+                        .map_err(|_| ReceiverHold::ChangedState)?;
+                    if current.lifecycle != cgka_traits::GroupLifecycleState::Stable
+                        || !self.engine.auto_publish_buf.is_empty()
+                        || !self.engine.auto_proposal_buf.is_empty()
+                        || self
+                            .engine
+                            .has_pending_convergence_inputs(&self.group)
+                            .map_err(|_| ReceiverHold::ChangedState)?
+                        || self
+                            .engine
+                            .has_pending_canonical_applications(&self.group)
+                            .map_err(|_| ReceiverHold::ChangedState)?
+                    {
+                        return Err(ReceiverHold::ChangedState);
+                    }
+                }
                 // Conservatively refuse state changes, reorgs and delayed messages. This
                 // slice does not authenticate a prior wire using the current wire's record.
                 _ => return Err(ReceiverHold::ChangedState),
             }
         }
         self.record(serde_json::json!({"schema":"receiver-outcome.v1", "sequence":self.sequence,
-            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate,"pending_application_ids":pending_ids}))?;
+            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate,"pending_application_ids":pending_ids,"native_merge":merge.direct}))?;
         // Native pending plaintext may be dropped only after the complete durable
         // receiver projection exists. Deletion is idempotent; failure stays held.
         self.engine

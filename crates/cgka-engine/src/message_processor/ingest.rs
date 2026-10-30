@@ -1139,8 +1139,19 @@ impl<S: StorageProvider> Engine<S> {
         // checkpoints, so a committer adjudicates its rival exactly like
         // an observer does.
         let mut convergence_refused_for_missing_anchor = false;
+        // Provisional private classification; authenticated staged policy and atomic
+        // post-merge projections must still qualify before the update commits.
+        let private_direct_update = msg_content_type == ContentType::Commit
+            && self.receiver_direct_update_candidate(
+                &group_id,
+                msg_epoch,
+                current_epoch,
+                &mls_group,
+            )?;
         let commit_should_enter_convergence = if msg_content_type == ContentType::Commit {
-            if msg_epoch >= current_epoch {
+            if private_direct_update {
+                false
+            } else if msg_epoch >= current_epoch {
                 true
             } else {
                 let policy = self
@@ -1509,6 +1520,10 @@ impl<S: StorageProvider> Engine<S> {
             }
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 let before = EpochId(mls_group.epoch().as_u64());
+                if private_direct_update {
+                    crate::protected_merge::validate_staged_update(&mls_group, &staged)?;
+                }
+
                 if let Err(error) = self.strict_cutover_rejects_legacy_group_addition(
                     &group_id,
                     staged.add_proposals().next().is_some(),
@@ -1651,6 +1666,20 @@ impl<S: StorageProvider> Engine<S> {
                         self_removed.insert(id);
                     }
                 }
+                let receiver_merge_before = if self.receiver_merge_capture.is_some() {
+                    Some((
+                        crate::protected_merge::Projection::read(&mls_group)?,
+                        staged
+                            .queued_proposals()
+                            .map(|queued| {
+                                crate::audit_helpers::proposal_kind_str(queued.proposal())
+                                    .to_owned()
+                            })
+                            .collect::<Vec<_>>(),
+                    ))
+                } else {
+                    None
+                };
                 let before_members = group_lifecycle::marmot_members(&mls_group);
                 let before_admins =
                     crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
@@ -1693,6 +1722,21 @@ impl<S: StorageProvider> Engine<S> {
                         crate::app_components::validate_current_profile_group_invariants(
                             &mls_group,
                         )?;
+                        if private_direct_update {
+                            let before_projection = &receiver_merge_before
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    EngineError::Other("missing receiver projection".into())
+                                })?
+                                .0;
+                            if !before_projection
+                                .same_policy(&crate::protected_merge::Projection::read(&mls_group)?)
+                            {
+                                return Err(EngineError::Other(
+                                    "receiver update changes indexed credentials".into(),
+                                ));
+                            }
+                        }
                         let after = EpochId(mls_group.epoch().as_u64());
                         let after_members = group_lifecycle::marmot_members(&mls_group);
                         let after_ids: std::collections::HashSet<MemberId> =
@@ -1754,6 +1798,20 @@ impl<S: StorageProvider> Engine<S> {
                         return Err(error);
                     }
                 };
+                if let Some((projection, proposals)) = receiver_merge_before {
+                    let evidence = crate::protected_merge::DirectMerge::new(
+                        group_id.clone(),
+                        msg.id.clone(),
+                        commit_committer,
+                        committer_index.u32(),
+                        projection,
+                        crate::protected_merge::Projection::read(&mls_group)?,
+                        proposals,
+                    );
+                    if let Some(capture) = &mut self.receiver_merge_capture {
+                        capture.retain(evidence)?;
+                    }
+                }
                 let after_admins =
                     crate::app_components::admins_of_group(&mls_group).unwrap_or_default();
                 let after_profile = crate::app_components::group_profile_of_group(&mls_group)

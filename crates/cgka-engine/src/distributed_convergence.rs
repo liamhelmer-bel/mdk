@@ -1088,6 +1088,9 @@ impl<S: StorageProvider> Engine<S> {
         now: ConvergenceTime,
         deadline: Option<web_time::Instant>,
     ) -> Result<CanonicalizationResult, OpenMlsProjectionError> {
+        if let Some(capture) = &mut self.receiver_merge_capture {
+            capture.convergence_entered = true;
+        }
         let now_ms = now.monotonic_ms;
         // A convergence pass over a seeded-but-unhydrated group promotes it
         // first (mdk#1161); a hydration failure quarantines it and the gate

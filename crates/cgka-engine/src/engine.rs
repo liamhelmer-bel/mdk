@@ -188,6 +188,7 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) last_ingest_left_object_unpersisted: bool,
     /// Private owned-receiver capture: exact outer input to peeled content ID.
     pub(crate) receiver_ingress_capture: Option<(MessageId, Option<MessageId>)>,
+    pub(crate) receiver_merge_capture: Option<crate::protected_merge::Capture>,
 
     /// MessageIds this engine has produced via `send` or `create_group` /
     /// `invite`. Backs the typed own-echo exclusion when a message we produced
@@ -637,6 +638,7 @@ impl<S: StorageProvider> EngineBuilder<S> {
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
             receiver_ingress_capture: None,
+            receiver_merge_capture: None,
             sent_message_ids: BoundedIdSet::with_capacity(DEDUP_CACHE_CAPACITY),
             leave_requests: HashMap::new(),
             leaving_groups: HashSet::new(),

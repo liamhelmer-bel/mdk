@@ -328,7 +328,7 @@ async fn receiver_state_change_latches_without_returning_an_approval_candidate()
         ProtectedReceiver::new(bob, group, vec![alice.self_id()], file.reopen().unwrap()).unwrap();
     assert_eq!(
         receiver.ingest(commit.clone()).await.unwrap_err(),
-        ReceiverHold::ChangedState
+        ReceiverHold::Engine
     );
     assert_eq!(
         receiver.ingest(commit).await.unwrap_err(),
@@ -427,4 +427,393 @@ async fn receiver_durable_nonoperator_projection_also_acknowledges_plaintext() {
         rows[1]["pending_application_ids"].as_array().unwrap().len(),
         1
     );
+}
+
+#[tokio::test]
+async fn native_merge_capture_refuses_actual_routine_update_convergence() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let result = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = result
+    else {
+        panic!("update commit")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::default());
+    assert!(matches!(
+        bob.ingest(commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let capture = bob.receiver_merge_capture.as_ref().unwrap();
+    assert!(capture.convergence_entered);
+    assert!(capture.direct.is_none());
+    assert!(!capture.qualifies(&group, &content));
+}
+
+#[tokio::test]
+async fn native_merge_capture_refuses_actual_roster_change_convergence() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let (mut carol, _) = build_client(b"merge-evidence-carol");
+    let result = alice
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = result
+    else {
+        panic!("invite commit")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::default());
+    assert!(matches!(
+        bob.ingest(commit).await.unwrap(),
+        IngestOutcome::Buffered { .. }
+    ));
+    let capture = bob.receiver_merge_capture.as_ref().unwrap();
+    assert!(capture.convergence_entered);
+    assert!(!capture.qualifies(&group, &content));
+}
+
+#[tokio::test]
+async fn native_owned_receiver_direct_update_retains_exact_authenticated_policy() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let before = bob.group_authority(&group).unwrap().facts.epoch;
+    let result = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = result
+    else {
+        panic!("update commit")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    commit.id = MessageId::new(vec![0x71; 32]);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    let outcome = bob.ingest(commit.clone()).await.unwrap();
+    assert!(matches!(outcome, IngestOutcome::Processed), "{outcome:?}");
+    let capture = bob.receiver_merge_capture.as_ref().unwrap();
+    assert!(capture.qualifies(&group, &content), "{capture:?}");
+    assert!(!capture.qualifies(&group, &commit.id));
+    let evidence = serde_json::to_value(capture.direct.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        evidence["committer"],
+        serde_json::to_value(alice.self_id()).unwrap()
+    );
+    assert_eq!(
+        evidence["before"]["indexed_credentials"],
+        evidence["after"]["indexed_credentials"]
+    );
+    assert_eq!(
+        evidence["before"]["extensions"],
+        evidence["after"]["extensions"]
+    );
+    assert_eq!(
+        bob.group_authority(&group).unwrap().facts.epoch.0,
+        before.0 + 1
+    );
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    bob.ingest(commit).await.unwrap();
+    assert!(
+        !bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .qualifies(&group, &content),
+        "duplicate is not another native update"
+    );
+}
+
+#[tokio::test]
+async fn native_owned_receiver_rejects_actual_invite_before_merge() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let before = bob.group_authority(&group).unwrap();
+    let (mut carol, _) = build_client(b"owned-receiver-carol");
+    let result = alice
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![carol.fresh_key_package().await.unwrap()],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = result
+    else {
+        panic!("invite commit")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    assert!(matches!(
+        bob.ingest(commit).await,
+        Err(EngineError::Other(_))
+    ));
+    assert_eq!(bob.group_authority(&group).unwrap(), before);
+    assert!(
+        bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .direct
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn receiver_routine_update_remains_live_and_journals_native_evidence() {
+    let (mut alice, _, bob, group) = fixture().await;
+    let result = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit,
+        pending,
+        ..
+    } = result
+    else {
+        panic!("update commit")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut receiver = ProtectedReceiver::new(
+        bob,
+        group.clone(),
+        vec![alice.self_id()],
+        file.reopen().unwrap(),
+    )
+    .unwrap();
+    assert!(receiver.ingest(commit).await.unwrap().is_none());
+    let log = records(&file);
+    assert!(!log[1]["native_merge"].is_null());
+    assert!(log[1]["candidate"].is_null());
+    let reply = send_app(&mut alice, &group, b"approve".to_vec()).await;
+    assert!(receiver.ingest(reply).await.unwrap().is_some());
+    assert_eq!(records(&file).len(), 4);
+}
+
+#[tokio::test]
+async fn native_owned_receiver_competing_old_epoch_update_enters_convergence() {
+    let (mut alice, _) = build_client(b"race-alice");
+    let (mut bob, _) = build_client(b"race-bob");
+    let (mut carol, _) = build_client(b"race-carol");
+    let (group, created) = alice
+        .create_group(CreateGroupRequest {
+            name: "receiver race".into(),
+            description: String::new(),
+            members: vec![
+                bob.fresh_key_package().await.unwrap(),
+                carol.fresh_key_package().await.unwrap(),
+            ],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupCreated { pending, welcomes } = created else {
+        panic!("group")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    bob.join_welcome(welcome_for(&welcomes, b"race-bob"))
+        .await
+        .unwrap();
+    carol
+        .join_welcome(welcome_for(&welcomes, b"race-carol"))
+        .await
+        .unwrap();
+    bob.drain_events();
+    let SendResult::GroupEvolution { msg: mut first, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("first update")
+    };
+    let SendResult::GroupEvolution { msg: mut rival, .. } = carol
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("rival update")
+    };
+    for commit in [&mut first, &mut rival] {
+        commit.envelope = TransportEnvelope::GroupMessage {
+            transport_group_id: group.as_slice().to_vec(),
+        };
+    }
+    let first_content = hash_id(&first.payload);
+    let rival_content = hash_id(&rival.payload);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    assert!(matches!(
+        bob.ingest(first).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    assert!(
+        bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .qualifies(&group, &first_content)
+    );
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    let outcome = bob.ingest(rival).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .convergence_entered
+    );
+    assert!(
+        !bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .qualifies(&group, &rival_content)
+    );
+}
+
+#[tokio::test]
+async fn native_owned_receiver_pending_local_commit_cannot_qualify() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    bob.send(SendIntent::SelfUpdate {
+        group_id: group.clone(),
+    })
+    .await
+    .unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("peer update")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    let _outcome = bob.ingest(commit).await;
+    assert!(
+        !bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .qualifies(&group, &content)
+    );
+}
+
+#[tokio::test]
+async fn native_owned_receiver_future_epoch_update_cannot_qualify() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let SendResult::GroupEvolution { pending, .. } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("first update")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    let SendResult::GroupEvolution {
+        msg: mut commit, ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("future update")
+    };
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    bob.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(group.clone()));
+    let outcome = bob.ingest(commit).await.unwrap();
+    assert!(
+        matches!(outcome, IngestOutcome::Buffered { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        !bob.receiver_merge_capture
+            .as_ref()
+            .unwrap()
+            .qualifies(&group, &content)
+    );
+}
+
+#[tokio::test]
+async fn receiver_nonoperator_routine_update_does_not_lock_queue() {
+    let (mut alice, _, bob, group) = fixture().await;
+    let SendResult::GroupEvolution {
+        msg: mut commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("update commit")
+    };
+    alice.confirm_published(pending).await.unwrap();
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut receiver = ProtectedReceiver::new(
+        bob,
+        group.clone(),
+        vec![MemberId::new(pad32(b"other-operator"))],
+        file.reopen().unwrap(),
+    )
+    .unwrap();
+    assert!(receiver.ingest(commit).await.unwrap().is_none());
+    assert!(!records(&file)[1]["native_merge"].is_null());
+    let ordinary = send_app(&mut alice, &group, b"hello".to_vec()).await;
+    assert!(receiver.ingest(ordinary).await.unwrap().is_none());
+    assert!(!receiver.latched);
 }
