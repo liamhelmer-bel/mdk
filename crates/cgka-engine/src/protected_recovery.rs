@@ -12,11 +12,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const MAX_LINE: usize = 4 * 1024 * 1024;
+const MAX_LINE: usize = 12 * 1024 * 1024;
 const DOMAIN: &[u8] = b"heterodyne.receiver-recovery.v1\0";
 
 #[derive(Debug, PartialEq, Eq)]
-enum Hold {
+pub(super) enum Hold {
     Io,
     Lock,
     Encoding,
@@ -29,14 +29,14 @@ type Result<T> = std::result::Result<T, Hold>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Enrollment {
-    account: String,
-    group: String,
-    operators: Vec<String>,
-    source_profile_sha256: String,
-    storage_generation: String,
-    initial_native_state_sha256: String,
-    welcome_provenance_sha256: String,
+pub(super) struct Enrollment {
+    pub(super) account: String,
+    pub(super) group: String,
+    pub(super) operators: Vec<String>,
+    pub(super) source_profile_sha256: String,
+    pub(super) storage_generation: String,
+    pub(super) initial_native_state_sha256: String,
+    pub(super) welcome_provenance_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +60,7 @@ enum TransitionKind {
     Conflict,
     Expired,
     NativeUpdate,
+    Consumed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,15 +108,15 @@ struct Anchor {
 /// independently own anchor backup/restore and authenticated consumer custody.
 /// This private seam verifies descriptor properties and actual kernel locks;
 /// distinct inodes alone do NOT qualify independent protection.
-struct OwnedFiles {
-    journal: File,
-    journal_directory: File,
-    storage_lease: File,
-    anchor: File,
-    anchor_directory: File,
+pub(super) struct OwnedFiles {
+    pub(super) journal: File,
+    pub(super) journal_directory: File,
+    pub(super) storage_lease: File,
+    pub(super) anchor: File,
+    pub(super) anchor_directory: File,
 }
 
-struct Journal {
+pub(super) struct Journal {
     files: OwnedFiles,
     sequence: u64,
     digest: String,
@@ -207,14 +208,13 @@ fn anchor_digest(a: &Anchor) -> Result<String> {
 }
 
 impl Journal {
-    fn enroll(files: OwnedFiles, mut enrollment: Enrollment) -> Result<Self> {
+    pub(super) fn enroll(files: OwnedFiles, mut enrollment: Enrollment) -> Result<Self> {
         enrollment.operators.sort();
         if enrollment.operators.is_empty()
             || enrollment.operators.len() > 64
             || enrollment.operators.windows(2).any(|p| p[0] == p[1])
             || ![
                 &enrollment.account,
-                &enrollment.group,
                 &enrollment.source_profile_sha256,
                 &enrollment.storage_generation,
                 &enrollment.initial_native_state_sha256,
@@ -222,6 +222,7 @@ impl Journal {
             ]
             .iter()
             .all(|s| is_hash(s))
+            || !valid_group(&enrollment.group)
             || !enrollment.operators.iter().all(|s| is_hash(s))
         {
             return Err(Hold::Changed);
@@ -255,7 +256,7 @@ impl Journal {
 
     /// Strict clean checkpoint recovery. A suffix ahead of the anchor remains
     /// HOLD until an actual semantic/native completion validator is integrated.
-    fn reopen(files: OwnedFiles, expected: &Enrollment) -> Result<Self> {
+    pub(super) fn reopen(files: OwnedFiles, expected: &Enrollment) -> Result<Self> {
         let files = checked_files(files)?;
         io((&files.journal).seek(SeekFrom::Start(0)))?;
         io((&files.anchor).seek(SeekFrom::Start(0)))?;
@@ -321,6 +322,247 @@ impl Journal {
         })
     }
 
+    /// Stream original protected source records, retaining only the actual
+    /// pending projection set. No lifetime history materialization or replay.
+    pub(super) fn verify_pending(
+        &self,
+        pending: &[crate::protected_receiver::PendingApplicationProjection],
+    ) -> Result<()> {
+        use crate::protected_receiver::{RetainedOutcome, RetainedWire};
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let mut reader = BufReader::new(&self.files.journal);
+        let mut wire: Option<RetainedWire> = None;
+        let mut sequence = 0u64;
+        let mut matches = vec![0u8; pending.len()];
+        while let Some(record) = next::<Record>(&mut reader)? {
+            let Body::Transition {
+                transition,
+                payload_hex,
+            } = record.body
+            else {
+                continue;
+            };
+            let bytes = hex::decode(payload_hex).map_err(|_| Hold::Encoding)?;
+            match transition {
+                TransitionKind::Wire => {
+                    let retained: RetainedWire =
+                        serde_json::from_slice(&bytes).map_err(|_| Hold::Encoding)?;
+                    if retained.schema != "receiver-wire.v1"
+                        || wire.is_some()
+                        || retained.sequence != sequence.checked_add(1).ok_or(Hold::Changed)?
+                    {
+                        return Err(Hold::Changed);
+                    }
+                    wire = Some(retained);
+                }
+                TransitionKind::Outcome => {
+                    let outcome: RetainedOutcome =
+                        serde_json::from_slice(&bytes).map_err(|_| Hold::Encoding)?;
+                    let original = wire.take().ok_or(Hold::Changed)?;
+                    if outcome.schema != "receiver-outcome.v1"
+                        || outcome.sequence != original.sequence
+                        || outcome.message_id != hex::encode(original.wire.id.as_slice())
+                        || outcome.pending_application_ids.len()
+                            != outcome.pending_application_projections.len()
+                        || !matches!(
+                            outcome.outcome,
+                            cgka_traits::ingest::IngestOutcome::Processed
+                                | cgka_traits::ingest::IngestOutcome::Ignored { .. }
+                                | cgka_traits::ingest::IngestOutcome::Rejected { .. }
+                        )
+                    {
+                        return Err(Hold::Changed);
+                    }
+                    // Readback DTOs cannot mint native evidence. This method
+                    // verifies only pending plaintext projection/acknowledgment;
+                    // native update reconstruction remains a separate validator.
+                    if outcome.candidate.as_ref().is_some_and(|candidate| {
+                        !candidate
+                            .matches_retained(&original, &outcome.pending_application_projections)
+                    }) || (outcome.native_merge.is_some()
+                        && !outcome.pending_application_projections.is_empty())
+                    {
+                        return Err(Hold::Changed);
+                    }
+                    for (id, projection) in outcome
+                        .pending_application_ids
+                        .iter()
+                        .zip(&outcome.pending_application_projections)
+                    {
+                        if !projection.matches_id(id) {
+                            return Err(Hold::Changed);
+                        }
+                        for (index, actual) in pending.iter().enumerate() {
+                            if actual == projection {
+                                matches[index] =
+                                    matches[index].checked_add(1).ok_or(Hold::Changed)?;
+                            }
+                        }
+                    }
+                    sequence = outcome.sequence;
+                }
+                _ => {}
+            }
+        }
+        if wire.is_some() || matches.iter().any(|count| *count != 1) {
+            return Err(Hold::Changed);
+        }
+        Ok(())
+    }
+
+    pub(super) fn length(&self) -> Result<u64> {
+        Ok(io(self.files.journal.metadata())?.len())
+    }
+
+    pub(super) fn binds_native(
+        &self,
+        account: &str,
+        group: &str,
+        operators: &[String],
+        native: &str,
+    ) -> Result<bool> {
+        // This bridge is fresh-only; a historical journal requires the separate
+        // complete semantic/native restart validator, never a reset sequence.
+        if self.sequence != 1 || self.latched {
+            return Ok(false);
+        }
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let record =
+            next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
+        let mut operators = operators.to_vec();
+        operators.sort();
+        Ok(matches!(record.body, Body::Header { enrollment, .. }
+            if enrollment.account == account && enrollment.group == group
+                && enrollment.operators == operators && enrollment.initial_native_state_sha256 == native))
+    }
+
+    /// Fixed source schemas only. This chains original bytes; it is not a semantic
+    /// recovery validator and cannot turn a supplied decoded object into authority.
+    pub(super) fn record_source(&mut self, value: serde_json::Value) -> Result<()> {
+        let transition = match value.get("schema").and_then(|v| v.as_str()) {
+            Some("receiver-wire.v1") => TransitionKind::Wire,
+            Some("receiver-outcome.v1") => TransitionKind::Outcome,
+            Some("semantic-original.v1") => TransitionKind::Original,
+            Some("semantic-outbound.v1") => TransitionKind::Outbound,
+            Some("semantic-published.v1" | "semantic-card-complete.v1") => {
+                TransitionKind::Published
+            }
+            Some("semantic-decision.v1") => TransitionKind::Decision,
+            Some("semantic-conflict.v1" | "semantic-removal.v1") => TransitionKind::Conflict,
+            Some("semantic-consumed.v1") => TransitionKind::Consumed,
+            _ => return Err(Hold::Encoding),
+        };
+        let payload = serde_json::to_vec(&value).map_err(|_| Hold::Encoding)?;
+        if payload.len() > 4 * 1024 * 1024 {
+            return Err(Hold::Encoding);
+        }
+        let terminal = match value.get("schema").and_then(|v| v.as_str()) {
+            Some("semantic-card-complete.v1") => {
+                let ask_id = value
+                    .get("ask_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or(Hold::Encoding)?;
+                let original_operation_sha256 = self.source_original(ask_id)?;
+                Some(Body::CardComplete {
+                    ask_id: ask_id.into(),
+                    original_operation_sha256,
+                })
+            }
+            Some("semantic-consumed.v1") => {
+                let ask = value
+                    .get("ask_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or(Hold::Encoding)?;
+                let operation = value
+                    .get("operation_sha256")
+                    .and_then(|v| v.as_str())
+                    .ok_or(Hold::Encoding)?;
+                Some(Body::Consumed {
+                    key: self.source_card(ask, operation)?,
+                })
+            }
+            _ => None,
+        };
+        if let Some(body) = &terminal {
+            self.validate_body(body)?;
+        }
+        let result = (|| {
+            self.write(Body::Transition {
+                transition,
+                payload_hex: hex::encode(payload),
+            })?;
+            if let Some(body) = terminal {
+                self.write(body)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.latched = true;
+        }
+        result
+    }
+
+    fn source_original(&self, ask: &str) -> Result<String> {
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let mut reader = BufReader::new(&self.files.journal);
+        let mut operation = None;
+        while let Some(record) = next::<Record>(&mut reader)? {
+            let Body::Transition {
+                transition: TransitionKind::Original,
+                payload_hex,
+            } = record.body
+            else {
+                continue;
+            };
+            let value: serde_json::Value =
+                serde_json::from_slice(&hex::decode(payload_hex).map_err(|_| Hold::Encoding)?)
+                    .map_err(|_| Hold::Encoding)?;
+            if value.get("schema").and_then(|v| v.as_str()) != Some("semantic-original.v1") {
+                return Err(Hold::Encoding);
+            }
+            let original = value.get("original").ok_or(Hold::Encoding)?;
+            if original.get("ask_id").and_then(|v| v.as_str()) == Some(ask) {
+                let bytes = hex::decode(
+                    original
+                        .get("operation")
+                        .and_then(|v| v.as_str())
+                        .ok_or(Hold::Encoding)?,
+                )
+                .map_err(|_| Hold::Encoding)?;
+                if operation.is_some() || bytes.is_empty() {
+                    return Err(Hold::Changed);
+                }
+                operation = Some(hex::encode(Sha256::digest(bytes)));
+            }
+        }
+        operation.ok_or(Hold::Changed)
+    }
+
+    fn source_card(&self, ask: &str, operation: &str) -> Result<UseKey> {
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let mut reader = BufReader::new(&self.files.journal);
+        let mut key = None;
+        while let Some(record) = next::<Record>(&mut reader)? {
+            if let Body::CardComplete {
+                ask_id,
+                original_operation_sha256,
+            } = record.body
+                && ask_id == ask
+            {
+                if key.is_some() || original_operation_sha256 != operation {
+                    return Err(Hold::Changed);
+                }
+                key = Some(UseKey {
+                    header_sha256: self.header_digest.clone(),
+                    card_complete_sequence: record.sequence,
+                    ask_id,
+                    original_operation_sha256,
+                });
+            }
+        }
+        key.ok_or(Hold::Changed)
+    }
+
     fn write(&mut self, body: Body) -> Result<()> {
         if self.latched {
             return Err(Hold::Latched);
@@ -364,7 +606,7 @@ impl Journal {
         match body {
             Body::Header { .. } if self.sequence != 0 => Err(Hold::Changed),
             Body::Transition { payload_hex, .. }
-                if payload_hex.len() > 2 * 1024 * 1024
+                if payload_hex.len() > 8 * 1024 * 1024
                     || !payload_hex
                         .bytes()
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -426,6 +668,13 @@ impl Journal {
         Err(Hold::Changed)
     }
 }
+fn valid_group(value: &str) -> bool {
+    matches!(value.len(), 32 | 64)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 fn valid_ask(id: &str) -> bool {
     id.len() == 4
         && id

@@ -14,7 +14,8 @@ use cgka_traits::{
     transport::TransportMessage,
     types::{GroupId, MemberId, MessageId},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::Write,
@@ -36,6 +37,102 @@ pub(crate) struct AuthenticatedCandidate {
     application: MarmotAppEvent,
 }
 
+/// Non-authoritative protected-journal readback. It cannot be converted into
+/// AuthenticatedCandidate; only the actual native ingest path creates evidence.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetainedCandidate {
+    sequence: u64,
+    received_at_unix_ms: u128,
+    group: GroupId,
+    message_id: String,
+    source_epoch: u64,
+    sender: MemberId,
+    application: MarmotAppEvent,
+}
+impl RetainedCandidate {
+    pub(super) fn matches_retained(
+        &self,
+        wire: &RetainedWire,
+        projections: &[PendingApplicationProjection],
+    ) -> bool {
+        self.sequence == wire.sequence
+            && self.received_at_unix_ms == wire.received_at_unix_ms
+            && self
+                .application
+                .validate_sender(&hex::encode(self.sender.as_slice()))
+                .is_ok()
+            && projections
+                .iter()
+                .filter(|p| {
+                    p.group == self.group
+                        && hex::encode(p.message_id.as_slice()) == self.message_id
+                        && p.source_epoch == self.source_epoch
+                        && p.sender == self.sender
+                })
+                .count()
+                == 1
+    }
+}
+
+/// Complete immutable native pending identity; delivery/read/retention annotations
+/// are intentionally excluded. Constructed at the actual owned ingest event seam.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PendingApplicationProjection {
+    group: GroupId,
+    message_id: MessageId,
+    sender: MemberId,
+    source_epoch: u64,
+    payload_sha256: String,
+}
+impl PendingApplicationProjection {
+    pub(super) fn matches_id(&self, id: &MessageId) -> bool {
+        &self.message_id == id
+    }
+    pub(super) fn capture(event: &GroupEvent) -> Option<Self> {
+        match event {
+            GroupEvent::MessageReceived {
+                group_id,
+                message_id,
+                sender,
+                epoch,
+                payload,
+                ..
+            } => Some(Self {
+                group: group_id.clone(),
+                message_id: message_id.clone(),
+                sender: sender.clone(),
+                source_epoch: epoch.0,
+                payload_sha256: hex::encode(Sha256::digest(payload)),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Journal-owned wire/outcome decoding only; no external authority import API.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetainedWire {
+    pub(super) schema: String,
+    pub(super) sequence: u64,
+    pub(super) received_at_unix_ms: u128,
+    pub(super) wire: TransportMessage,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RetainedOutcome {
+    pub(super) schema: String,
+    pub(super) sequence: u64,
+    pub(super) message_id: String,
+    pub(super) outcome: IngestOutcome,
+    pub(super) candidate: Option<RetainedCandidate>,
+    pub(super) pending_application_ids: Vec<MessageId>,
+    pub(super) pending_application_projections: Vec<PendingApplicationProjection>,
+    pub(super) native_merge: Option<serde_json::Value>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReceiverHold {
     Configuration,
@@ -47,13 +144,31 @@ pub(crate) enum ReceiverHold {
     Malformed,
 }
 
+enum ReceiverJournal {
+    Fresh(File),
+    #[cfg(unix)]
+    Ordered(crate::protected_recovery::Journal),
+}
+impl ReceiverJournal {
+    fn length(&self) -> Result<u64, ReceiverHold> {
+        match self {
+            Self::Fresh(file) => file
+                .metadata()
+                .map(|m| m.len())
+                .map_err(|_| ReceiverHold::Journal),
+            #[cfg(unix)]
+            Self::Ordered(journal) => journal.length().map_err(|_| ReceiverHold::Journal),
+        }
+    }
+}
+
 /// No injectable engine trait, observer callback, plaintext ingress or authority deserializer.
 /// No restart/reopen path: an interrupted journal requires explicit reconciliation.
 pub(crate) struct ProtectedReceiver<S: StorageProvider + 'static> {
     engine: Engine<S>,
     group: GroupId,
     operators: Vec<MemberId>,
-    journal: File,
+    journal: ReceiverJournal,
     sequence: u64,
     latched: bool,
 }
@@ -83,10 +198,88 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             engine,
             group,
             operators,
-            journal,
+            journal: ReceiverJournal::Fresh(journal),
             sequence: 0,
             latched: false,
         })
+    }
+
+    /// Private fresh ordered sink; not an authenticated file opener or restart API.
+    #[cfg(unix)]
+    fn from_ordered(
+        mut engine: Engine<S>,
+        group: GroupId,
+        operators: Vec<MemberId>,
+        journal: crate::protected_recovery::Journal,
+    ) -> Result<Self, ReceiverHold> {
+        let projection = engine
+            .with_mls_group(&group, crate::protected_merge::Projection::read)
+            .map_err(|_| ReceiverHold::Configuration)?;
+        let native = hex::encode(Sha256::digest(
+            serde_json::to_vec(&projection).map_err(|_| ReceiverHold::Malformed)?,
+        ));
+        if operators.is_empty()
+            || operators.len() > 64
+            || operators.contains(&engine.self_id())
+            || !engine.drain_events().is_empty()
+            || !journal
+                .binds_native(
+                    &hex::encode(engine.self_id().as_slice()),
+                    &hex::encode(group.as_slice()),
+                    &operators
+                        .iter()
+                        .map(|m| hex::encode(m.as_slice()))
+                        .collect::<Vec<_>>(),
+                    &native,
+                )
+                .map_err(|_| ReceiverHold::Journal)?
+        {
+            return Err(ReceiverHold::Configuration);
+        }
+        engine
+            .group_authority(&group)
+            .map_err(|_| ReceiverHold::Configuration)?;
+        Ok(Self {
+            engine,
+            group,
+            operators,
+            journal: ReceiverJournal::Ordered(journal),
+            sequence: 0,
+            latched: false,
+        })
+    }
+
+    /// Positive plaintext reconciliation only. This does not admit a semantic
+    /// factory or replay any wire. Unknown pending native state refuses before
+    /// deleting anything, including unrelated welcome/lifecycle outputs.
+    #[cfg(unix)]
+    fn reconcile_pending_plaintext(
+        engine: &mut Engine<S>,
+        journal: &crate::protected_recovery::Journal,
+    ) -> Result<(), ReceiverHold> {
+        let pending = engine
+            .storage
+            .list_pending_application_events()
+            .map_err(|_| ReceiverHold::Journal)?;
+        let projections = pending
+            .iter()
+            .map(PendingApplicationProjection::capture)
+            .collect::<Option<Vec<_>>>()
+            .ok_or(ReceiverHold::ChangedState)?;
+        journal
+            .verify_pending(&projections)
+            .map_err(|_| ReceiverHold::ChangedState)?;
+        let ids = pending
+            .iter()
+            .filter_map(|event| match event {
+                GroupEvent::MessageReceived { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        engine
+            .storage
+            .delete_pending_application_events(&ids)
+            .map_err(|_| ReceiverHold::Journal)
     }
 
     fn record(&mut self, value: impl Serialize) -> Result<(), ReceiverHold> {
@@ -95,18 +288,20 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             return Err(ReceiverHold::Capacity);
         }
         bytes.push(b'\n');
-        let length = self
-            .journal
-            .metadata()
-            .map_err(|_| ReceiverHold::Journal)?
-            .len();
+        let length = self.journal.length()?;
         if length.checked_add(bytes.len() as u64).is_none() {
             return Err(ReceiverHold::Capacity);
         }
-        self.journal
-            .write_all(&bytes)
-            .and_then(|_| self.journal.sync_all())
-            .map_err(|_| ReceiverHold::Journal)
+        match &mut self.journal {
+            ReceiverJournal::Fresh(file) => file
+                .write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| ReceiverHold::Journal),
+            #[cfg(unix)]
+            ReceiverJournal::Ordered(journal) => journal
+                .record_source(serde_json::from_slice(&bytes).map_err(|_| ReceiverHold::Malformed)?)
+                .map_err(|_| ReceiverHold::Journal),
+        }
     }
 
     pub(crate) async fn ingest(
@@ -124,11 +319,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         // arithmetic validation, NOT disk reservation: a later write/fsync may
         // fail after native mutation and must HOLD without blind replay. There
         // is no lifetime journal cap or promise of available disk capacity.
-        let available = self
-            .journal
-            .metadata()
-            .map_err(|_| ReceiverHold::Journal)?
-            .len();
+        let available = self.journal.length()?;
         if available
             .checked_add(encoded.len() as u64 + MAX_RECORD as u64 + 1024)
             .is_none()
@@ -172,7 +363,9 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         }
         let mut candidate = None;
         let mut pending_ids = Vec::new();
+        let mut pending_projections = Vec::new();
         for event in self.engine.drain_events() {
+            let projection = PendingApplicationProjection::capture(&event);
             match event {
                 GroupEvent::MessageReceived {
                     group_id,
@@ -183,6 +376,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                     ..
                 } if group_id == self.group && Some(&message_id) == content_id.as_ref() => {
                     pending_ids.push(message_id.clone());
+                    pending_projections.push(projection.ok_or(ReceiverHold::ChangedState)?);
                     // Eligibility derives from the authenticated MLS credential. An
                     // unrelated member's malformed inner event is not operator input.
                     if sender == self.engine.self_id() || !self.operators.contains(&sender) {
@@ -245,7 +439,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             }
         }
         self.record(serde_json::json!({"schema":"receiver-outcome.v1", "sequence":self.sequence,
-            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate,"pending_application_ids":pending_ids,"native_merge":merge.direct}))?;
+            "message_id":hex::encode(wire.id.as_slice()), "outcome":outcome, "candidate":candidate,"pending_application_ids":pending_ids,"pending_application_projections":pending_projections,"native_merge":merge.direct}))?;
         // Native pending plaintext may be dropped only after the complete durable
         // receiver projection exists. Deletion is idempotent; failure stays held.
         self.engine

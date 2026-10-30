@@ -616,3 +616,58 @@ async fn edit_and_operator_removal_before_or_after_approval_cannot_leave_it_usab
         }
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn ordered_actual_post_reply_and_consume_bind_native_card_to_independent_use_anchor() {
+    let (mut factory, mut operator, _, _) = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    let (journal, _) = crate::protected_receiver::tests::ordered_fixture(
+        root.path(),
+        &factory.receiver.engine,
+        &factory.receiver.group,
+        &factory.receiver.operators,
+    );
+    factory.receiver.journal = crate::protected_receiver::ReceiverJournal::Ordered(journal);
+    let ask = original("ask3", &factory.receiver.group);
+    let operation_sha = digest(&ask.operation);
+    factory.post(ask).await.unwrap();
+    let target = factory.asks["ask3"].app_ids[0].clone();
+    let wire = reaction(&mut operator, &factory, &target, "👍").await;
+    assert_eq!(factory.ingest(wire).await.unwrap(), Some("ask3".into()));
+    factory.consume("ask3", &operation_sha).unwrap();
+    assert!(factory.consume("ask3", &operation_sha).is_err());
+    let records = std::fs::read_to_string(root.path().join("receiver/journal"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let anchors = std::fs::read_to_string(root.path().join("consumer/anchor"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), anchors.len());
+    let card = records
+        .iter()
+        .find(|r| r["body"]["kind"] == "card-complete")
+        .unwrap();
+    let consumed = records
+        .iter()
+        .find(|r| r["body"]["kind"] == "consumed")
+        .unwrap();
+    assert_eq!(card["body"]["original_operation_sha256"], operation_sha);
+    assert_eq!(
+        consumed["body"]["key"]["card_complete_sequence"],
+        card["sequence"]
+    );
+    assert_eq!(
+        consumed["body"]["key"]["original_operation_sha256"],
+        operation_sha
+    );
+    assert_eq!(
+        consumed["body"]["key"]["header_sha256"],
+        records[0]["sha256"]
+    );
+    assert_eq!(anchors.last().unwrap()["use_key"], consumed["body"]["key"]);
+}
