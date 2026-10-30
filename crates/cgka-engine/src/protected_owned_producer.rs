@@ -202,7 +202,7 @@ impl InstalledProducer {
         }
         let profile = read_profile(&inputs.profile)?;
         if digest(original) != profile.operation_original_sha256
-            || hex::encode(binding.transport) != profile.group_hex
+            || hex::encode(binding.native.as_slice()) != profile.group_hex
         {
             return Err(ReceiverHold::ChangedState);
         }
@@ -263,7 +263,7 @@ fn correlate(
         || value.packet_sha256 != digest(&canonical)
         || value.packet_sha256 != profile.packet_sha256
         || value.published_original_sha256 != value.packet_sha256
-        || value.group_hex != hex::encode(binding.transport)
+        || value.group_hex != hex::encode(binding.native.as_slice())
         || value.group_hex != profile.group_hex
         || value.publication_url != profile.publication_url
         || value.request_sha256 != digest(&request)
@@ -318,8 +318,8 @@ mod tests {
         let output: Output = serde_json::from_value(value["output"].clone()).unwrap();
         let original = decode(&output.operation_original).unwrap();
         let group = GroupBinding {
-            native: GroupId::new(vec![0x81; 16]),
-            transport: hex::decode(&output.group_hex).unwrap().try_into().unwrap(),
+            native: GroupId::new(hex::decode(&output.group_hex).unwrap()),
+            transport: [0x81; 32],
         };
         let profile = Profile {
             schema: "heterodyne-owned-card-profile.v1".into(),
@@ -336,12 +336,12 @@ mod tests {
         // Actual Product producer output under synthetic HTTPS/profile, not runtime custody.
         let (value, profile, original, group) = fixture();
         let raw = serde_json::to_vec(&value).unwrap();
-        let wrong_route = GroupBinding {
-            native: group.native.clone(),
-            transport: [0x91; 32],
+        let wrong_native = GroupBinding {
+            native: GroupId::new(vec![0x91; 32]),
+            transport: group.transport,
         };
         assert!(matches!(
-            correlate(&raw, &original, &wrong_route, &profile),
+            correlate(&raw, &original, &wrong_native, &profile),
             Err(ReceiverHold::ChangedState)
         ));
         let ask = correlate(&raw, &original, &group, &profile).unwrap();
@@ -357,8 +357,8 @@ mod tests {
     #[test]
     fn owned_output_refuses_product_routing_group_and_exact_card_tampering() {
         let (mut value, mut profile, original, binding) = fixture();
-        // Matching Product profile/output still cannot replace native-authenticated routing.
-        value.group_hex = hex::encode([0x92; 32]);
+        // Both domains are32bytes here: field meaning, not length, rejects routing.
+        value.group_hex = hex::encode(binding.transport);
         profile.group_hex = value.group_hex.clone();
         assert!(matches!(
             correlate(

@@ -20,14 +20,12 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         .unwrap();
     assert!(head.status.success());
     assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), PRODUCT_HEAD);
-    assert!(
-        Command::new("git")
-            .args(["diff", "--quiet", "HEAD"])
-            .current_dir(&product)
-            .status()
-            .unwrap()
-            .success()
-    );
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(&product)
+        .output()
+        .unwrap();
+    assert!(status.status.success() && status.stdout.is_empty());
     let (mut factory, mut operator, root, relay) = current_routed_fixture().await;
     assert_eq!(factory.receiver.group.as_slice().len(), 16);
     let transport_group = [7; 32];
@@ -40,14 +38,14 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     let fixture = root.path().join("current-whole-packet.json");
     let generator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/support/current_whole_packet.py");
-    let generated = Command::new(python)
-        .arg(generator)
+    let generated = Command::new(&python)
+        .arg(&generator)
         .arg("--product")
         .arg(&product)
         .arg("--output")
         .arg(&fixture)
         .arg("--group-hex")
-        .arg(hex::encode(transport_group))
+        .arg(hex::encode(factory.receiver.group.as_slice()))
         .output()
         .unwrap();
     assert!(
@@ -69,7 +67,10 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         .unwrap();
     let ask = super::super::owned_producer::qualification_original(&raw, &binding).unwrap();
     assert_eq!(ask.expected_group, factory.receiver.group);
-    assert_eq!(payload["output"]["group_hex"], hex::encode(transport_group));
+    assert_eq!(
+        payload["output"]["group_hex"],
+        hex::encode(factory.receiver.group.as_slice())
+    );
     let wrong_route_binding = super::super::owned_producer::GroupBinding::read(
         &factory.receiver.engine,
         &factory.receiver.group,
@@ -77,6 +78,33 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     );
     assert!(matches!(
         wrong_route_binding,
+        Err(ReceiverHold::ChangedState)
+    ));
+    // Routing32 is grammatically valid Product input but the wrong domain.
+    // Generate a genuine second card rather than rewriting card group context.
+    let route_fixture = root.path().join("routing-domain-packet.json");
+    let wrong = Command::new(&python)
+        .arg(&generator)
+        .arg("--product")
+        .arg(&product)
+        .arg("--output")
+        .arg(&route_fixture)
+        .arg("--group-hex")
+        .arg(hex::encode(transport_group))
+        .output()
+        .unwrap();
+    assert!(
+        wrong.status.success(),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+    let wrong_payload: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(route_fixture).unwrap()).unwrap();
+    let wrong_raw = STANDARD
+        .decode(wrong_payload["output_original_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(matches!(
+        super::super::owned_producer::qualification_original(&wrong_raw, &binding),
         Err(ReceiverHold::ChangedState)
     ));
     let expected = serde_json::to_value(&ask).unwrap();
@@ -99,50 +127,109 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         .as_nanos();
     assert!(u128::from(packet["release"]["not_before_ns"].as_u64().unwrap()) <= now);
     assert!(now < u128::from(packet["outage"]["deadline_ns"].as_u64().unwrap()));
-    factory.post(ask).await.unwrap();
-    assert_eq!(relay.wires.lock().unwrap().len(), 1);
-    for wire in relay.wires.lock().unwrap().clone() {
-        operator.ingest(wire).await.unwrap();
-    }
-    operator.drain_events();
-    let target = factory.asks[&id].app_ids[0].clone();
-    let reply = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
-    assert_eq!(factory.ingest(reply).await.unwrap(), Some(id.clone()));
-    assert!(factory.consume(&id, &canonical).is_err());
-    assert!(consumed_key(&factory, &id, &operation).is_err());
-    super::super::owned_producer::GroupBinding::read(
-        &factory.receiver.engine,
-        &factory.receiver.group,
-        &transport_group,
-    )
-    .unwrap();
-    factory.consume(&id, &operation).unwrap();
-    let key = consumed_key(&factory, &id, &operation).unwrap();
-    let receipt = factory.asks[&id].receipt.as_ref().unwrap();
-    let original = serde_json::to_value(&factory.asks[&id].original).unwrap();
-    assert_eq!(original, expected);
+    // Real exchange owns activation, post, ingress/EOSE, preconsume check and frame.
+    factory
+        .enable_catalog(super::super::tests::cache(root.path(), "exchange-cache"))
+        .unwrap();
+    let expected_operator = operator.self_id();
+    let native = factory.receiver.group.clone();
+    let adapter = factory.transport.clone();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let forwarder = forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
+    let keepalive = tx.clone();
     let (mut sender, mut consumer) = UnixStream::pair().unwrap();
+    let mut before_eose = consumer.try_clone().unwrap();
+    let subscriptions_before = relay.subscriptions.lock().unwrap().len();
+    let driver = tokio::spawn(async move {
+        let wire = loop {
+            if let Some(wire) = relay.wires.lock().unwrap().first().cloned() {
+                break wire;
+            }
+            tokio::task::yield_now().await;
+        };
+        operator.ingest(wire).await.unwrap();
+        let target = operator
+            .drain_events()
+            .into_iter()
+            .find_map(|event| match event {
+                cgka_traits::GroupEvent::MessageReceived { payload, .. } => {
+                    let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                    Some(value["id"].as_str().unwrap().to_owned())
+                }
+                _ => None,
+            })
+            .expect("actual published card must reach operator");
+        let reaction = MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1,
+            MARMOT_APP_EVENT_KIND_REACTION,
+            vec![vec!["e".into(), target]],
+            "👍",
+        );
+        let cgka_traits::SendResult::ApplicationMessage { msg, .. } = operator
+            .send(cgka_traits::SendIntent::AppMessage {
+                group_id: native,
+                payload: reaction.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("actual MLS reply");
+        };
+        tx.send(nostr_sdk::RelayPoolNotification::Event {
+            relay_url: "wss://semantic.invalid".parse().unwrap(),
+            subscription_id: nostr::SubscriptionId::new("fixture"),
+            event: Box::new(serde_json::from_slice(&msg.payload).unwrap()),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        before_eose.set_nonblocking(true).unwrap();
+        assert_eq!(
+            before_eose.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        before_eose.set_nonblocking(false).unwrap();
+        let subscriptions = relay.subscriptions.lock().unwrap().clone();
+        assert!(subscriptions.len() > subscriptions_before);
+        for subscription in subscriptions {
+            tx.send(nostr_sdk::RelayPoolNotification::Message {
+                relay_url: "wss://semantic.invalid".parse().unwrap(),
+                message: nostr::RelayMessage::EndOfStoredEvents(std::borrow::Cow::Owned(
+                    nostr::SubscriptionId::new(subscription.subscription_id()),
+                )),
+            })
+            .unwrap();
+        }
+        assert_eq!(relay.wires.lock().unwrap().len(), 1);
+    });
     let nonce = [0x39; 32];
-    consumer.write_all(&nonce).unwrap();
-    let mut challenge = [0; 32];
-    sender.read_exact(&mut challenge).unwrap();
-    let response = Consumed {
-        schema: "heterodyne-owned-consumed.v1",
-        nonce_hex: hex::encode(challenge),
-        startup_profile_sha256: &"01".repeat(32),
-        enrollment_sha256: &"02".repeat(32),
-        journal_profile_sha256: &"03".repeat(32),
-        producer_closure_sha256: &"04".repeat(32),
-        original: &original,
-        consumption_key: key,
-        receipt,
-    };
-    let bytes = serde_json::to_vec(&response).unwrap();
-    write_frame(&mut sender, &bytes).unwrap();
+    exchange(
+        &mut factory,
+        &adapter,
+        &forwarder,
+        &mut sender,
+        Session {
+            ask,
+            transport_group: transport_group.to_vec(),
+            wait_seconds: 15,
+            profile_sha: "01".repeat(32),
+            enrollment_sha: "02".repeat(32),
+            journal_sha: "03".repeat(32),
+            closure_sha: "04".repeat(32),
+            nonce,
+        },
+    )
+    .await
+    .unwrap();
+    driver.await.unwrap();
+    factory.load_retained(&id).unwrap();
+    assert!(factory.asks[&id].consumed);
+    assert!(factory.consume(&id, &canonical).is_err());
+    let key = consumed_key(&factory, &id, &operation).unwrap();
     let mut prefix = [0; 4];
     consumer.read_exact(&mut prefix).unwrap();
-    assert_eq!(u32::from_be_bytes(prefix) as usize, bytes.len());
-    let mut frame = vec![0; bytes.len()];
+    let mut frame = vec![0; u32::from_be_bytes(prefix) as usize];
     consumer.read_exact(&mut frame).unwrap();
     let result: serde_json::Value = serde_json::from_slice(&frame).unwrap();
     assert_eq!(result["schema"], "heterodyne-owned-consumed.v1");
@@ -151,7 +238,7 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     assert_eq!(result["receipt"]["decision"], "Approve");
     assert_eq!(
         result["receipt"]["operator"],
-        serde_json::to_value(operator.self_id()).unwrap()
+        serde_json::to_value(expected_operator).unwrap()
     );
     assert_eq!(result["receipt"]["operation_sha256"], operation);
     assert_eq!(
@@ -183,8 +270,14 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         card["sequence"]
     );
     assert!(factory.consume(&id, &operation).is_err());
+    assert_eq!(
+        serde_json::to_value(&key).unwrap(),
+        result["consumption_key"]
+    );
     drop(consumer);
-    assert!(write_frame(&mut sender, &bytes).is_err());
+    assert!(write_frame(&mut sender, &frame).is_err());
+    drop(keepalive);
+    forwarder.abort();
     assert!(factory.asks[&id].consumed); // lost reply never reverses durable one-use.
     eprintln!(
         "TEST ONLY: actual Product {} child/Git + real MLS approve/consume/frame PASS; synthetic HTTPS/render/relay ACK; generated fixture SHA256 {}",

@@ -14,7 +14,8 @@ parser.add_argument('--product', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--group-hex', required=True)
 args = parser.parse_args()
-assert len(bytes.fromhex(args.group_hex)) == 32
+if not 16 <= len(bytes.fromhex(args.group_hex)) <= 64:
+    raise ValueError("Product group must be16–64bytes, independently of Nostr routing")
 sys.path[:0] = [str(args.product / 'src'), str(args.product / 'tests')]
 import msgspec
 import pytest
