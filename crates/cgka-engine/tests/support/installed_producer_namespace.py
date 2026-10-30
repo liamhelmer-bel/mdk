@@ -13,6 +13,9 @@ import subprocess
 import sys
 import time
 
+if sys.flags.optimize:
+    raise RuntimeError("qualification requires nonoptimized Python before any mount")
+
 parser = argparse.ArgumentParser(
     description="Disposable namespace qualification only; not installed authority"
 )
