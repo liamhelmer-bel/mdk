@@ -4,8 +4,8 @@ use super::{AuthenticatedCandidate, ProtectedReceiver, ReceiverHold};
 use cgka_traits::{
     TransportAdapter, TransportEndpoint, TransportPublishRequest, TransportPublishTarget,
     app_event::{
-        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-        MarmotAppEvent,
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_REMOVE, MarmotAppEvent,
     },
     engine::{CgkaEngine, SendIntent, SendResult},
     storage::StorageProvider,
@@ -68,6 +68,8 @@ struct SemanticFactory<S: StorageProvider + 'static> {
     endpoints: Vec<TransportEndpoint>,
     asks: BTreeMap<String, RetainedAsk>,
     seen_candidates: BTreeSet<String>,
+    // Authenticated inner-event removals survive arrival before their target.
+    removals: BTreeSet<(Option<String>, String)>,
     held: bool,
 }
 impl<S: StorageProvider + 'static> SemanticFactory<S> {
@@ -88,6 +90,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             endpoints,
             asks: BTreeMap::new(),
             seen_candidates: BTreeSet::new(),
+            removals: BTreeSet::new(),
             held: false,
         })
     }
@@ -116,7 +119,12 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         if self.held || self.receiver.latched {
             return Err(ReceiverHold::Latched);
         }
-        if self.asks.values().filter(|a| a.receipt.is_none()).count() >= 100
+        if self
+            .asks
+            .values()
+            .filter(|a| a.receipt.is_none() && !a.conflicted)
+            .count()
+            >= 100
             || original.expected_group != self.receiver.group
             || self.asks.contains_key(&original.ask_id)
             || !valid_ask_id(&original.ask_id)
@@ -145,30 +153,38 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         {
             return Err(ReceiverHold::Capacity);
         }
+        // Construct and validate every inner event before any journal/native
+        // effect. Same-text chunks in one second have the same native event ID.
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ReceiverHold::Journal)?
+            .as_secs();
+        let mut events = Vec::new();
+        let mut ids = BTreeSet::new();
+        for text in &original.card_chunks {
+            let event = MarmotAppEvent::new(
+                hex::encode(self.receiver.engine.self_id().as_slice()),
+                created_at,
+                MARMOT_APP_EVENT_KIND_CHAT,
+                vec![],
+                text.clone(),
+            );
+            if !ids.insert(event.id.clone())
+                || self
+                    .asks
+                    .values()
+                    .any(|ask| ask.app_ids.contains(&event.id))
+            {
+                return Err(ReceiverHold::ChangedState);
+            }
+            events.push(event);
+        }
         self.held = true;
         self.receiver
             .record(serde_json::json!({"schema":"semantic-original.v1",
             "original":original,"policy_sha256":policy}))?;
         let mut app_ids = Vec::new();
-        for (index, text) in original.card_chunks.iter().enumerate() {
-            let event = MarmotAppEvent::new(
-                hex::encode(self.receiver.engine.self_id().as_slice()),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|_| ReceiverHold::Journal)?
-                    .as_secs(),
-                MARMOT_APP_EVENT_KIND_CHAT,
-                vec![],
-                text.clone(),
-            );
-            if self
-                .asks
-                .values()
-                .any(|ask| ask.app_ids.contains(&event.id))
-                || app_ids.contains(&event.id)
-            {
-                return Err(ReceiverHold::ChangedState);
-            }
+        for (index, event) in events.into_iter().enumerate() {
             let payload = event.encode().map_err(|_| ReceiverHold::Malformed)?;
             let result = self
                 .receiver
@@ -284,6 +300,34 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .filter_map(|t| t.get(1))
             .map(|s| s.to_ascii_lowercase())
             .collect();
+        if matches!(
+            app.kind,
+            MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_EDIT
+                | MARMOT_APP_EVENT_KIND_REMOVE
+        ) {
+            // Even an as-yet unseen reaction may already have been withdrawn.
+            // Edits/deletes bind to their actual MLS sender. A removal from
+            // any configured operator is a conservative objection, never proof
+            // of admin authority or a positive deletion/approval instruction.
+            self.receiver.record(serde_json::json!({
+                "schema":"semantic-removal.v1", "authenticated_candidate":candidate
+            }))?;
+            for target in &targets {
+                self.removals.insert((
+                    if app.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+                        None
+                    } else {
+                        Some(hex::encode(candidate.sender.as_slice()))
+                    },
+                    target.clone(),
+                ));
+            }
+        }
+        let removed = self.removals.contains(&(
+            Some(hex::encode(candidate.sender.as_slice())),
+            app.id.to_ascii_lowercase(),
+        )) || self.removals.contains(&(None, app.id.to_ascii_lowercase()));
         let command_id = if app.kind == MARMOT_APP_EVENT_KIND_CHAT {
             let mut words = app.content.split_whitespace();
             match (words.next(), words.next()) {
@@ -301,16 +345,20 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                     || targets
                         .iter()
                         .any(|t| r.app_ids.iter().any(|id| id.eq_ignore_ascii_case(t)))
-                    || (app.kind == MARMOT_APP_EVENT_KIND_DELETE
-                        && r.receipt.as_ref().is_some_and(|r| {
-                            r.operator == candidate.sender
-                                && targets.iter().any(|t| {
-                                    r.authenticated_candidate
-                                        .application
-                                        .id
-                                        .eq_ignore_ascii_case(t)
-                                })
-                        }))
+                    || (matches!(
+                        app.kind,
+                        MARMOT_APP_EVENT_KIND_DELETE
+                            | MARMOT_APP_EVENT_KIND_EDIT
+                            | MARMOT_APP_EVENT_KIND_REMOVE
+                    ) && r.receipt.as_ref().is_some_and(|r| {
+                        (r.operator == candidate.sender || app.kind == MARMOT_APP_EVENT_KIND_REMOVE)
+                            && targets.iter().any(|t| {
+                                r.authenticated_candidate
+                                    .application
+                                    .id
+                                    .eq_ignore_ascii_case(t)
+                            })
+                    }))
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -325,6 +373,8 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             app.kind == MARMOT_APP_EVENT_KIND_REACTION && targets.len() == 1 && matches.len() == 1;
         let decision = emoji_action(&app.content);
         if !supported_reaction
+            || decision.is_none()
+            || removed
             || (self.asks[&matches[0]].receipt.is_some() || self.asks[&matches[0]].conflicted)
         {
             self.receiver

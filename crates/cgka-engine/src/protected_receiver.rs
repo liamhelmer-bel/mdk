@@ -5,8 +5,8 @@ use crate::Engine;
 use cgka_traits::{
     EngineError,
     app_event::{
-        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_REACTION,
-        MarmotAppEvent,
+        MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+        MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_REMOVE, MarmotAppEvent,
     },
     engine::{CgkaEngine, GroupEvent},
     ingest::IngestOutcome,
@@ -120,9 +120,10 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         if encoded.len() > MAX_WIRE {
             return Err(ReceiverHold::Capacity);
         }
-        // Refuse bounded resource exhaustion before touching native state. Reserve
-        // the largest permitted outcome as well as this exact wire record. A real
-        // filesystem failure can still hold; there is no lifetime journal cap.
+        // Check representable file lengths before native state changes. This is
+        // arithmetic validation, NOT disk reservation: a later write/fsync may
+        // fail after native mutation and must HOLD without blind replay. There
+        // is no lifetime journal cap or promise of available disk capacity.
         let available = self
             .journal
             .metadata()
@@ -188,6 +189,8 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                         MARMOT_APP_EVENT_KIND_CHAT
                             | MARMOT_APP_EVENT_KIND_REACTION
                             | MARMOT_APP_EVENT_KIND_DELETE
+                            | MARMOT_APP_EVENT_KIND_EDIT
+                            | MARMOT_APP_EVENT_KIND_REMOVE
                     ) {
                         continue;
                     }

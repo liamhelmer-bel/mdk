@@ -475,3 +475,144 @@ async fn oversized_pre_effect_input_does_not_lock_factory_or_consume_original() 
     f.consume("ask3", &digest(b"exact source-only operation"))
         .unwrap();
 }
+
+#[tokio::test]
+async fn removal_before_original_approval_is_retained_and_blocks_only_its_ask() {
+    let (mut f, mut operator, file, _) = fixture().await;
+    f.post(original("ask3", &f.receiver.group)).await.unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let approval = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![vec!["e".into(), target.clone()]],
+        "👍",
+    );
+    // Native MLS sender generates approval first, but relay delivers its later
+    // withdrawal first. Both wires go through the actual native decrypt path.
+    let late_approval = reaction(&mut operator, &f, &target, "👍").await;
+    let removal = app_wire(
+        &mut operator,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".into(), approval.id.to_ascii_uppercase()]],
+        "",
+    )
+    .await;
+    assert_eq!(f.ingest(removal).await.unwrap(), None);
+    assert!(!f.held);
+    assert!(
+        std::fs::read_to_string(file.path())
+            .unwrap()
+            .contains("semantic-removal.v1")
+    );
+    assert_eq!(f.ingest(late_approval).await.unwrap(), None);
+    assert!(f.asks["ask3"].conflicted);
+    assert!(f.asks["ask3"].receipt.is_none());
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    approve(&mut f, &mut operator, "ask2").await;
+    f.consume("ask2", &digest(b"exact source-only operation"))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn objection_before_positive_reaction_remains_terminal_and_order_independent() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    f.post(original("ask3", &f.receiver.group)).await.unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let objection = reaction(&mut operator, &f, &target, "🛑").await;
+    assert_eq!(f.ingest(objection).await.unwrap(), None);
+    assert!(f.asks["ask3"].conflicted);
+    let positive = reaction(&mut operator, &f, &target, "👍").await;
+    assert_eq!(f.ingest(positive).await.unwrap(), None);
+    assert!(f.asks["ask3"].receipt.is_none());
+    assert!(!f.held);
+}
+
+#[tokio::test]
+async fn hundred_scoped_terminal_conflicts_do_not_exhaust_unanswered_intake() {
+    let (mut f, mut operator, _, _) = fixture().await;
+    let alphabet = b"23456789abcdefghjkmnpqrstuvwxyz";
+    for i in 0..100 {
+        let id = format!(
+            "ab{}{}",
+            alphabet[i / alphabet.len()] as char,
+            alphabet[i % alphabet.len()] as char
+        );
+        f.post(original(&id, &f.receiver.group)).await.unwrap();
+        let objection = app_wire(
+            &mut operator,
+            &f,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            &format!("!answer {id} no"),
+        )
+        .await;
+        assert_eq!(f.ingest(objection).await.unwrap(), None);
+        assert!(f.asks[&id].conflicted);
+    }
+    assert_eq!(f.asks.len(), 100);
+    assert!(f.asks.values().all(|a| a.conflicted && a.receipt.is_none()));
+    approve(&mut f, &mut operator, "ask3").await;
+    f.consume("ask3", &digest(b"exact source-only operation"))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_outbound_inner_ids_refuse_before_journal_send_or_latch() {
+    let (mut f, mut operator, file, relay) = fixture().await;
+    let mut ask = original("ask3", &f.receiver.group);
+    ask.card_chunks = vec!["identical exact card".into(), "identical exact card".into()];
+    assert_eq!(f.post(ask).await.unwrap_err(), ReceiverHold::ChangedState);
+    assert!(!f.held);
+    assert!(!f.receiver.latched);
+    assert!(f.asks.is_empty());
+    assert!(relay.wires.lock().unwrap().is_empty());
+    assert_eq!(file.as_file().metadata().unwrap().len(), 0);
+    approve(&mut f, &mut operator, "ask2").await;
+    f.consume("ask2", &digest(b"exact source-only operation"))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn edit_and_operator_removal_before_or_after_approval_cannot_leave_it_usable() {
+    for kind in [MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_REMOVE] {
+        for before in [true, false] {
+            let (mut f, mut operator, _, _) = fixture().await;
+            f.post(original("ask3", &f.receiver.group)).await.unwrap();
+            let target = f.asks["ask3"].app_ids[0].clone();
+            let event = MarmotAppEvent::new(
+                hex::encode(operator.self_id().as_slice()),
+                1,
+                MARMOT_APP_EVENT_KIND_REACTION,
+                vec![vec!["e".into(), target.clone()]],
+                "👍",
+            );
+            let approval = reaction(&mut operator, &f, &target, "👍").await;
+            let objection = app_wire(
+                &mut operator,
+                &f,
+                kind,
+                vec![vec!["e".into(), event.id]],
+                "!answer ask3 no",
+            )
+            .await;
+            if before {
+                assert_eq!(f.ingest(objection).await.unwrap(), None);
+                assert_eq!(f.ingest(approval).await.unwrap(), None);
+            } else {
+                assert_eq!(f.ingest(approval).await.unwrap(), Some("ask3".into()));
+                assert_eq!(f.ingest(objection).await.unwrap(), None);
+            }
+            assert!(f.asks["ask3"].conflicted);
+            assert!(!f.held);
+            assert!(
+                f.consume("ask3", &digest(b"exact source-only operation"))
+                    .is_err()
+            );
+        }
+    }
+}
