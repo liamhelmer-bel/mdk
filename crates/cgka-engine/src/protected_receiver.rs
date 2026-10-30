@@ -224,3 +224,6 @@ pub(crate) fn capture_receiver_content(
     }
     Ok(())
 }
+
+#[path = "protected_semantic.rs"]
+mod semantic;

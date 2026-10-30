@@ -945,6 +945,8 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tracing",
+ "transport-nostr-adapter",
+ "transport-nostr-peeler",
  "web-time",
 ]
 

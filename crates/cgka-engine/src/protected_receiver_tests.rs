@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use storage_sqlite::SqliteAccountStorage;
 use tls_codec::Serialize as _;
 
-fn key(seed: &[u8]) -> k256::schnorr::SigningKey {
+pub(super) fn key(seed: &[u8]) -> k256::schnorr::SigningKey {
     for counter in 0u64.. {
         let mut hash = Sha256::new();
         hash.update(seed);
@@ -31,7 +31,7 @@ fn key(seed: &[u8]) -> k256::schnorr::SigningKey {
 fn pad32(seed: &[u8]) -> Vec<u8> {
     key(seed).verifying_key().to_bytes().to_vec()
 }
-fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
+pub(super) fn build_client(seed: &[u8]) -> (Engine<SqliteAccountStorage>, SqliteAccountStorage) {
     let storage = SqliteAccountStorage::in_memory().unwrap();
     let engine = EngineBuilder::new(storage.clone())
         .legacy_compatibility_profile()
