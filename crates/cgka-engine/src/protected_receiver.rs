@@ -159,17 +159,19 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                     payload,
                     ..
                 } if group_id == self.group && Some(&message_id) == content_id.as_ref() => {
+                    // Eligibility derives from the authenticated MLS credential. An
+                    // unrelated member's malformed inner event is not operator input.
+                    if sender == self.engine.self_id() || !self.operators.contains(&sender) {
+                        continue;
+                    }
                     let app =
                         MarmotAppEvent::decode(&payload).map_err(|_| ReceiverHold::Malformed)?;
                     app.validate_sender(&hex::encode(sender.as_slice()))
                         .map_err(|_| ReceiverHold::Malformed)?;
-                    if sender == self.engine.self_id()
-                        || !self.operators.contains(&sender)
-                        || !matches!(
-                            app.kind,
-                            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-                        )
-                    {
+                    if !matches!(
+                        app.kind,
+                        MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+                    ) {
                         continue;
                     }
                     if candidate.is_some() {

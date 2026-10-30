@@ -233,12 +233,22 @@ async fn receiver_rejects_authentic_mls_with_forged_inner_operator_identity() {
     let wire = raw_app_message_with_payload(&storage, &alice.self_id(), &group, &payload);
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut receiver =
-        ProtectedReceiver::new(bob, group, vec![forged], file.reopen().unwrap()).unwrap();
-    let result = receiver.ingest(wire).await;
+        ProtectedReceiver::new(bob, group, vec![alice.self_id()], file.reopen().unwrap()).unwrap();
+    let result = receiver.ingest(wire.clone()).await;
     assert!(
-        !matches!(result, Ok(Some(_))),
-        "MLS leaf must override forged inner pubkey"
+        matches!(result, Ok(None)),
+        "native sender validation must reject without producing a candidate: {result:?}"
     );
+    assert_eq!(
+        records(&file)[1]["outcome"],
+        serde_json::json!({"Ignored":{"category":"InvalidEncoding"}})
+    );
+    assert!(records(&file)[1]["candidate"].is_null());
+    assert_eq!(
+        records(&file)[0]["wire"],
+        serde_json::to_value(&wire).unwrap()
+    );
+    assert!(!receiver.latched);
     assert!(
         records(&file)
             .iter()
@@ -331,4 +341,22 @@ async fn receiver_state_change_latches_without_returning_an_approval_candidate()
         1,
         "original retained; no fabricated completed outcome"
     );
+}
+
+#[tokio::test]
+async fn receiver_skips_authenticated_nonoperator_malformed_inner_without_latching() {
+    let (alice, storage, bob, group) = fixture().await;
+    let wire =
+        raw_app_message_with_payload(&storage, &alice.self_id(), &group, b"not an inner event");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut receiver = ProtectedReceiver::new(
+        bob,
+        group,
+        vec![MemberId::new(pad32(b"other"))],
+        file.reopen().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(receiver.ingest(wire).await, Ok(None)));
+    assert!(!receiver.latched);
+    assert!(records(&file)[1]["candidate"].is_null());
 }
