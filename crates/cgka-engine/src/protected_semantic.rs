@@ -23,7 +23,7 @@ fn digest(bytes: &[u8]) -> String {
 
 /// Source-owned producer input, never deserialized as authority. Original bytes
 /// are retained, not reconstructed from a summary. Rendering enrollment is separate.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct OriginalAsk {
     ask_id: String,
     expected_group: cgka_traits::types::GroupId,

@@ -405,3 +405,32 @@ pub(crate) fn catalog_terminal_fixture(j: &mut Journal, index: u64, policy: &str
     );
     id
 }
+
+#[test]
+fn consumed_export_key_is_native_anchored_generation_bound_and_survives_reopen() {
+    let first = tempfile::tempdir().unwrap();
+    let mut a = Journal::enroll(files(first.path()), enrollment()).unwrap();
+    let old = card(&mut a);
+    assert!(a.consumed_key("ask3", &"aa".repeat(32)).is_err());
+    a.write(Body::Consumed { key: old.clone() }).unwrap();
+    assert_eq!(a.consumed_key("ask3", &"aa".repeat(32)).unwrap(), old);
+    drop(a);
+    let a = Journal::reopen(files(first.path()), &enrollment()).unwrap();
+    assert_eq!(a.consumed_key("ask3", &"aa".repeat(32)).unwrap(), old);
+    let second = tempfile::tempdir().unwrap();
+    let mut b = Journal::enroll(files(second.path()), enrollment()).unwrap();
+    let current = card(&mut b);
+    assert_ne!(current.header_sha256, old.header_sha256);
+    assert_eq!(current.card_complete_sequence, old.card_complete_sequence);
+    assert!(b.write(Body::Consumed { key: old }).is_err());
+    assert!(b.consumed_key("ask3", &"aa".repeat(32)).is_err());
+    b.write(Body::Consumed {
+        key: current.clone(),
+    })
+    .unwrap();
+    assert_eq!(b.consumed_key("ask3", &"aa".repeat(32)).unwrap(), current);
+    assert!(b.consumed_key("ask3", &"bb".repeat(32)).is_err());
+    assert!(b.write(Body::Consumed { key: current }).is_err());
+    b.latched = true;
+    assert!(b.consumed_key("ask3", &"aa".repeat(32)).is_err());
+}

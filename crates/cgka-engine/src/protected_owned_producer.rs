@@ -101,23 +101,28 @@ fn identity(file: &File) -> Result<Identity, ReceiverHold> {
         ctime_ns: m.ctime_nsec(),
     })
 }
-fn read_profile(file: &File) -> Result<Profile, ReceiverHold> {
+pub(super) fn read_retained(file: &File, limit: u64) -> Result<Vec<u8>, ReceiverHold> {
     let before = identity(file)?;
-    if before.size == 0 || before.size > 32768 {
+    if before.size == 0 || before.size > limit {
         return Err(ReceiverHold::Configuration);
     }
     let mut raw = vec![0; usize::try_from(before.size).map_err(|_| ReceiverHold::Configuration)?];
     file.read_exact_at(&mut raw, 0)
         .map_err(|_| ReceiverHold::Configuration)?;
+    if before != identity(file)? {
+        return Err(ReceiverHold::ChangedState);
+    }
+    Ok(raw)
+}
+fn read_profile(file: &File) -> Result<Profile, ReceiverHold> {
+    let raw = read_retained(file, 32768)?;
     let value: Profile = serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
-    if before != identity(file)?
-        || value.schema != "heterodyne-owned-card-profile.v1"
-        || !value.targets.is_array()
-    {
+    if value.schema != "heterodyne-owned-card-profile.v1" || !value.targets.is_array() {
         return Err(ReceiverHold::Configuration);
     }
     Ok(value)
 }
+
 impl InstalledProducer {
     fn check(&self) -> Result<(), ReceiverHold> {
         if !self.python.is_absolute()
@@ -125,6 +130,11 @@ impl InstalledProducer {
             || !self.purelib.is_absolute()
             || self.closure.is_empty()
             || !self.closure.iter().any(|(p, _)| p == &self.python)
+            || !self.closure.iter().any(|(p, _)| {
+                p == &self
+                    .source
+                    .join("heterodyne/actions/deployment_producer_process.py")
+            })
         {
             return Err(ReceiverHold::Configuration);
         }

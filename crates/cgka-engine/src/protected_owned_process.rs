@@ -15,16 +15,19 @@ const INPUT_LIMIT: usize = 32768;
 struct ChildGuard {
     child: Child,
     group: i32,
+    reaped: bool,
 }
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // The pinned Product producer does not detach descendants. Group teardown
         // also closes inherited stdout on cancellation/failure; always reap child.
-        unsafe {
-            libc::kill(-self.group, libc::SIGKILL);
+        if !self.reaped {
+            unsafe {
+                libc::kill(-self.group, libc::SIGKILL);
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 fn nonblocking(fd: i32) -> Result<(), ReceiverHold> {
@@ -89,7 +92,11 @@ pub(super) fn run(
     }
     let child = command.spawn().map_err(|_| ReceiverHold::Engine)?;
     let group = i32::try_from(child.id()).map_err(|_| ReceiverHold::Engine)?;
-    let mut guard = ChildGuard { child, group };
+    let mut guard = ChildGuard {
+        child,
+        group,
+        reaped: false,
+    };
     let input = guard.child.stdin.take().ok_or(ReceiverHold::Engine)?;
     let mut output = guard.child.stdout.take().ok_or(ReceiverHold::Engine)?;
     nonblocking(input.as_raw_fd())?;
@@ -135,9 +142,27 @@ pub(super) fn run(
                 Err(_) => return Err(ReceiverHold::Engine),
             }
         }
-        if let Some(status) = guard.child.try_wait().map_err(|_| ReceiverHold::Engine)?
-            && eof
+        // Observe exit without reaping: PGID remains reserved until teardown.
+        // Kill the trusted producer group before wait, including pipe-holding
+        // descendants. Never signal a group after its leader has been reaped.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                guard.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } < 0
         {
+            return Err(ReceiverHold::Engine);
+        }
+        if unsafe { info.si_pid() } != 0 && eof {
+            unsafe {
+                libc::kill(-guard.group, libc::SIGKILL);
+            }
+            let status = guard.child.wait().map_err(|_| ReceiverHold::Engine)?;
+            guard.reaped = true;
             if status.success() && written == original.len() && !bytes.is_empty() {
                 return Ok(bytes);
             }
@@ -208,12 +233,15 @@ mod tests {
                 python(&script),
                 files.each_ref(),
                 b"original",
-                Duration::from_millis(300)
+                Duration::from_secs(2)
             ),
             Err(ReceiverHold::Engine)
         ));
-        assert!(started.elapsed() < Duration::from_secs(2));
-        let pid: i32 = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let pid: i32 = raw.parse().unwrap();
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),

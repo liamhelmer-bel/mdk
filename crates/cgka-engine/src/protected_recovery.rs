@@ -41,7 +41,7 @@ pub(super) struct Enrollment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct UseKey {
+pub(super) struct UseKey {
     header_sha256: String,
     card_complete_sequence: u64,
     ask_id: String,
@@ -701,6 +701,32 @@ impl Journal {
             }
         }
         operation.ok_or(Hold::Changed)
+    }
+
+    /// Return only the exact positively anchored one-use record, never a
+    /// candidate sequence or a caller-created generation/card projection.
+    pub(super) fn consumed_key(&self, ask: &str, operation: &str) -> Result<UseKey> {
+        if self.latched {
+            return Err(Hold::Latched);
+        }
+        let expected = self.source_card(ask, operation)?;
+        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
+        let mut reader = BufReader::new(&self.files.journal);
+        let mut found = false;
+        while let Some(record) = next::<Record>(&mut reader)? {
+            if let Body::Consumed { key } = record.body
+                && key.ask_id == ask
+            {
+                if found || key != expected {
+                    return Err(Hold::Changed);
+                }
+                found = true;
+            }
+        }
+        if !found {
+            return Err(Hold::Changed);
+        }
+        Ok(expected)
     }
 
     fn source_card(&self, ask: &str, operation: &str) -> Result<UseKey> {

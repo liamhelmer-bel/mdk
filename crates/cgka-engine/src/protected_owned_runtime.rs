@@ -47,26 +47,7 @@ fn inherited(fd: i32) -> Result<File, ReceiverHold> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 fn read(file: &File, limit: u64) -> Result<Vec<u8>, ReceiverHold> {
-    let m = file.metadata().map_err(|_| ReceiverHold::Configuration)?;
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-    if !m.is_file()
-        || m.nlink() != 1
-        || m.mode() & 0o777 != 0o400
-        || m.len() == 0
-        || m.len() > limit
-        || flags < 0
-        || flags & libc::O_ACCMODE != libc::O_RDONLY
-    {
-        return Err(ReceiverHold::Configuration);
-    }
-    let mut raw = Vec::new();
-    file.take(limit + 1)
-        .read_to_end(&mut raw)
-        .map_err(|_| ReceiverHold::Configuration)?;
-    if raw.len() as u64 != m.len() {
-        return Err(ReceiverHold::ChangedState);
-    }
-    Ok(raw)
+    owned_producer::read_retained(file, limit)
 }
 struct Signer(nostr::Keys);
 impl crate::account_identity_proof::AccountIdentityProofSigner for Signer {
@@ -109,24 +90,46 @@ pub(crate) fn entry() -> bool {
         {
             return Err(ReceiverHold::Configuration);
         }
+        // Claim every inherited slot before Tokio can allocate epoll/eventfd into
+        // a missing descriptor number. No runtime owns any of these slots yet.
+        let files: [File; 15] = (4..=18)
+            .map(inherited)
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| ReceiverHold::Configuration)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|_| ReceiverHold::Engine)?;
-        rt.block_on(run(profile, digest(&raw)))
+        rt.block_on(run(profile, digest(&raw), files))
     })();
     result.is_ok()
 }
-async fn run(profile: Profile, profile_sha: String) -> Result<(), ReceiverHold> {
+async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result<(), ReceiverHold> {
     let enrollment_sha =
         digest(&serde_json::to_vec(&profile.enrollment).map_err(|_| ReceiverHold::Malformed)?);
     let closure_sha = digest(
         &serde_json::to_vec(&profile.producer_closure).map_err(|_| ReceiverHold::Malformed)?,
     );
     // Retain all custody handles through SDK shutdown, not merely through reopen.
-    let key_file = inherited(4)?;
-    let dbkey_file = inherited(5)?;
+    let [
+        key_file,
+        dbkey_file,
+        journal_file,
+        journal_dir,
+        lease,
+        anchor,
+        anchor_dir,
+        expiry,
+        cache,
+        producer_profile,
+        archive,
+        commit,
+        account_dir,
+        peer_file,
+        original_file,
+    ] = files;
     let mut key = read(&key_file, 64)?;
     let mut dbkey = read(&dbkey_file, 64)?;
     if key.len() != 32 || dbkey.len() != 32 {
@@ -137,19 +140,6 @@ async fn run(profile: Profile, profile_sha: String) -> Result<(), ReceiverHold> 
     if keys.public_key().to_hex() != profile.enrollment.account {
         return Err(ReceiverHold::ChangedState);
     }
-    let journal_file = inherited(6)?;
-    let journal_dir = inherited(7)?;
-    let lease = inherited(8)?;
-    let anchor = inherited(9)?;
-    let anchor_dir = inherited(10)?;
-    let expiry = inherited(11)?;
-    let cache = inherited(12)?;
-    let producer_profile = inherited(13)?;
-    let archive = inherited(14)?;
-    let commit = inherited(15)?;
-    let account_dir = inherited(16)?;
-    let peer_file = inherited(17)?;
-    let original_file = inherited(18)?;
     let dir = account_dir
         .metadata()
         .map_err(|_| ReceiverHold::Configuration)?;
@@ -206,8 +196,12 @@ async fn run(profile: Profile, profile_sha: String) -> Result<(), ReceiverHold> 
         return Err(ReceiverHold::Configuration);
     }
     dbkey.fill(0);
-    let storage =
-        SqliteAccountStorage::open_encrypted(db_path, &sqlkey).map_err(|_| ReceiverHold::Engine)?;
+    let storage = SqliteAccountStorage::open_encrypted(&db_path, &sqlkey)
+        .map_err(|_| ReceiverHold::Engine)?;
+    let reopened = std::fs::metadata(&db_path).map_err(|_| ReceiverHold::ChangedState)?;
+    if reopened.dev() != db_meta.dev() || reopened.ino() != db_meta.ino() {
+        return Err(ReceiverHold::ChangedState);
+    }
     let engine = EngineBuilder::new(storage)
         .identity(keys.public_key().to_bytes().to_vec())
         .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
@@ -253,104 +247,23 @@ async fn run(profile: Profile, profile_sha: String) -> Result<(), ReceiverHold> 
         &original,
         &group,
     )?;
-    let ask_id = ask.ask_id.clone();
-    let operation_sha = digest(&original);
-    let expected_ask = serde_json::to_value(&ask).map_err(|_| ReceiverHold::Malformed)?;
-    // Own the actual SDK notification receiver. Lag/error ends this task and
-    // prevents consumption; the generic application forwarder discards that error.
     let forwarder = forward(sdk.clone(), adapter.clone());
-    let result = async {
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            adapter.activate_account(TransportAccountActivation {
-                account_id: factory.receiver.engine.self_id(),
-                inbox_endpoints: profile.endpoints.clone(),
-                group_subscriptions: vec![TransportGroupSubscription {
-                    group_id: group,
-                    transport_group_id: profile.transport_group,
-                    endpoints: profile.endpoints,
-                }],
-                since: None,
-            }),
-        )
-        .await
-        .map_err(|_| ReceiverHold::Engine)?
-        .map_err(|_| ReceiverHold::Engine)?;
-        if !factory.catalog_has_ask(&ask_id)? {
-            tokio::time::timeout(Duration::from_secs(30), factory.post(ask))
-                .await
-                .map_err(|_| ReceiverHold::Engine)??;
-        }
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(u64::from(profile.wait_seconds));
-        loop {
-            if forwarder.is_finished() {
-                return Err(ReceiverHold::Engine);
-            }
-            // Drain every queued delivery before inspecting an approval. Coverage
-            // includes every endpoint of this activation, with no history floor.
-            let replay_complete = adapter
-                .account_subscription_eose(&factory.receiver.engine.self_id())
-                .await
-                .complete();
-            match tokio::time::timeout(Duration::from_millis(5), adapter.receive()).await {
-                Ok(Ok(Some(delivery))) => {
-                    if delivery.account_id != factory.receiver.engine.self_id() {
-                        return Err(ReceiverHold::ChangedState);
-                    }
-                    factory.ingest(delivery.message).await?;
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(ReceiverHold::Engine);
-                    }
-                    continue;
-                }
-                Ok(Ok(None)) | Ok(Err(_)) => return Err(ReceiverHold::Engine),
-                Err(_) => {}
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(ReceiverHold::Engine);
-            }
-            if !replay_complete {
-                continue;
-            }
-            factory.catalog_start()?;
-            factory.load_retained(&ask_id)?;
-            factory.expire()?;
-            let retained = factory
-                .asks
-                .get(&ask_id)
-                .ok_or(ReceiverHold::ChangedState)?;
-            let retained_original =
-                serde_json::to_value(&retained.original).map_err(|_| ReceiverHold::Malformed)?;
-            if retained_original != expected_ask {
-                return Err(ReceiverHold::ChangedState);
-            }
-            if retained.conflicted || retained.expired || retained.consumed {
-                return Err(ReceiverHold::ChangedState);
-            }
-            if retained.receipt.is_some() {
-                if forwarder.is_finished() {
-                    return Err(ReceiverHold::Engine);
-                }
-                let receipt = factory.consume(&ask_id, &operation_sha)?;
-                // Exact consumed source result over the already authenticated peer;
-                // a lost write is UNKNOWN, never unconsume or replay.
-                let response = Consumed {
-                    schema: "heterodyne-owned-consumed.v1",
-                    nonce_hex: hex::encode(nonce),
-                    startup_profile_sha256: &profile_sha,
-                    enrollment_sha256: &enrollment_sha,
-                    journal_profile_sha256: &journal_sha,
-                    producer_closure_sha256: &closure_sha,
-                    original: &retained_original,
-                    receipt,
-                };
-                let bytes = serde_json::to_vec(&response).map_err(|_| ReceiverHold::Malformed)?;
-                write_frame(&mut peer, &bytes)?;
-                return Ok(());
-            }
-        }
-    }
+    let result = exchange(
+        &mut factory,
+        &adapter,
+        &forwarder,
+        &mut peer,
+        Session {
+            ask,
+            transport_group: profile.transport_group,
+            wait_seconds: profile.wait_seconds,
+            profile_sha,
+            enrollment_sha,
+            journal_sha,
+            closure_sha,
+            nonce,
+        },
+    )
     .await;
     forwarder.abort();
     let _ = forwarder.await;
@@ -364,6 +277,148 @@ async fn run(profile: Profile, profile_sha: String) -> Result<(), ReceiverHold> 
     result
 }
 
+struct Session {
+    ask: OriginalAsk,
+    transport_group: Vec<u8>,
+    wait_seconds: u32,
+    profile_sha: String,
+    enrollment_sha: String,
+    journal_sha: String,
+    closure_sha: String,
+    nonce: [u8; 32],
+}
+/// Actual production activation/post/replay/consume/frame state machine.
+/// Parameters are private owned objects, not an external authority DTO.
+async fn exchange<S: StorageProvider + 'static>(
+    factory: &mut SemanticFactory<S>,
+    adapter: &NostrTransportAdapter,
+    forwarder: &tokio::task::JoinHandle<()>,
+    peer: &mut UnixStream,
+    session: Session,
+) -> Result<(), ReceiverHold> {
+    let ask = session.ask;
+    let ask_id = ask.ask_id.clone();
+    let operation_sha = digest(&ask.operation);
+    let expected_ask = serde_json::to_value(&ask).map_err(|_| ReceiverHold::Malformed)?;
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        adapter.activate_account(TransportAccountActivation {
+            account_id: factory.receiver.engine.self_id(),
+            inbox_endpoints: factory.endpoints.clone(),
+            group_subscriptions: vec![TransportGroupSubscription {
+                group_id: factory.receiver.group.clone(),
+                transport_group_id: session.transport_group,
+                endpoints: factory.endpoints.clone(),
+            }],
+            since: None,
+        }),
+    )
+    .await
+    .map_err(|_| ReceiverHold::Engine)?
+    .map_err(|_| ReceiverHold::Engine)?;
+    if !factory.catalog_has_ask(&ask_id)? {
+        tokio::time::timeout(Duration::from_secs(30), factory.post(ask))
+            .await
+            .map_err(|_| ReceiverHold::Engine)??;
+    }
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(u64::from(session.wait_seconds));
+    let mut inspect = true;
+    let mut next_inspection = tokio::time::Instant::now();
+    let mut oversized = 0u64;
+    loop {
+        if forwarder.is_finished() {
+            return Err(ReceiverHold::Engine);
+        }
+        // Drain every queued delivery before inspecting an approval. Coverage
+        // includes every endpoint of this activation, with no history floor.
+        let replay_complete = adapter
+            .account_subscription_eose(&factory.receiver.engine.self_id())
+            .await
+            .complete();
+        let idle_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(1));
+        let wait = if inspect {
+            Duration::from_millis(5)
+        } else {
+            idle_deadline.saturating_duration_since(tokio::time::Instant::now())
+        };
+        match tokio::time::timeout(wait, adapter.receive()).await {
+            Ok(Ok(Some(delivery))) => {
+                if delivery.account_id != factory.receiver.engine.self_id() {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                match factory.ingest(delivery.message).await {
+                    Ok(_) => {}
+                    Err(ReceiverHold::Capacity) if !factory.held && !factory.receiver.latched => {
+                        oversized = oversized.saturating_add(1);
+                        tracing::debug!(oversized, "ignored pre-effect oversized relay input");
+                    }
+                    Err(error) => return Err(error),
+                }
+                inspect = true;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ReceiverHold::Engine);
+                }
+                continue;
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => return Err(ReceiverHold::Engine),
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ReceiverHold::Engine);
+        }
+        if !replay_complete || (!inspect && tokio::time::Instant::now() < next_inspection) {
+            inspect = false;
+            continue;
+        }
+        inspect = false;
+        next_inspection = tokio::time::Instant::now() + Duration::from_secs(1);
+        factory.catalog_start()?;
+        factory.load_retained(&ask_id)?;
+        factory.expire()?;
+        let retained = factory
+            .asks
+            .get(&ask_id)
+            .ok_or(ReceiverHold::ChangedState)?;
+        let retained_original =
+            serde_json::to_value(&retained.original).map_err(|_| ReceiverHold::Malformed)?;
+        if retained_original != expected_ask {
+            return Err(ReceiverHold::ChangedState);
+        }
+        if retained.conflicted || retained.expired || retained.consumed {
+            return Err(ReceiverHold::ChangedState);
+        }
+        if retained.receipt.is_some() {
+            if forwarder.is_finished() {
+                return Err(ReceiverHold::Engine);
+            }
+            factory.consume(&ask_id, &operation_sha)?;
+            let consumption_key = consumed_key(factory, &ask_id, &operation_sha)?;
+            let receipt = factory.asks[&ask_id]
+                .receipt
+                .as_ref()
+                .ok_or(ReceiverHold::ChangedState)?;
+            // Exact consumed source result over the already authenticated peer;
+            // a lost write is UNKNOWN, never unconsume or replay.
+            let response = Consumed {
+                schema: "heterodyne-owned-consumed.v1",
+                nonce_hex: hex::encode(session.nonce),
+                startup_profile_sha256: &session.profile_sha,
+                enrollment_sha256: &session.enrollment_sha,
+                journal_profile_sha256: &session.journal_sha,
+                producer_closure_sha256: &session.closure_sha,
+                original: &retained_original,
+                consumption_key,
+                receipt,
+            };
+            let bytes = serde_json::to_vec(&response).map_err(|_| ReceiverHold::Malformed)?;
+            write_frame(peer, &bytes)?;
+            return Ok(());
+        }
+    }
+}
+
 /// Private wire, not a deserializable approval constructor. The peer owns the
 /// nonce and independently compares exact retained originals and enrolled pins.
 #[derive(Serialize)]
@@ -375,7 +430,21 @@ struct Consumed<'a> {
     journal_profile_sha256: &'a str,
     producer_closure_sha256: &'a str,
     original: &'a serde_json::Value,
+    consumption_key: crate::protected_recovery::UseKey,
     receipt: &'a SemanticReceipt,
+}
+
+fn consumed_key<S: StorageProvider + 'static>(
+    factory: &SemanticFactory<S>,
+    ask: &str,
+    operation: &str,
+) -> Result<crate::protected_recovery::UseKey, ReceiverHold> {
+    match &factory.receiver.journal {
+        crate::protected_receiver::ReceiverJournal::Ordered(journal) => journal
+            .consumed_key(ask, operation)
+            .map_err(|_| ReceiverHold::ChangedState),
+        _ => Err(ReceiverHold::ChangedState),
+    }
 }
 
 fn write_frame(peer: &mut UnixStream, bytes: &[u8]) -> Result<(), ReceiverHold> {
@@ -387,8 +456,14 @@ fn write_frame(peer: &mut UnixStream, bytes: &[u8]) -> Result<(), ReceiverHold> 
         .map_err(|_| ReceiverHold::Engine)
 }
 fn forward(sdk: nostr_sdk::Client, adapter: NostrTransportAdapter) -> tokio::task::JoinHandle<()> {
-    let mut notifications = sdk.notifications();
+    forward_notifications(sdk.notifications(), adapter)
+}
+fn forward_notifications(
+    mut notifications: tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>,
+    adapter: NostrTransportAdapter,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut rejected = 0u64;
         while let Ok(notification) = notifications.recv().await {
             match notification {
                 nostr_sdk::RelayPoolNotification::Event {
@@ -399,18 +474,23 @@ fn forward(sdk: nostr_sdk::Client, adapter: NostrTransportAdapter) -> tokio::tas
                     let Ok(event) =
                         transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&event)
                     else {
-                        break;
+                        rejected = rejected.saturating_add(1);
+                        tracing::debug!(rejected, "ignored invalid relay DTO");
+                        continue;
                     };
-                    if adapter
+                    if let Err(error) = adapter
                         .handle_relay_event(transport_nostr_adapter::NostrRelayEvent {
                             endpoint: TransportEndpoint(relay_url.to_string()),
                             subscription_id: Some(subscription_id.to_string()),
                             event,
                         })
                         .await
-                        .is_err()
                     {
-                        break;
+                        if matches!(error, cgka_traits::TransportAdapterError::Closed) {
+                            break;
+                        }
+                        rejected = rejected.saturating_add(1);
+                        tracing::debug!(rejected, "ignored invalid relay event");
                     }
                 }
                 nostr_sdk::RelayPoolNotification::Message {
@@ -437,6 +517,14 @@ mod tests {
     #[tokio::test]
     async fn real_native_consumed_receipt_frames_exact_original_and_nonce() {
         let (mut factory, mut operator, _, _) = super::super::tests::fixture().await;
+        let root = tempfile::tempdir().unwrap();
+        let (journal, _) = crate::protected_receiver::tests::ordered_fixture(
+            root.path(),
+            &factory.receiver.engine,
+            &factory.receiver.group,
+            &factory.receiver.operators,
+        );
+        factory.receiver.journal = crate::protected_receiver::ReceiverJournal::Ordered(journal);
         super::super::tests::approve(&mut factory, &mut operator, "ask3").await;
         let original = serde_json::to_value(&factory.asks["ask3"].original).unwrap();
         let expected_operator = operator.self_id();
@@ -445,9 +533,12 @@ mod tests {
         consumer.write_all(&nonce).unwrap();
         let mut challenge = [0u8; 32];
         receiver.read_exact(&mut challenge).unwrap();
-        let receipt = factory
-            .consume("ask3", &digest(b"exact source-only operation"))
-            .unwrap();
+        let operation = digest(b"exact source-only operation");
+        assert!(consumed_key(&factory, "ask3", &operation).is_err());
+        factory.consume("ask3", &operation).unwrap();
+        let consumption_key = consumed_key(&factory, "ask3", &operation).unwrap();
+        assert!(consumed_key(&factory, "ask3", &"ff".repeat(32)).is_err());
+        let receipt = factory.asks["ask3"].receipt.as_ref().unwrap();
         let response = Consumed {
             schema: "heterodyne-owned-consumed.v1",
             nonce_hex: hex::encode(challenge),
@@ -456,6 +547,7 @@ mod tests {
             journal_profile_sha256: &"02".repeat(32),
             producer_closure_sha256: &"03".repeat(32),
             original: &original,
+            consumption_key,
             receipt,
         };
         let bytes = serde_json::to_vec(&response).unwrap();
@@ -468,6 +560,35 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&actual).unwrap();
         assert_eq!(value["nonce_hex"], hex::encode(nonce));
         assert_eq!(value["original"], original);
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(root.path().join("receiver/journal"))
+                .unwrap()
+                .lines()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .collect();
+        let card = records
+            .iter()
+            .find(|r| r["body"]["kind"] == "card-complete")
+            .unwrap();
+        let consumed = records
+            .iter()
+            .find(|r| r["body"]["kind"] == "consumed")
+            .unwrap();
+        assert_eq!(value["consumption_key"], consumed["body"]["key"]);
+        assert_eq!(
+            value["consumption_key"]["header_sha256"],
+            records[0]["sha256"]
+        );
+        assert_eq!(
+            value["consumption_key"]["card_complete_sequence"],
+            card["sequence"]
+        );
+        assert_eq!(value["consumption_key"]["ask_id"], "ask3");
+        assert_eq!(
+            value["consumption_key"]["original_operation_sha256"],
+            operation
+        );
+
         assert_eq!(value["receipt"]["decision"], "Approve");
         assert_eq!(
             value["receipt"]["operator"],
@@ -500,6 +621,167 @@ mod tests {
         let file = unsafe { File::from_raw_fd(writer.into_raw_fd()) };
         assert!(checked_peer(file, unsafe { libc::geteuid() }).is_err());
     }
+    fn session(ask: OriginalAsk) -> Session {
+        Session {
+            ask,
+            transport_group: vec![7; 32],
+            wait_seconds: 2,
+            profile_sha: "00".repeat(32),
+            enrollment_sha: "01".repeat(32),
+            journal_sha: "02".repeat(32),
+            closure_sha: "03".repeat(32),
+            nonce: [0x61; 32],
+        }
+    }
+    fn notification(event: nostr::Event) -> nostr_sdk::RelayPoolNotification {
+        nostr_sdk::RelayPoolNotification::Event {
+            relay_url: "wss://semantic.invalid".parse().unwrap(),
+            subscription_id: nostr::SubscriptionId::new("fixture"),
+            event: Box::new(event),
+        }
+    }
+    #[tokio::test]
+    async fn owned_exchange_ignores_invalid_replay_and_oversize_then_consumes_after_eose() {
+        use nostr::{EventBuilder, Kind, Tag, TagKind};
+        let (mut factory, mut operator, root, relay) =
+            super::super::tests::finite_fixture_lifetime(60_000).await;
+        factory
+            .enable_catalog(super::super::tests::cache(root.path(), "owner-cache"))
+            .unwrap();
+        let ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
+        factory.post(ask.clone()).await.unwrap();
+        let target = factory.asks["ask3"].app_ids[0].clone();
+        let approval = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
+        let approval: nostr::Event = serde_json::from_slice(&approval.payload).unwrap();
+        let before = relay.wires.lock().unwrap().len();
+        let adapter = factory.transport.clone();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let forwarder = forward_notifications(rx, adapter.clone());
+        let (mut receiver, mut consumer) = UnixStream::pair().unwrap();
+        let mut before_eose = consumer.try_clone().unwrap();
+        let keepalive = tx.clone();
+        let driver = tokio::spawn(async move {
+            loop {
+                let subscriptions = relay.subscriptions.lock().unwrap().clone();
+                if subscriptions.len() >= 2 {
+                    let outsider = nostr::Keys::generate();
+                    let h = || Tag::custom(TagKind::custom("h"), [hex::encode([7; 32])]);
+                    let malformed = EventBuilder::new(Kind::MlsGroupMessage, "invalid")
+                        .tags([h(), Tag::custom(TagKind::custom("extra"), ["x"])])
+                        .sign_with_keys(&outsider)
+                        .unwrap();
+                    tx.send(notification(malformed)).unwrap();
+                    let oversized =
+                        EventBuilder::new(Kind::MlsGroupMessage, "A".repeat(1024 * 1024 + 1))
+                            .tags([h()])
+                            .sign_with_keys(&outsider)
+                            .unwrap();
+                    tx.send(notification(oversized)).unwrap();
+                    tx.send(notification(approval)).unwrap();
+                    // Do not let the genuine queued receipt bypass initial replay coverage.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    before_eose.set_nonblocking(true).unwrap();
+                    assert_eq!(
+                        before_eose.read(&mut [0]).unwrap_err().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    before_eose.set_nonblocking(false).unwrap();
+                    for subscription in subscriptions {
+                        tx.send(nostr_sdk::RelayPoolNotification::Message {
+                            relay_url: "wss://semantic.invalid".parse().unwrap(),
+                            message: nostr::RelayMessage::EndOfStoredEvents(
+                                std::borrow::Cow::Owned(nostr::SubscriptionId::new(
+                                    subscription.subscription_id(),
+                                )),
+                            ),
+                        })
+                        .unwrap();
+                    }
+                    return relay.wires.lock().unwrap().len();
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        exchange(
+            &mut factory,
+            &adapter,
+            &forwarder,
+            &mut receiver,
+            session(ask),
+        )
+        .await
+        .unwrap();
+        factory.load_retained("ask3").unwrap();
+        assert!(factory.asks["ask3"].consumed);
+        let mut size = [0; 4];
+        consumer.read_exact(&mut size).unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(size) as usize];
+        consumer.read_exact(&mut bytes).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(response["receipt"]["decision"], "Approve");
+        assert_eq!(response["consumption_key"]["ask_id"], "ask3");
+        assert!(!forwarder.is_finished());
+        // Existing retained card was not republished by the actual exchange path.
+        assert_eq!(before, 2);
+        assert_eq!(driver.await.unwrap(), before);
+        drop(keepalive);
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn owned_exchange_posts_once_but_no_eose_or_dead_forwarder_never_consumes() {
+        for closed in [false, true] {
+            let (mut factory, _, root, relay) =
+                super::super::tests::finite_fixture_lifetime(60_000).await;
+            factory
+                .enable_catalog(super::super::tests::cache(root.path(), "owner-cache"))
+                .unwrap();
+            let ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
+            let adapter = factory.transport.clone();
+            let (tx, rx) = tokio::sync::broadcast::channel(2);
+            let forwarder = forward_notifications(rx, adapter.clone());
+            if closed {
+                drop(tx);
+                tokio::task::yield_now().await;
+            }
+            let (mut receiver, mut consumer) = UnixStream::pair().unwrap();
+            assert!(
+                exchange(
+                    &mut factory,
+                    &adapter,
+                    &forwarder,
+                    &mut receiver,
+                    session(ask)
+                )
+                .await
+                .is_err()
+            );
+            assert!(!factory.asks["ask3"].consumed);
+            assert_eq!(relay.wires.lock().unwrap().len(), 2);
+            consumer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                consumer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            forwarder.abort();
+        }
+    }
+    #[tokio::test]
+    async fn owned_notification_lag_and_shutdown_end_forwarder() {
+        for lag in [false, true] {
+            let (factory, _, _, _) = super::super::tests::fixture().await;
+            let (tx, rx) = tokio::sync::broadcast::channel(1);
+            let forwarder = forward_notifications(rx, factory.transport.clone());
+            for _ in 0..if lag { 3 } else { 1 } {
+                tx.send(nostr_sdk::RelayPoolNotification::Shutdown).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(1), forwarder)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     #[test]
     fn frame_limit_refuses_without_any_peer_bytes() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();

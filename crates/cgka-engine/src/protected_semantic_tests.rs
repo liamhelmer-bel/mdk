@@ -14,12 +14,17 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 #[derive(Default)]
 pub(super) struct Relay {
-    wires: Mutex<Vec<TransportMessage>>,
+    pub(super) wires: Mutex<Vec<TransportMessage>>,
+    pub(super) subscriptions: Mutex<Vec<NostrSubscription>>,
     fail_at: Mutex<Option<usize>>,
 }
 #[async_trait::async_trait]
 impl NostrRelayClient for Relay {
-    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
     async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
@@ -134,7 +139,7 @@ pub(super) async fn fixture() -> (
         relay,
     )
 }
-fn original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
+pub(super) fn original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
     OriginalAsk {
         ask_id: id.into(),
         expected_group: group.clone(),
@@ -147,7 +152,7 @@ fn original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
         ],
     }
 }
-async fn reaction(
+pub(super) async fn reaction(
     operator: &mut Engine<SqliteAccountStorage>,
     factory: &SemanticFactory<SqliteAccountStorage>,
     target: &str,
@@ -685,7 +690,7 @@ async fn finite_fixture() -> (
     finite_fixture_lifetime(100).await
 }
 #[cfg(unix)]
-async fn finite_fixture_lifetime(
+pub(super) async fn finite_fixture_lifetime(
     lifetime: u64,
 ) -> (
     SemanticFactory<SqliteAccountStorage>,
@@ -717,7 +722,7 @@ async fn finite_fixture_lifetime(
     (f, op, root, relay)
 }
 #[cfg(unix)]
-fn finite_original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
+pub(super) fn finite_original(id: &str, group: &cgka_traits::types::GroupId) -> OriginalAsk {
     let mut ask = original(id, group);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -801,7 +806,7 @@ async fn absent_finite_operation_or_changed_actual_profile_refuses_before_publis
 }
 
 #[cfg(target_os = "linux")]
-fn cache(root: &std::path::Path, name: &str) -> std::fs::File {
+pub(super) fn cache(root: &std::path::Path, name: &str) -> std::fs::File {
     use std::os::unix::fs::DirBuilderExt;
     let path = root.join(name);
     std::fs::DirBuilder::new()

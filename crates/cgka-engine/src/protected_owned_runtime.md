@@ -48,7 +48,7 @@ The fixed account.sqlite3 basename must already exist, be regular/single-link,
 mode0600 with the receiver owner, and is inspected using openat+O_NOFOLLOW.
 
 The Product process uses the exact private `_entry` in Product source
-35650c0ced0f9e1e3b1e5cefe36d5485fec74837. Its interpreter and supplied import files
+35650c0ced0f9e1e3b1e5cefe36d5485fec74837. Its interpreter and supplied import files (including the required entry module)
 are hash-read before/after invocation. Complete immutable import/stdlib custody
 and interpreter installation are still enrollment prerequisites; these checks do
 not prove the manifest is complete. Python runs isolated without environment
@@ -73,6 +73,10 @@ native consume it sends a4-byte unsigned big-endian JSON length, then compact JS
   "enrollment_sha256":"<serde JSON Enrollment>",
   "journal_profile_sha256":"<actual reopened protected journal profile>",
   "producer_closure_sha256":"<serde JSON enrolled ordered closure list>",
+  "consumption_key":{
+    "header_sha256":"<actual journal header digest>", "card_complete_sequence":0,
+    "ask_id":"...", "original_operation_sha256":"<exact original packet>"
+  },
   "original":{
     "ask_id":"...", "expected_group":[0],
     "operation":"<hex original packet>",
@@ -102,6 +106,14 @@ An outer DeploymentPacket is not interchangeable with an inner native plan. Nati
 canonical operation envelopes must be derived/compared through the actual closed
 approved mapping, not reconstructed from a boolean or receipt digest alone.
 
+`consumption_key` is the exact native journal/anchor `Body::Consumed` key after
+positive durable consume: generation/header digest, actual original CardComplete
+record sequence, ask ID and original operation hash. Candidate `receipt.sequence`
+is a distinct ingress sequence and cannot replace this key. Export refuses an
+unconsumed, wrong-original or unbound journal. The consumer's one-use acceptance
+must use the complete native key, never infer generation or card completion from
+profile hashes or candidate sequence.
+
 The response follows consume. A lost/partial output remains UNKNOWN; it does not
 undo one-use state or authorize replay. A response is not a deployment permit on
 its own. The consumer's durable acceptance/antirollback anchor and exact owner
@@ -113,7 +125,11 @@ Subscriptions cover both current account inbox and group at every enrolled
 endpoint, without a history floor. Every endpoint must report EOSE for the current
 activation. The owner drains queued deliveries before inspecting approval. The
 owner uses the actual SDK notification receiver directly: notification lag/error,
-conversion or adapter error, or shutdown ends the forwarder and prevents consume.
+notification channel closure or shutdown ends the forwarder and prevents consume.
+Individual invalid DTOs/transport events are skipped and counted before native
+ingress, so replayed outsider junk cannot permanently stop initial replay. Only
+a definite non-latched pre-effect oversized ingress refusal is likewise skipped;
+all uncertain/native-state failures remain HOLD.
 This does not claim that EOSE proves human visibility or that unavailable relays
 have no future messages. The existing card's transport-gap disclosures remain.
 
@@ -155,3 +171,24 @@ simulator/bench examples, small canonical-base64/fd helper shape matches and
 short-horizon churn from access changes. No clean quality verdict is claimed;
 these structural findings are retained for review. The production signer uses
 the existing proof-event/signature APIs rather than implementing cryptography.
+
+
+Round-one repairs add actual production `exchange`/notification routing tests
+using real native MLS, finite expiry and disk catalog plus fixture relay endpoint
+ACK/EOSE. Signed malformed outsider replay and oversized native-boundary refusal
+precede a genuine operator reply; no response appears before EOSE and the retained
+card is not republished. Initial publication with missing EOSE/dead notification
+forwarder refuses without consuming; lag/Shutdown end the forwarder. Idle waits
+block on deliveries with a one-second expiry/readback timer rather than repeating
+catalog/storage I/O every5ms. Startup owns inherited descriptor slots before Tokio
+allocation; input readers share owner-checked positioned readback and post-open
+SQLite dev/inode comparison. Producer teardown observes exit with waitid WNOWAIT,
+kills its still-reserved process group, then reaps, never kills a reused PGID.
+These are source qualification, not an installed account/producer/consumer run.
+
+The supplied mutable anchor FD is source-only journal durability mechanics. It
+does not qualify the approved independent guarded-consumer anchor service or its
+authenticated protected-peer custody. A root-opened separate file or backup
+exclusion alone does not establish independent consumer ownership. In particular,
+a receiver-owned/co-restorable anchor cannot satisfy the approved design. Actual
+consumer-owned anchor protocol/custody remains a deployment prerequisite.
