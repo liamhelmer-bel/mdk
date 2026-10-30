@@ -29,7 +29,7 @@ use cgka_traits::engine::{CreateGroupRequest, SendResult};
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 
-fn intent(root: &std::path::Path) -> JoinIntent {
+pub(crate) fn intent(root: &std::path::Path) -> JoinIntent {
     JoinIntent {
         file: OpenOptions::new()
             .create_new(true)
@@ -41,7 +41,7 @@ fn intent(root: &std::path::Path) -> JoinIntent {
         directory: File::open(root).unwrap(),
     }
 }
-async fn invitation() -> (
+pub(crate) async fn invitation() -> (
     Engine<storage_sqlite::SqliteAccountStorage>,
     storage_sqlite::SqliteAccountStorage,
     TransportMessage,
@@ -176,7 +176,7 @@ async fn intent_permissions_are_checked_before_consuming_welcome() {
     );
 }
 
-fn recovery_files(root: &std::path::Path) -> crate::protected_recovery::OwnedFiles {
+pub(crate) fn recovery_files(root: &std::path::Path) -> crate::protected_recovery::OwnedFiles {
     let receiver = root.join("receiver");
     let consumer = root.join("consumer");
     std::fs::create_dir_all(&receiver).unwrap();

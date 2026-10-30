@@ -111,3 +111,9 @@ mod protected_join;
 pub fn protected_receiver_process_main() -> bool {
     protected_receiver::semantic::owned_runtime::entry()
 }
+
+/// Fixed fresh live-Welcome entry; descriptor enrollment/custody is not installed.
+#[cfg(all(target_os = "linux", feature = "protected-owner-runtime"))]
+pub fn protected_receiver_enroll_main() -> bool {
+    protected_receiver::semantic::owned_runtime::enroll_entry()
+}

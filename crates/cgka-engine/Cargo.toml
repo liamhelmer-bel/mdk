@@ -91,3 +91,8 @@ harness = false
 name = "heterodyne-protected-receiver"
 path = "src/bin/protected_receiver.rs"
 required-features = ["protected-owner-runtime"]
+
+[[bin]]
+name = "heterodyne-protected-receiver-enroll"
+path = "src/bin/protected_receiver_enroll.rs"
+required-features = ["protected-owner-runtime"]

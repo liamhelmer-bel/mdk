@@ -146,4 +146,4 @@ impl<S: StorageProvider + 'static> Engine<S> {
 
 #[cfg(test)]
 #[path = "protected_join_tests.rs"]
-mod tests;
+pub(crate) mod tests;

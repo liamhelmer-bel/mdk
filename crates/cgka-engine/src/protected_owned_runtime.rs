@@ -957,3 +957,9 @@ fn checked_peer(peer_file: File, consumer_uid: u32) -> Result<UnixStream, Receiv
     peer.peer_addr().map_err(|_| ReceiverHold::Configuration)?;
     Ok(peer)
 }
+
+#[path = "protected_owned_enroll.rs"]
+mod enroll;
+pub(crate) fn enroll_entry() -> bool {
+    enroll::entry()
+}

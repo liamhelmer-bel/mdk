@@ -270,6 +270,18 @@ impl SourceCursor {
 }
 
 impl Journal {
+    /// Preflight and retain exact fresh descriptor locks before any native join.
+    /// This verifies mechanics, not protected publisher or independent custody.
+    pub(super) fn prepare_fresh(files: OwnedFiles) -> Result<OwnedFiles> {
+        let files = checked_files(files)?;
+        if io(files.journal.metadata())?.len() != 0 || io(files.anchor.metadata())?.len() != 0 {
+            return Err(Hold::Changed);
+        }
+        io(files.journal_directory.sync_all())?;
+        io(files.anchor_directory.sync_all())?;
+        Ok(files)
+    }
+
     pub(super) fn enroll(files: OwnedFiles, mut enrollment: Enrollment) -> Result<Self> {
         enrollment.operators.sort();
         if enrollment.operators.is_empty()
@@ -537,6 +549,13 @@ impl Journal {
     pub(super) fn header_hash(&self) -> &str {
         &self.header_digest
     }
+    pub(super) fn header_digest(&self) -> Result<String> {
+        if self.latched {
+            return Err(Hold::Latched);
+        }
+        Ok(self.header_digest.clone())
+    }
+
     pub(super) fn checkpoint(&self) -> (u64, String) {
         (self.sequence, self.digest.clone())
     }
@@ -859,7 +878,7 @@ impl Journal {
         Err(Hold::Changed)
     }
 }
-fn valid_group(value: &str) -> bool {
+pub(super) fn valid_group(value: &str) -> bool {
     matches!(value.len(), 32 | 64)
         && value
             .bytes()
