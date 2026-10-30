@@ -509,3 +509,29 @@ pub(crate) fn key_package_ref(wire: &TransportMessage) -> String {
     };
     hex::encode(welcome.secrets()[0].new_member().as_slice())
 }
+
+#[tokio::test]
+async fn oversized_preintent_input_is_rejected_then_real_welcome_joins() {
+    let (mut engine, storage, wire, _, _) = invitation().await;
+    let root = tempfile::tempdir().unwrap();
+    let intent = intent(root.path());
+    let mut oversized = wire.clone();
+    oversized.payload = vec![255; 400_000];
+    assert!(
+        engine
+            .receiver_join_attempt(
+                oversized,
+                JoinIntent {
+                    file: intent.file.try_clone().unwrap(),
+                    directory: intent.directory.try_clone().unwrap(),
+                },
+                None
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.list_groups().unwrap().is_empty());
+    assert_eq!(intent.file.metadata().unwrap().len(), 0);
+    assert!(engine.receiver_join_owned(wire, intent).await.is_ok());
+}

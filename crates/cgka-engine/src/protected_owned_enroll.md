@@ -14,7 +14,8 @@ profile; 4 account secret; 5 SQLCipher key; 6 fresh empty journal; 7 journal
 directory; 8 storage lease; 9 fresh empty anchor; 10 anchor directory; 11
 exclusive fresh empty join intent; 12 intent directory; 13 existing protected
 account directory; 14 connected authenticated Unix consumer; 15 private
-ephemeral cache directory on a different filesystem from the journal. Keys are
+ephemeral cache directory on a different filesystem from every durable journal,
+anchor, intent and account file/directory. Keys are
 exact32bytes in read-only mode0400 files. The account database must already
 exist mode0600 with receiver owner under its mode0700 directory, contain native
 KeyPackage provisioning, and have no groups or pending application events. This
@@ -33,7 +34,9 @@ actual policy/enrollment custody. No publisher is installed.
 All slots are owned before Tokio allocates descriptors. The storage lease is
 held before encrypted SQLite opening; nofollow database identity is checked
 before/after open. Empty journal/anchor descriptor properties, locks and
-directory fsyncs are preflighted before native join. The native transaction
+directory fsyncs are preflighted before native join. Intent/journal/anchor must
+be nonappend O_RDWR descriptors; actual account groups/pending and privately
+owned selected KeyPackageRef are checked before SDK activation. The native transaction
 tentatively stages the Welcome and checks the actual authenticated MLS welcomer
 against current enrolled operators, actual group and selected native
 KeyPackageRef. Only then does the native commit seam write/fsync the original
@@ -51,12 +54,15 @@ inside the rollbackable native transaction before durable intent or native
 commit. Unknown attempts never retry, reset state or manufacture enrollment;
 positively rejected input permits the live loop to consider the next invitation.
 SDK activation is bounded30seconds, finite wait1..86400seconds, SDK
-shutdown5seconds. Notification loss or shutdown refuses positive output.
+shutdown5seconds. Notification loss before join holds; a dead relay forwarder
+after durable enrollment does not negate completion. Shutdown timeout still
+requires consumer UNKNOWN even if it follows a complete frame.
 Individual invalid relay DTOs use the reviewed receiver forwarding behavior. The
 anonymous ephemeral disk FIFO is opened through FD15, a private receiver-owned
-mode0700 cache directory on a filesystem different from the journal; it has no
+mode0700 cache directory on a filesystem different from all durable journal,
+anchor, intent and account locations; it has no
 directory entry. This separation prevents an untrusted replay spool filling the
-journal filesystem. It is not a disk reservation or an adversarial availability
+durable filesystems. It is not a disk reservation or an adversarial availability
 guarantee. It is nonauthority storage and makes no restart promise; SDK lag or
 I/O failure still holds.
 
@@ -67,7 +73,7 @@ this fresh attempt; historical invitations using other packages or already
 consumed material are rejected before intent. A still-valid identical invitation
 for the exact enrolled package/group/operator is the same authorized join, not a
 fabricated historical enrollment. Only positively classified native Welcome
-rejection may continue intake. Backend/unknown errors stop, even if intent bytes
+rejection or bounded oversized preintent rejection may continue intake. Backend/unknown errors stop, even if intent bytes
 look empty.
 
 The consumer sends32 fresh nonce bytes on the kernel-checked Unix stream. After
@@ -113,3 +119,12 @@ implements nor claims that amendment. Root publisher, actual KeyPackage/account
 provisioning, independent anchor custody, immutable source/runtime installation
 and separate live enrollment/deployment approval remain prerequisites. Existing
 unknown historical joins remain UNKNOWN.
+
+R2 repair causal tests exercise the actual loop's attempt_welcome helper with an
+oversized unauthenticated input followed by the real native invitation; actual
+F_GETFL rejects read-only and append descriptors without effects, and device
+comparison checks every durable position. These are composed helper tests,
+not an installed SDK/Unix/SQLCipher end-to-end enrollment qualification. Native
+backend failures during rollbackable foreign-Welcome processing still HOLD;
+they are never relabeled as positively rejected input. The cache isolation is
+not a space reservation, and out-of-space or durability faults still HOLD.

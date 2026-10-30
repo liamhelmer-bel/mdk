@@ -165,7 +165,8 @@ impl<S: StorageProvider + 'static> Engine<S> {
         intent.file.try_lock().map_err(|_| fail())?;
         let bytes = serde_json::to_vec(&wire).map_err(|e| EngineError::Serialize(e.to_string()))?;
         if bytes.len() > 1024 * 1024 {
-            return Err(fail());
+            // Bounded input rejection before any native or intent effect.
+            return Ok(None);
         }
         self.receiver_join_capture = Some(Capture {
             wire: wire.clone(),
