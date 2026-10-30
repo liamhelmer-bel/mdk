@@ -272,6 +272,7 @@ if server == 0:
         os._exit(0)
     except (OSError, AssertionError):
         os._exit(1)
+child = None
 try:
     started = time.monotonic()
     child = subprocess.Popen(
@@ -303,6 +304,7 @@ try:
             prepared = True
         if time.monotonic() > deadline:
             child.kill()
+            child.wait(timeout=2)
             raise TimeoutError("bounded actual combined fixture")
         time.sleep(0.005)
     out, err = child.communicate(timeout=2)
@@ -328,12 +330,20 @@ try:
         result["producer"] = json.loads(
             (scratch / "qualification-output.json").read_text()
         )
-    print(json.dumps(result, sort_keys=True))
-    assert child.returncode == 0
 finally:
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait(timeout=2)
     try:
         os.kill(server, 9)
     except ProcessLookupError:
         pass
-    os.waitpid(server, 0)
+    reaped_server, server_status = os.waitpid(server, 0)
     # Mount namespace exits discard all overlays; no shared mount/host metadata changed.
+result["cleanup"] = {
+    "tls_child_reaped": reaped_server == server,
+    "tls_wait_status": server_status,
+    "native_child_reaped": child.returncode is not None,
+}
+print(json.dumps(result, sort_keys=True))
+assert child.returncode == 0
