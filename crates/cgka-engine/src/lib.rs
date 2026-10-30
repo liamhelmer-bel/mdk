@@ -104,3 +104,10 @@ mod protected_merge;
 #[cfg(unix)]
 #[allow(dead_code)]
 mod protected_join;
+
+/// Fixed process entry only; accepts no approval/identity/candidate DTO arguments.
+/// Installed inherited-descriptor custody remains a separate enrollment gate.
+#[cfg(all(target_os = "linux", feature = "protected-owner-runtime"))]
+pub fn protected_receiver_process_main() -> bool {
+    protected_receiver::semantic::owned_runtime::entry()
+}

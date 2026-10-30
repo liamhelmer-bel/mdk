@@ -930,6 +930,7 @@ dependencies = [
  "libc",
  "marmot-forensics",
  "nostr",
+ "nostr-sdk",
  "openmls",
  "openmls_basic_credential",
  "openmls_memory_storage",

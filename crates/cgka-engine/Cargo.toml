@@ -19,6 +19,9 @@ test-crash-hooks = []
 # production/app consumers.
 test-conformance-snapshot = []
 
+# Fixed Linux owned process; no public receiver constructor/DTO importer.
+protected-owner-runtime = ["dep:storage-sqlite", "dep:transport-nostr-peeler", "dep:nostr-sdk", "transport-nostr-adapter/sdk", "tokio/rt-multi-thread"]
+
 [dependencies]
 cgka-traits.workspace = true
 openmls.workspace = true
@@ -50,6 +53,9 @@ tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+storage-sqlite = { workspace = true, optional = true }
+transport-nostr-peeler = { workspace = true, optional = true }
+nostr-sdk = { workspace = true, optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures.workspace = true
@@ -80,3 +86,8 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 [[bench]]
 name = "group_lifecycle"
 harness = false
+
+[[bin]]
+name = "heterodyne-protected-receiver"
+path = "src/bin/protected_receiver.rs"
+required-features = ["protected-owner-runtime"]

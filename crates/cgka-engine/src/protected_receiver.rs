@@ -575,7 +575,7 @@ pub(crate) fn capture_receiver_content(
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "protected_semantic.rs"]
-mod semantic;
+pub(crate) mod semantic;
 
 #[cfg(unix)]
 #[path = "protected_reopen.rs"]

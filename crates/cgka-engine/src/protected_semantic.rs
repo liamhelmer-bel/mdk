@@ -656,3 +656,11 @@ mod catalog;
 #[cfg(target_os = "linux")]
 #[path = "protected_semantic_reopen.rs"]
 mod reopen;
+
+#[cfg(target_os = "linux")]
+#[path = "protected_owned_producer.rs"]
+mod owned_producer;
+
+#[cfg(all(target_os = "linux", feature = "protected-owner-runtime"))]
+#[path = "protected_owned_runtime.rs"]
+pub(crate) mod owned_runtime;

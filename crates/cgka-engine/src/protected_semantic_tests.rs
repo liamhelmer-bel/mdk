@@ -13,7 +13,7 @@ use transport_nostr_adapter::{NostrPublishOutcome, NostrRelayClient, NostrSubscr
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 #[derive(Default)]
-struct Relay {
+pub(super) struct Relay {
     wires: Mutex<Vec<TransportMessage>>,
     fail_at: Mutex<Option<usize>>,
 }
@@ -68,7 +68,7 @@ fn restart_client(seed: &[u8], storage: SqliteAccountStorage) -> Engine<SqliteAc
         .build()
         .unwrap()
 }
-async fn fixture() -> (
+pub(super) async fn fixture() -> (
     SemanticFactory<SqliteAccountStorage>,
     Engine<SqliteAccountStorage>,
     tempfile::NamedTempFile,
@@ -330,7 +330,7 @@ async fn app_wire(
     };
     msg
 }
-async fn approve(
+pub(super) async fn approve(
     f: &mut SemanticFactory<SqliteAccountStorage>,
     operator: &mut Engine<SqliteAccountStorage>,
     id: &str,
