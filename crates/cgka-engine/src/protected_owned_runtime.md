@@ -14,8 +14,8 @@ cargo build --locked -p cgka-engine --features protected-owner-runtime --bin het
 
 The fixed entry reopens an existing encrypted account, owns the actual Engine and
 Nostr SDK adapter, executes the fixed Product producer, posts the exact generated
-card if absent, receives actual SDK messages and emits only an actual consumed
-native receipt. A previously retained ask must equal the current owned producer's
+card if absent, receives actual SDK messages and emits an actual consumed
+native receipt or a distinct nonauthorizing HOLD status. A previously retained ask must equal the current owned producer's
 entire OriginalAsk before reuse. Native unknown/partial external effects remain
 HOLD; there is no automatic replay or unconsume on transport failure.
 
@@ -121,13 +121,14 @@ composition remain integration prerequisites.
 
 ## Transport and limits
 
-Subscriptions cover both current account inbox and group at every enrolled
-endpoint, without a history floor. Every endpoint must report EOSE for the current
+Deployment reopen subscriptions cover the enrolled group at every enrolled
+endpoint, without a history floor. Fresh Welcome/inbox intake is a separate path. Every endpoint must report EOSE for the current
 activation. The owner drains queued deliveries before inspecting approval. The
 owner uses the actual SDK notification receiver directly: notification lag/error,
 notification channel closure or shutdown ends the forwarder and prevents consume.
 Individual invalid DTOs/transport events are skipped and counted before native
-ingress, so replayed outsider junk cannot permanently stop initial replay. Only
+ingress. This excludes only definite pre-native DTO failures; valid-route opaque
+ciphertext can still produce native UNKNOWN and HOLD as detailed below. Only
 a definite non-latched pre-effect oversized ingress refusal is likewise skipped;
 all uncertain/native-state failures remain HOLD.
 This does not claim that EOSE proves human visibility or that unavailable relays
@@ -192,3 +193,48 @@ authenticated protected-peer custody. A root-opened separate file or backup
 exclusion alone does not establish independent consumer ownership. In particular,
 a receiver-owned/co-restorable anchor cannot satisfy the approved design. Actual
 consumer-owned anchor protocol/custody remains a deployment prerequisite.
+
+
+## Round-two repair and explicit availability boundary
+
+Deployment-only reopen activates group subscriptions without an inbox; fresh
+Welcome enrollment remains a separate path. EOSE coverage counts only subscriptions
+with actual endpoint attempts, so an empty inbox cannot block group-only replay.
+A private anonymous O_TMPFILE FIFO in the already protected cache directory drains
+SDK notifications independently of native journal/fsync latency. Event and EOSE
+records retain FIFO order. This is ephemeral nonauthority storage, without a
+restart/durability promise or lifetime cap. Per-record bounds remain; actual I/O
+failure, SDK broadcast lag, shutdown or closed adapter ends intake and holds.
+An actual causal test stalls adapter consumption while 5,200 signed records and
+EOSE are spooled, then drains all records in order before coverage can complete.
+This qualifies ordinary finite cooperative traffic, not arbitrary sustained floods.
+
+Once the consumer peer and nonce are established, an exchange failure attempts the
+same length-prefixed channel with schema `heterodyne-owned-receiver-hold.v1`, nonce
+and startup/enrollment/journal digests, a closed reason code, and fixed flags
+`reconciliation_required:true`, `automatic_replay_permitted:false`, and
+`native_or_external_effects_may_be_unknown:true`. It carries no receipt, no success
+key and no permission. Failure to deliver status does not release HOLD. Startup
+failures before a validated peer/nonce retain fixed stderr/exit2 only. Consumers
+must reject both unknown schemas and HOLD as authority. Consumer UID must be
+nonzero and distinct from the receiver UID.
+
+Cryptographic ambiguity is deliberately preserved. The transport peeler uses a
+fresh ephemeral outer signing key per group event; an outer Nostr signer is not
+the MLS operator. The group h-tag is public routing, not authenticated admission.
+A real routed opaque cipher that cannot decrypt may be unrelated, future epoch,
+or historical pending native work: the actual native state is PeelDeferred.
+This source retains that UNKNOWN and quiet-HOLD, emits the nonauthorizing status,
+and never reexecutes it. It does not terminal-reject arbitrary opaque ciphertext.
+The causal test asserts retained native PeelDeferred, latched factory, exact HOLD,
+no consumed receipt and no subsequent ingest/journal replay. Availability under
+adversarial valid-route opaque input remains explicitly unqualified. Changing
+that admission tradeoff needs a separate approved policy, not a speculative
+classification that could discard contrary authorization history.
+
+Python's supplied source paths now follow the isolated interpreter's standard
+library instead of shadowing it. The complete immutable source/interpreter/import
+closure remains an enrollment prerequisite, not established by hash manifests.
+All current source tests remain synthetic protected-custody/relay fixtures; no
+installed publisher, enrolled live account, fresh join, external consumer service,
+anchor custody amendment or end-to-end deployment qualification is implied.

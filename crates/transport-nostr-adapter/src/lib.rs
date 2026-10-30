@@ -1715,6 +1715,9 @@ impl AdapterState {
     ) {
         let subscriptions = subscriptions
             .iter()
+            // An empty inbox issues no relay attempt. Counting that phantom
+            // subscription makes a group-only activation impossible to finish.
+            .filter(|subscription| !subscription.endpoints().is_empty())
             .map(|subscription| {
                 let relays = subscription
                     .endpoints()

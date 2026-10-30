@@ -178,7 +178,7 @@ impl InstalledProducer {
         let paths = serde_json::to_string(&[&self.source, &self.purelib])
             .map_err(|_| ReceiverHold::Configuration)?;
         let bootstrap = format!(
-            "import sys; sys.path[:0]={paths}; from heterodyne.actions.deployment_producer_process import _entry; sys.exit(_entry())"
+            "import sys; sys.path.extend({paths}); from heterodyne.actions.deployment_producer_process import _entry; sys.exit(_entry())"
         );
         let mut command = Command::new(&self.python);
         command

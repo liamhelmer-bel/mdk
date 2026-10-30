@@ -85,6 +85,8 @@ pub(crate) fn entry() -> bool {
         let profile: Profile = serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         if profile.schema != "heterodyne-protected-receiver-process.v1"
             || profile.receiver_uid != unsafe { libc::geteuid() }
+            || profile.consumer_uid == 0
+            || profile.consumer_uid == profile.receiver_uid
             || profile.wait_seconds == 0
             || profile.wait_seconds > 86400
         {
@@ -223,6 +225,7 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
     let sdk = nostr_sdk::Client::builder().build();
     let relay = NostrSdkRelayClient::new(sdk.clone());
     let adapter = NostrTransportAdapter::new(Arc::new(relay.clone()));
+    let relay_spool = relay_spool::anonymous(&cache)?;
     let mut factory = SemanticFactory::reopen(
         engine,
         group.clone(),
@@ -247,7 +250,7 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
         &original,
         &group,
     )?;
-    let forwarder = forward(sdk.clone(), adapter.clone());
+    let forwarder = forward(sdk.clone(), adapter.clone(), relay_spool);
     let result = exchange(
         &mut factory,
         &adapter,
@@ -292,7 +295,46 @@ struct Session {
 async fn exchange<S: StorageProvider + 'static>(
     factory: &mut SemanticFactory<S>,
     adapter: &NostrTransportAdapter,
-    forwarder: &tokio::task::JoinHandle<()>,
+    forwarder: &relay_spool::Forwarder,
+    peer: &mut UnixStream,
+    session: Session,
+) -> Result<(), ReceiverHold> {
+    let context = (
+        hex::encode(session.nonce),
+        session.profile_sha.clone(),
+        session.enrollment_sha.clone(),
+        session.journal_sha.clone(),
+    );
+    let result = exchange_inner(factory, adapter, forwarder, peer, session).await;
+    if let Err(error) = &result {
+        // Failure status has a distinct schema and confers no authority. A lost
+        // error response remains held, exactly like a lost consumed response.
+        let reason = match error {
+            ReceiverHold::Configuration => "configuration",
+            ReceiverHold::Journal => "journal",
+            ReceiverHold::Capacity => "capacity",
+            ReceiverHold::Latched => "latched",
+            ReceiverHold::Engine => "engine_or_transport",
+            ReceiverHold::ChangedState => "native_or_semantic_state",
+            ReceiverHold::Malformed => "malformed",
+        };
+        let response = serde_json::json!({
+            "schema":"heterodyne-owned-receiver-hold.v1", "nonce_hex":context.0,
+            "startup_profile_sha256":context.1, "enrollment_sha256":context.2,
+            "journal_profile_sha256":context.3, "reason":reason,
+            "reconciliation_required":true, "automatic_replay_permitted":false,
+            "native_or_external_effects_may_be_unknown":true
+        });
+        if let Ok(bytes) = serde_json::to_vec(&response) {
+            let _ = write_frame(peer, &bytes);
+        }
+    }
+    result
+}
+async fn exchange_inner<S: StorageProvider + 'static>(
+    factory: &mut SemanticFactory<S>,
+    adapter: &NostrTransportAdapter,
+    forwarder: &relay_spool::Forwarder,
     peer: &mut UnixStream,
     session: Session,
 ) -> Result<(), ReceiverHold> {
@@ -305,7 +347,7 @@ async fn exchange<S: StorageProvider + 'static>(
         Duration::from_secs(30),
         adapter.activate_account(TransportAccountActivation {
             account_id: factory.receiver.engine.self_id(),
-            inbox_endpoints: factory.endpoints.clone(),
+            inbox_endpoints: vec![],
             group_subscriptions: vec![TransportGroupSubscription {
                 group_id: factory.receiver.group.clone(),
                 transport_group_id: session.transport_group,
@@ -352,7 +394,7 @@ async fn exchange<S: StorageProvider + 'static>(
                     Ok(_) => {}
                     Err(ReceiverHold::Capacity) if !factory.held && !factory.receiver.latched => {
                         oversized = oversized.saturating_add(1);
-                        tracing::debug!(oversized, "ignored pre-effect oversized relay input");
+                        tracing::debug!(target: "cgka_engine::protected_receiver", method = "exchange", oversized, "ignored pre-effect oversized relay input");
                     }
                     Err(error) => return Err(error),
                 }
@@ -368,7 +410,10 @@ async fn exchange<S: StorageProvider + 'static>(
         if tokio::time::Instant::now() >= deadline {
             return Err(ReceiverHold::Engine);
         }
-        if !replay_complete || (!inspect && tokio::time::Instant::now() < next_inspection) {
+        if !replay_complete
+            || !forwarder.is_drained()
+            || (!inspect && tokio::time::Instant::now() < next_inspection)
+        {
             inspect = false;
             continue;
         }
@@ -455,65 +500,27 @@ fn write_frame(peer: &mut UnixStream, bytes: &[u8]) -> Result<(), ReceiverHold> 
         .and_then(|_| peer.write_all(bytes))
         .map_err(|_| ReceiverHold::Engine)
 }
-fn forward(sdk: nostr_sdk::Client, adapter: NostrTransportAdapter) -> tokio::task::JoinHandle<()> {
-    forward_notifications(sdk.notifications(), adapter)
+#[path = "protected_owned_relay.rs"]
+mod relay_spool;
+fn forward(
+    sdk: nostr_sdk::Client,
+    adapter: NostrTransportAdapter,
+    spool: File,
+) -> relay_spool::Forwarder {
+    forward_notifications(sdk.notifications(), adapter, spool)
 }
 fn forward_notifications(
-    mut notifications: tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>,
+    notifications: tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>,
     adapter: NostrTransportAdapter,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut rejected = 0u64;
-        while let Ok(notification) = notifications.recv().await {
-            match notification {
-                nostr_sdk::RelayPoolNotification::Event {
-                    relay_url,
-                    subscription_id,
-                    event,
-                } => {
-                    let Ok(event) =
-                        transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&event)
-                    else {
-                        rejected = rejected.saturating_add(1);
-                        tracing::debug!(rejected, "ignored invalid relay DTO");
-                        continue;
-                    };
-                    if let Err(error) = adapter
-                        .handle_relay_event(transport_nostr_adapter::NostrRelayEvent {
-                            endpoint: TransportEndpoint(relay_url.to_string()),
-                            subscription_id: Some(subscription_id.to_string()),
-                            event,
-                        })
-                        .await
-                    {
-                        if matches!(error, cgka_traits::TransportAdapterError::Closed) {
-                            break;
-                        }
-                        rejected = rejected.saturating_add(1);
-                        tracing::debug!(rejected, "ignored invalid relay event");
-                    }
-                }
-                nostr_sdk::RelayPoolNotification::Message {
-                    relay_url,
-                    message: nostr::RelayMessage::EndOfStoredEvents(subscription_id),
-                } => {
-                    adapter
-                        .handle_relay_eose(
-                            TransportEndpoint(relay_url.to_string()),
-                            subscription_id.to_string(),
-                        )
-                        .await;
-                }
-                nostr_sdk::RelayPoolNotification::Shutdown => break,
-                _ => {}
-            }
-        }
-    })
+    spool: File,
+) -> relay_spool::Forwarder {
+    relay_spool::forward(notifications, adapter, spool)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cgka_traits::MessageStorage;
     #[tokio::test]
     async fn real_native_consumed_receipt_frames_exact_original_and_nonce() {
         let (mut factory, mut operator, _, _) = super::super::tests::fixture().await;
@@ -654,16 +661,17 @@ mod tests {
         let approval = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
         let approval: nostr::Event = serde_json::from_slice(&approval.payload).unwrap();
         let before = relay.wires.lock().unwrap().len();
+        let subscriptions_before = relay.subscriptions.lock().unwrap().len();
         let adapter = factory.transport.clone();
         let (tx, rx) = tokio::sync::broadcast::channel(16);
-        let forwarder = forward_notifications(rx, adapter.clone());
+        let forwarder = forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
         let (mut receiver, mut consumer) = UnixStream::pair().unwrap();
         let mut before_eose = consumer.try_clone().unwrap();
         let keepalive = tx.clone();
         let driver = tokio::spawn(async move {
             loop {
                 let subscriptions = relay.subscriptions.lock().unwrap().clone();
-                if subscriptions.len() >= 2 {
+                if subscriptions.len() > subscriptions_before {
                     let outsider = nostr::Keys::generate();
                     let h = || Tag::custom(TagKind::custom("h"), [hex::encode([7; 32])]);
                     let malformed = EventBuilder::new(Kind::MlsGroupMessage, "invalid")
@@ -739,7 +747,8 @@ mod tests {
             let ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
             let adapter = factory.transport.clone();
             let (tx, rx) = tokio::sync::broadcast::channel(2);
-            let forwarder = forward_notifications(rx, adapter.clone());
+            let forwarder =
+                forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
             if closed {
                 drop(tx);
                 tokio::task::yield_now().await;
@@ -758,20 +767,119 @@ mod tests {
             );
             assert!(!factory.asks["ask3"].consumed);
             assert_eq!(relay.wires.lock().unwrap().len(), 2);
-            consumer.set_nonblocking(true).unwrap();
-            assert_eq!(
-                consumer.read(&mut [0]).unwrap_err().kind(),
-                std::io::ErrorKind::WouldBlock
-            );
+            let mut length = [0; 4];
+            consumer.read_exact(&mut length).unwrap();
+            let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+            consumer.read_exact(&mut bytes).unwrap();
+            let hold: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(hold["schema"], "heterodyne-owned-receiver-hold.v1");
+            assert_eq!(hold["nonce_hex"], hex::encode([0x61; 32]));
+            assert_eq!(hold["automatic_replay_permitted"], false);
+            assert_eq!(hold["reconciliation_required"], true);
             forwarder.abort();
         }
+    }
+    #[tokio::test]
+    async fn genuine_route_undecryptable_wire_retains_unknown_and_reports_hold_without_replay() {
+        use nostr::{EventBuilder, Kind, Tag, TagKind};
+        let (mut factory, mut operator, root, relay) =
+            super::super::tests::finite_fixture_lifetime(60_000).await;
+        factory
+            .enable_catalog(super::super::tests::cache(root.path(), "unknown-cache"))
+            .unwrap();
+        let ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
+        factory.post(ask.clone()).await.unwrap();
+        let target = factory.asks["ask3"].app_ids[0].clone();
+        let actual = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
+        let actual: serde_json::Value = serde_json::from_slice(&actual.payload).unwrap();
+        let h = actual["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t[0] == "h")
+            .unwrap()[1]
+            .as_str()
+            .unwrap();
+        let cipher = EventBuilder::new(
+            Kind::MlsGroupMessage,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .tags([Tag::custom(TagKind::custom("h"), [h])])
+        .sign_with_keys(&nostr::Keys::generate())
+        .unwrap();
+        let wire = transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&cipher)
+            .unwrap()
+            .to_transport_message()
+            .unwrap();
+        let adapter = factory.transport.clone();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let forwarder = forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
+        let keepalive = tx.clone();
+        let driver = tokio::spawn(async move {
+            while relay.subscriptions.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            tx.send(notification(cipher)).unwrap();
+        });
+        let (mut receiver, mut consumer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            exchange(
+                &mut factory,
+                &adapter,
+                &forwarder,
+                &mut receiver,
+                session(ask)
+            )
+            .await,
+            Err(ReceiverHold::ChangedState)
+        );
+        driver.await.unwrap();
+        let mut length = [0; 4];
+        consumer.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+        consumer.read_exact(&mut bytes).unwrap();
+        let hold: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(hold["schema"], "heterodyne-owned-receiver-hold.v1");
+        assert_eq!(hold["nonce_hex"], hex::encode([0x61; 32]));
+        assert_eq!(hold["reason"], "native_or_semantic_state");
+        assert_eq!(hold["automatic_replay_permitted"], false);
+        assert_eq!(hold["reconciliation_required"], true);
+        assert!(hold.get("receipt").is_none());
+        assert_eq!(
+            factory
+                .receiver
+                .engine
+                .storage
+                .get_message(&wire.id)
+                .unwrap()
+                .state,
+            cgka_traits::message::MessageState::PeelDeferred
+        );
+        let before = factory.receiver.journal.length().unwrap();
+        assert!(factory.held && factory.receiver.latched);
+        assert!(factory.ingest(wire.clone()).await.is_err());
+        assert_eq!(factory.receiver.journal.length().unwrap(), before);
+        assert_eq!(
+            factory
+                .receiver
+                .engine
+                .storage
+                .get_message(&wire.id)
+                .unwrap()
+                .state,
+            cgka_traits::message::MessageState::PeelDeferred
+        );
+        assert!(!factory.asks["ask3"].consumed);
+        drop(keepalive);
+        forwarder.abort();
     }
     #[tokio::test]
     async fn owned_notification_lag_and_shutdown_end_forwarder() {
         for lag in [false, true] {
             let (factory, _, _, _) = super::super::tests::fixture().await;
             let (tx, rx) = tokio::sync::broadcast::channel(1);
-            let forwarder = forward_notifications(rx, factory.transport.clone());
+            let forwarder =
+                forward_notifications(rx, factory.transport.clone(), tempfile::tempfile().unwrap());
             for _ in 0..if lag { 3 } else { 1 } {
                 tx.send(nostr_sdk::RelayPoolNotification::Shutdown).unwrap();
             }
