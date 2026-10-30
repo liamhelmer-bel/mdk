@@ -944,6 +944,11 @@ impl<S: StorageProvider> Engine<S> {
         // Rebind every downstream storage / convergence / fork-recovery row
         // and the in-memory dedup sets to this content-derived id.
         let content_id = content_dedup_id(&mls_bytes);
+        crate::protected_receiver::capture_receiver_content(
+            &mut self.receiver_ingress_capture,
+            &raw_msg_id,
+            &content_id,
+        )?;
         if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
             // Peeling proved which durable content record this wrapper carries.
             // Remember the exact wrapper outside the bounded hostile-input

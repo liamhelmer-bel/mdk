@@ -2554,7 +2554,7 @@ pub(crate) mod tests {
     use cgka_traits::types::{MemberId, MessageId};
     use sha2::{Digest, Sha256};
 
-    struct PassthroughPeeler;
+    pub(crate) struct PassthroughPeeler;
 
     fn hash_id(bytes: &[u8]) -> MessageId {
         MessageId::new(Sha256::digest(bytes).to_vec())
@@ -2623,7 +2623,7 @@ pub(crate) mod tests {
         }
     }
 
-    struct TestProofSigner(k256::schnorr::SigningKey);
+    pub(crate) struct TestProofSigner(pub(crate) k256::schnorr::SigningKey);
 
     impl crate::account_identity_proof::AccountIdentityProofSigner for TestProofSigner {
         fn sign_account_identity_proof(

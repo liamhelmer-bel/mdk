@@ -66,6 +66,8 @@ pub(crate) mod mls_group_cache;
 pub mod openmls_projection;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
+#[allow(dead_code)]
+mod protected_receiver;
 pub mod provider;
 pub mod publish;
 pub mod self_update;
