@@ -55,3 +55,30 @@ qualification; a pending or older-source run is not a final-source PASS.
 Private transport ownership remains a non-wasm cgka-engine layering deviation
 inherited from the reviewed semantic slice. Normal production source is exercised,
 not hidden behind cfg(test). Protected APIs remain dormant and unexported.
+
+## Round-one correctness repair
+
+The actual cumulative HIGH review requested changes; it is retained unchanged.
+Original and one-use consume records now retain the source-owned clock check used
+for that transition. A later write/fsync timestamp cannot change an already checked
+transition into an unreplayable one. Legacy records without the new checked-time
+field retain their stricter historical replay check. Completed Consumed and Denied
+states never turn into Expired; an unused Approved permission still expires.
+Contrary evidence remains meaningful after consumption, including after expiry.
+Expired candidates are no-ops before projection, including a final native outcome
+recovered after downtime. Multi-card objections retain every scoped removal target,
+including references whose original reply has not arrived yet.
+
+Native merge/join capture failures after durable commit invalidate the capture and
+provide no owning authority. They no longer bypass normal native in-memory epoch,
+routing, cache and pending-event finalization. The owner still refuses an invalid
+capture with the original effect retained; it never retries a committed wire.
+Linux derived cache opens use the target architecture's libc O_NOFOLLOW constant.
+No new dependency version is introduced; libc was already workspace/lock pinned.
+
+Causal regressions include actual clock/write expiry crossings, consumed and denied
+terminal state after expiry, later contrary evidence on consumed consent, actual
+multi-card early removal, recovered native reply expiry, actual postcommit join and
+merge capture failures, and a cache symlink that cannot read or alter its target.
+Linear history lookup, fsynced disposable cache rebuild cost, and duplicated strict
+readback validation remain disclosed improvements rather than new qualification.

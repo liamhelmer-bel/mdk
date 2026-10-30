@@ -48,6 +48,9 @@ k256 = { version = "0.13", default-features = false, features = ["schnorr"] }
 transport-nostr-adapter.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures.workspace = true
 gloo-timers = { version = "0.3", features = ["futures"] }

@@ -927,6 +927,7 @@ dependencies = [
  "hex",
  "insta",
  "k256",
+ "libc",
  "marmot-forensics",
  "nostr",
  "openmls",

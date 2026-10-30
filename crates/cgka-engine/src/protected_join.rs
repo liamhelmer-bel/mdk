@@ -36,8 +36,13 @@ pub(crate) struct Capture {
     wire: TransportMessage,
     wire_sha256: String,
     evidence: Option<JoinEvidence>,
+    failed: bool,
 }
 impl Capture {
+    pub(crate) fn invalidate(&mut self) {
+        self.failed = true;
+        self.evidence = None;
+    }
     pub(crate) fn committed(
         &mut self,
         group: GroupId,
@@ -46,7 +51,7 @@ impl Capture {
         welcomer: MemberId,
         joined: Projection,
     ) -> Result<(), EngineError> {
-        if outer != &self.wire.id || self.evidence.is_some() {
+        if self.failed || outer != &self.wire.id || self.evidence.is_some() {
             return Err(EngineError::Other("receiver join capture changed".into()));
         }
         self.evidence = Some(JoinEvidence {
@@ -108,10 +113,14 @@ impl<S: StorageProvider + 'static> Engine<S> {
             wire: wire.clone(),
             wire_sha256: hex::encode(Sha256::digest(bytes)),
             evidence: None,
+            failed: false,
         });
         let result = self.join_welcome(wire).await;
         let captured = self.receiver_join_capture.take().ok_or_else(fail)?;
         let group = result?;
+        if captured.failed {
+            return Err(fail());
+        }
         let evidence = captured.evidence.ok_or_else(fail)?;
         let current = self.with_mls_group(&group, |native| {
             if !self.receiver_group_quiet(&group, native)? {

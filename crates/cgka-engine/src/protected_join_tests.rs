@@ -298,3 +298,25 @@ async fn wrong_join_provenance_pin_preserves_actual_native_pending_welcome() {
         1
     );
 }
+
+#[tokio::test]
+async fn failed_postcommit_capture_still_finalizes_actual_native_join() {
+    let (mut recipient, storage, wire, group, _) = invitation().await;
+    let mut wrong_wire = wire.clone();
+    wrong_wire.id = MessageId::new(vec![0x19; 32]);
+    recipient.receiver_join_capture = Some(Capture {
+        wire: wrong_wire,
+        wire_sha256: "00".repeat(32),
+        evidence: None,
+        failed: false,
+    });
+    // Deliberately invalid capture fails only after the actual join commits.
+    recipient.join_welcome(wire).await.unwrap();
+    let capture = recipient.receiver_join_capture.take().unwrap();
+    assert!(capture.failed);
+    assert!(capture.evidence.is_none());
+    assert_eq!(storage.list_groups().unwrap(), vec![group.clone()]);
+    assert!(recipient.group_authority(&group).is_ok());
+    assert_eq!(storage.list_pending_application_events().unwrap().len(), 1);
+    assert!(!recipient.drain_events().is_empty());
+}

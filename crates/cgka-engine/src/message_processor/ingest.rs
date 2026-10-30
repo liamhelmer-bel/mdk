@@ -1799,17 +1799,25 @@ impl<S: StorageProvider> Engine<S> {
                     }
                 };
                 if let Some((projection, proposals)) = receiver_merge_before {
-                    let evidence = crate::protected_merge::DirectMerge::new(
-                        group_id.clone(),
-                        msg.id.clone(),
-                        commit_committer,
-                        committer_index.u32(),
-                        projection,
-                        crate::protected_merge::Projection::read(&mls_group)?,
-                        proposals,
-                    );
-                    if let Some(capture) = &mut self.receiver_merge_capture {
-                        capture.retain(evidence)?;
+                    // Native storage has committed. Evidence failure must park
+                    // the private receiver, never skip ordinary cache/epoch
+                    // finalization and leave this Engine at an obsolete epoch.
+                    let evidence =
+                        crate::protected_merge::Projection::read(&mls_group).map(|after| {
+                            crate::protected_merge::DirectMerge::new(
+                                group_id.clone(),
+                                msg.id.clone(),
+                                commit_committer,
+                                committer_index.u32(),
+                                projection,
+                                after,
+                                proposals,
+                            )
+                        });
+                    if let Some(capture) = &mut self.receiver_merge_capture
+                        && evidence.and_then(|e| capture.retain(e)).is_err()
+                    {
+                        capture.invalidate();
                     }
                 }
                 let after_admins =

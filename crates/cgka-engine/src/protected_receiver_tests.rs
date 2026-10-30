@@ -1080,3 +1080,64 @@ async fn ordered_reconcile_requires_exact_actual_pending_tuple_and_complete_wire
         }
     }
 }
+
+#[tokio::test]
+async fn failed_postcommit_capture_still_finalizes_actual_native_merge() {
+    let (mut alice, _, mut bob, group) = fixture().await;
+    let before = bob.group_authority(&group).unwrap().facts.epoch;
+    let SendResult::GroupEvolution {
+        msg: mut commit,
+        pending,
+        ..
+    } = alice
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("update");
+    };
+    alice.confirm_published(pending).await.unwrap();
+    commit.envelope = TransportEnvelope::GroupMessage {
+        transport_group_id: group.as_slice().to_vec(),
+    };
+    let content = hash_id(&commit.payload);
+    let mut capture = crate::protected_merge::Capture::for_group(group.clone());
+    capture.fail_retain = true;
+    bob.receiver_merge_capture = Some(capture);
+    assert!(matches!(
+        bob.ingest(commit).await.unwrap(),
+        IngestOutcome::Processed
+    ));
+    let capture = bob.receiver_merge_capture.take().unwrap();
+    assert!(capture.convergence_entered);
+    assert!(!capture.qualifies(&group, &content));
+    assert!(capture.direct.is_none());
+    assert_eq!(
+        bob.group_authority(&group).unwrap().facts.epoch.0,
+        before.0 + 1
+    );
+    assert!(!bob.drain_events().is_empty());
+    // A further real application message resolves the finalized current group.
+    let SendResult::ApplicationMessage { msg, .. } = alice
+        .send(SendIntent::AppMessage {
+            group_id: group,
+            payload: MarmotAppEvent::new(
+                hex::encode(alice.self_id().as_slice()),
+                1,
+                1,
+                vec![],
+                "native remains usable",
+            )
+            .encode()
+            .unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("application");
+    };
+    assert!(bob.ingest(msg).await.is_ok());
+}

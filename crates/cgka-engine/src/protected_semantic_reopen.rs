@@ -57,6 +57,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         )?;
         let pending = catalog.unprojected.clone();
         self.install_catalog(catalog)?;
+        self.expire()?;
         if let Some(value) = pending {
             let c: super::super::RetainedCandidate =
                 serde_json::from_value(value).map_err(|_| ReceiverHold::Malformed)?;
@@ -224,11 +225,37 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         let Some(catalog) = &self.catalog else {
             return Ok(true);
         };
-        let ids = catalog
+        let relevant = catalog
             .relevant(&serde_json::to_value(candidate).map_err(|_| ReceiverHold::Malformed)?)?;
+        let now = self.receiver.checked_now()?;
+        let mut ids = Vec::new();
+        for id in relevant {
+            let ask = self
+                .catalog
+                .as_ref()
+                .ok_or(ReceiverHold::ChangedState)?
+                .retained_ask(&id)?
+                .ok_or(ReceiverHold::ChangedState)?;
+            if now >= ask.expiry
+                && matches!(
+                    ask.disposition,
+                    catalog::Disposition::Awaiting | catalog::Disposition::Approved
+                )
+            {
+                if !self.asks.get(&id).is_some_and(|a| a.expired) {
+                    self.receiver.record(serde_json::json!({"schema":"semantic-expired.v1", "ask_id":id, "at_unix_ms":now}))?;
+                    if let Some(a) = self.asks.get_mut(&id) {
+                        a.expired = true;
+                    }
+                }
+                continue;
+            }
+            ids.push(id);
+        }
         if ids.len() > 1 {
             // Unsupported multi-ask input creates one scoped durable objection.
             // Compact terminal rows suffice: do not load historical full cards.
+            self.retain_removal(candidate)?;
             self.receiver.record(serde_json::json!({"schema":"semantic-conflict.v1","ask_ids":ids,"authenticated_candidate":candidate}))?;
             for id in &ids {
                 if let Some(ask) = self.asks.get_mut(id) {
@@ -239,10 +266,14 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             self.sync_catalog()?;
             return Ok(false);
         }
-        let removed = catalog.retained_removal(
-            &serde_json::to_value(&candidate.sender).map_err(|_| ReceiverHold::Malformed)?,
-            &candidate.application.id,
-        )?;
+        let removed = self
+            .catalog
+            .as_ref()
+            .ok_or(ReceiverHold::ChangedState)?
+            .retained_removal(
+                &serde_json::to_value(&candidate.sender).map_err(|_| ReceiverHold::Malformed)?,
+                &candidate.application.id,
+            )?;
         if removed {
             self.removals.insert((
                 Some(hex::encode(candidate.sender.as_slice())),

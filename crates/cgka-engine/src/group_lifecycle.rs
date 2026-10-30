@@ -1549,13 +1549,22 @@ impl<S: StorageProvider> Engine<S> {
 
         #[cfg(unix)]
         if let Some(capture) = &mut self.receiver_join_capture {
-            capture.committed(
-                group_id.clone(),
-                &welcome_id,
-                content_id.clone(),
-                welcome_sender_id.clone(),
-                crate::protected_merge::Projection::read(&mls_group)?,
-            )?;
+            // The native join is durable. An unusable capture means no owning
+            // enrollment authority, but normal in-memory join finalization
+            // must still run to match storage and preserve pending provenance.
+            let result =
+                crate::protected_merge::Projection::read(&mls_group).and_then(|projection| {
+                    capture.committed(
+                        group_id.clone(),
+                        &welcome_id,
+                        content_id.clone(),
+                        welcome_sender_id.clone(),
+                        projection,
+                    )
+                });
+            if result.is_err() {
+                capture.invalidate();
+            }
         }
 
         // #740: index this joined group's transport routing id for O(1) inbound

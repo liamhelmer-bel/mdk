@@ -73,6 +73,8 @@ struct SemanticFactory<S: StorageProvider + 'static> {
     // Authenticated inner-event removals survive arrival before their target.
     removals: BTreeSet<(Option<String>, String)>,
     held: bool,
+    #[cfg(test)]
+    record_delay: std::time::Duration,
     #[cfg(unix)]
     expiry_profile: Option<expiry::Profile>,
     #[cfg(target_os = "linux")]
@@ -98,6 +100,8 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             seen_candidates: BTreeSet::new(),
             removals: BTreeSet::new(),
             held: false,
+            #[cfg(test)]
+            record_delay: std::time::Duration::ZERO,
             #[cfg(unix)]
             expiry_profile: None,
             #[cfg(target_os = "linux")]
@@ -211,17 +215,11 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             }
             events.push(event);
         }
-        if expires_at_unix_ms.is_some_and(|expiry| {
-            self.receiver
-                .checked_now()
-                .map_or(true, |now| now >= expiry)
-        }) {
-            return Err(ReceiverHold::ChangedState);
-        }
+        let checked_at_unix_ms = self.record_check_time(expires_at_unix_ms)?;
         self.held = true;
         self.receiver.record(if let Some(expiry) = expires_at_unix_ms {
             serde_json::json!({"schema":"semantic-original.v2", "original":original,
-                "policy_sha256":policy, "expires_at_unix_ms":expiry})
+                "policy_sha256":policy, "expires_at_unix_ms":expiry, "checked_at_unix_ms":checked_at_unix_ms})
         } else { serde_json::json!({"schema":"semantic-original.v1", "original":original,"policy_sha256":policy}) })?;
         let mut app_ids = Vec::new();
         for (index, event) in events.into_iter().enumerate() {
@@ -347,6 +345,9 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         &mut self,
         candidate: AuthenticatedCandidate,
     ) -> Result<Option<String>, ReceiverHold> {
+        // Time may advance during native ingress or while a retained candidate
+        // awaits recovery. Expire before projecting any late reply.
+        self.expire()?;
         // A receipt is made only by this actual ingestion path, never from a DTO.
         if !self.seen_candidates.insert(candidate.message_id.clone()) {
             return Err(ReceiverHold::ChangedState);
@@ -361,30 +362,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             .filter_map(|t| t.get(1))
             .map(|s| s.to_ascii_lowercase())
             .collect();
-        if matches!(
-            app.kind,
-            MARMOT_APP_EVENT_KIND_DELETE
-                | MARMOT_APP_EVENT_KIND_EDIT
-                | MARMOT_APP_EVENT_KIND_REMOVE
-        ) {
-            // Even an as-yet unseen reaction may already have been withdrawn.
-            // Edits/deletes bind to their actual MLS sender. A removal from
-            // any configured operator is a conservative objection, never proof
-            // of admin authority or a positive deletion/approval instruction.
-            self.receiver.record(serde_json::json!({
-                "schema":"semantic-removal.v1", "authenticated_candidate":candidate
-            }))?;
-            for target in &targets {
-                self.removals.insert((
-                    if app.kind == MARMOT_APP_EVENT_KIND_REMOVE {
-                        None
-                    } else {
-                        Some(hex::encode(candidate.sender.as_slice()))
-                    },
-                    target.clone(),
-                ));
-            }
-        }
+        self.retain_removal(&candidate)?;
         let removed = self.removals.contains(&(
             Some(hex::encode(candidate.sender.as_slice())),
             app.id.to_ascii_lowercase(),
@@ -500,6 +478,50 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         self.sync_catalog()?;
         Ok(Some(answer))
     }
+    fn retain_removal(&mut self, candidate: &AuthenticatedCandidate) -> Result<(), ReceiverHold> {
+        let app = &candidate.application;
+        let targets: Vec<_> = app
+            .tags
+            .iter()
+            .filter(|t| t.first().is_some_and(|s| s == "e"))
+            .filter_map(|t| t.get(1))
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if matches!(
+            app.kind,
+            MARMOT_APP_EVENT_KIND_DELETE
+                | MARMOT_APP_EVENT_KIND_EDIT
+                | MARMOT_APP_EVENT_KIND_REMOVE
+        ) {
+            // Even an as-yet unseen reaction may already have been withdrawn.
+            // Edits/deletes bind to their actual MLS sender. A removal from
+            // any configured operator is a conservative objection, never proof
+            // of admin authority or a positive deletion/approval instruction.
+            self.receiver.record(serde_json::json!({
+                "schema":"semantic-removal.v1", "authenticated_candidate":candidate
+            }))?;
+            for target in &targets {
+                self.removals.insert((
+                    if app.kind == MARMOT_APP_EVENT_KIND_REMOVE {
+                        None
+                    } else {
+                        Some(hex::encode(candidate.sender.as_slice()))
+                    },
+                    target.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn record_check_time(&self, expiry: Option<u64>) -> Result<u64, ReceiverHold> {
+        let checked = self.receiver.checked_now()?;
+        if expiry.is_some_and(|e| checked >= e) {
+            return Err(ReceiverHold::ChangedState);
+        }
+        #[cfg(test)]
+        std::thread::sleep(self.record_delay);
+        Ok(checked)
+    }
     fn expiry_for(&self, original: &OriginalAsk) -> Result<Option<u64>, ReceiverHold> {
         #[cfg(unix)]
         if let Some(profile) = &self.expiry_profile {
@@ -519,7 +541,15 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         let expired: Vec<_> = self
             .asks
             .iter()
-            .filter(|(_, a)| !a.expired && a.expires_at_unix_ms.is_some_and(|e| now >= e))
+            .filter(|(_, a)| {
+                !a.expired
+                    && !a.consumed
+                    && !a.conflicted
+                    && a.receipt
+                        .as_ref()
+                        .is_none_or(|r| r.decision == Decision::Approve)
+                    && a.expires_at_unix_ms.is_some_and(|e| now >= e)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for ask in expired {
@@ -563,10 +593,11 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         {
             return Err(ReceiverHold::ChangedState);
         }
+        let checked_at_unix_ms = self.record_check_time(ask.expires_at_unix_ms)?;
         self.held = true;
         self.receiver
             .record(serde_json::json!({"schema":"semantic-consumed.v1",
-            "ask_id":ask_id,"operation_sha256":expected_operation_sha256,"sequence":r.sequence}))?;
+            "ask_id":ask_id,"operation_sha256":expected_operation_sha256,"sequence":r.sequence, "checked_at_unix_ms":checked_at_unix_ms}))?;
         let ask = self
             .asks
             .get_mut(ask_id)

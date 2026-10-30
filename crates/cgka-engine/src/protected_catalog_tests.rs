@@ -79,3 +79,31 @@ fn terminal_history_above_ten_thousand_and_32mib_rebuilds_with_bounded_live_proj
         .is_err()
     );
 }
+
+#[test]
+fn cache_read_and_write_refuse_symlink_without_touching_target() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("cache");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let disk = Disk::fresh(File::open(&directory).unwrap()).unwrap();
+    let target = root.path().join("untouched");
+    std::fs::write(&target, b"retained original").unwrap();
+    symlink(&target, disk.key(Space::Checkpoint, "key")).unwrap();
+    assert!(
+        disk.read::<serde_json::Value>(Space::Checkpoint, "key")
+            .is_err()
+    );
+    assert!(
+        disk.put(
+            Space::Checkpoint,
+            "key",
+            &serde_json::json!({"replacement":true})
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(target).unwrap(), b"retained original");
+}

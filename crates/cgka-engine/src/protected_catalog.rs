@@ -110,8 +110,8 @@ impl Disk {
     fn read<T: DeserializeOwned>(&self, space: Space, key: &str) -> Result<Option<T>> {
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(0x20000)
-            .open(self.key(space, key)); // Linux O_NOFOLLOW.
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.key(space, key)); // Architecture-correct Linux O_NOFOLLOW.
         let mut file = match file {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -141,7 +141,7 @@ impl Disk {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(0x20000)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(self.key(space, key))
             .map_err(|_| ReceiverHold::Journal)?;
         check_file(&file)?;
@@ -517,7 +517,7 @@ impl Builder<'_> {
         if !valid_ask_id(&id)
             || self.building.len() >= 100
             || text(v, "policy_sha256")? != self.policy
-            || expiry <= record.local_unix_ms
+            || expiry <= checked_at(v, record)?
             || self.disk.read::<Ask>(Space::Ask, &id)?.is_some()
         {
             return Err(ReceiverHold::ChangedState);
@@ -745,7 +745,16 @@ impl Builder<'_> {
             .read::<Ask>(Space::Ask, id)?
             .ok_or(ReceiverHold::ChangedState)?;
         let at = v["at_unix_ms"].as_u64().ok_or(ReceiverHold::Malformed)?;
-        if ask.complete_sequence.is_none() || at < ask.expiry || at > record.local_unix_ms {
+        if ask.complete_sequence.is_none()
+            || !matches!(
+                ask.disposition,
+                Disposition::Awaiting | Disposition::Approved
+            )
+            || ask.consumed
+            || ask.conflicted
+            || at < ask.expiry
+            || at > record.local_unix_ms
+        {
             return Err(ReceiverHold::ChangedState);
         }
         ask.disposition = Disposition::Expired;
@@ -762,7 +771,7 @@ impl Builder<'_> {
             .ok_or(ReceiverHold::ChangedState)?;
         if ask.disposition != Disposition::Approved
             || text(v, "operation_sha256")? != ask.original_sha256
-            || record.local_unix_ms >= ask.expiry
+            || checked_at(v, record)? >= ask.expiry
         {
             return Err(ReceiverHold::ChangedState);
         }
@@ -918,3 +927,17 @@ fn validate_candidate(
 #[cfg(test)]
 #[path = "protected_catalog_tests.rs"]
 mod tests;
+
+// Source-owned clock observation retained with the transition. Append/fsync may
+// finish later; replay must use the same actual authorization check, not a new
+// write timestamp. Legacy records without this field keep the stricter old rule.
+fn checked_at(v: &serde_json::Value, record: &SourceRecord) -> Result<u64> {
+    let at = match v.get("checked_at_unix_ms") {
+        Some(value) => value.as_u64().ok_or(ReceiverHold::Malformed)?,
+        None => record.local_unix_ms,
+    };
+    if at > record.local_unix_ms {
+        return Err(ReceiverHold::ChangedState);
+    }
+    Ok(at)
+}

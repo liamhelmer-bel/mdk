@@ -1415,3 +1415,190 @@ async fn actual_owner_reopens_only_retained_direct_unchanged_policy_update() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn short_original(id: &str, group: &cgka_traits::types::GroupId, lifetime_ms: u64) -> OriginalAsk {
+    let mut original = finite_original(id, group);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&original.operation_canonical).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    value["outage"]["deadline_ns"] = serde_json::json!(now + u128::from(lifetime_ms) * 1_000_000);
+    original.operation_canonical = serde_json::to_vec(&value).unwrap();
+    original
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_checked_time_survives_original_write_crossing_expiry() {
+    let (mut f, _, root, relay) = fresh_recovery_factory().await;
+    f.record_delay = std::time::Duration::from_millis(2200);
+    let original = short_original("ask3", &f.receiver.group, 1800);
+    f.post(original).await.unwrap();
+    f.record_delay = std::time::Duration::ZERO;
+    let mut f = restart_factory(f, root.path(), relay, "restart1")
+        .await
+        .unwrap();
+    assert!(f.asks["ask3"].expired);
+    assert!(!f.held);
+    f.post(finite_original("ask4", &f.receiver.group))
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_checked_time_preserves_consumed_and_denied_after_expiry() {
+    for deny in [false, true] {
+        let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+        f.post(short_original("ask3", &f.receiver.group, 4000))
+            .await
+            .unwrap();
+        let target = f.asks["ask3"].app_ids[0].clone();
+        let reply = reaction(&mut op, &f, &target, if deny { "👎" } else { "👍" }).await;
+        f.ingest(reply).await.unwrap();
+        if deny {
+            tokio::time::sleep(std::time::Duration::from_millis(4100)).await;
+        } else {
+            f.record_delay = std::time::Duration::from_millis(4100);
+            f.consume("ask3", &digest(b"exact source-only operation"))
+                .unwrap();
+            f.record_delay = std::time::Duration::ZERO;
+        }
+        let mut f = restart_factory(f, root.path(), relay.clone(), "restart1")
+            .await
+            .unwrap();
+        let view = f
+            .catalog
+            .as_ref()
+            .unwrap()
+            .ask(f.ordered().unwrap(), "ask3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            view.disposition,
+            if deny {
+                catalog::Disposition::Denied
+            } else {
+                catalog::Disposition::Consumed
+            }
+        );
+        assert!(
+            f.consume("ask3", &digest(b"exact source-only operation"))
+                .is_err()
+        );
+        assert!(!f.held);
+        if !deny {
+            let contrary = reaction(&mut op, &f, &target, "👎").await;
+            f.ingest(contrary).await.unwrap();
+            let view = f
+                .catalog
+                .as_ref()
+                .unwrap()
+                .ask(f.ordered().unwrap(), "ask3")
+                .unwrap()
+                .unwrap();
+            assert!(
+                view.conflicted,
+                "consumed consent retains contrary evidence after expiry"
+            );
+            assert!(view.consumed);
+        }
+        f.post(finite_original("ask4", &f.receiver.group))
+            .await
+            .unwrap();
+        restart_factory(f, root.path(), relay, "restart2")
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_unprojected_reply_expires_during_downtime_without_poisoning() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    f.post(short_original("ask3", &f.receiver.group, 1800))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let yes = reaction(&mut op, &f, &target, "👍").await;
+    f.receiver.ingest(yes).await.unwrap().unwrap();
+    let sequence = f.receiver.sequence;
+    tokio::time::sleep(std::time::Duration::from_millis(1900)).await;
+    let mut f = restart_factory(f, root.path(), relay, "restart1")
+        .await
+        .unwrap();
+    assert_eq!(f.receiver.sequence, sequence);
+    let mut cursor = f.ordered().unwrap().source_cursor().unwrap();
+    while let Some(record) = cursor.next().unwrap() {
+        assert_ne!(
+            record.body["schema"], "semantic-decision.v1",
+            "late recovered reply must never record a decision"
+        );
+    }
+    assert!(
+        f.consume("ask3", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    assert!(!f.held);
+    f.post(finite_original("ask4", &f.receiver.group))
+        .await
+        .unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_multicard_removal_retains_early_third_approval_tombstone() {
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    for id in ["ask3", "ask4", "ask5"] {
+        f.post(finite_original(id, &f.receiver.group))
+            .await
+            .unwrap();
+    }
+    let target = f.asks["ask5"].app_ids[0].clone();
+    let early = MarmotAppEvent::new(
+        hex::encode(op.self_id().as_slice()),
+        1,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![vec!["e".into(), target]],
+        "👍",
+    );
+    let deletion = app_wire(
+        &mut op,
+        &f,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![
+            vec!["e".into(), f.asks["ask3"].app_ids[0].clone()],
+            vec!["e".into(), f.asks["ask4"].app_ids[0].clone()],
+            vec!["e".into(), early.id.clone()],
+        ],
+        "",
+    )
+    .await;
+    assert!(f.ingest(deletion).await.unwrap().is_none());
+    let SendResult::ApplicationMessage { msg, .. } = op
+        .send(SendIntent::AppMessage {
+            group_id: f.receiver.group.clone(),
+            payload: early.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("application");
+    };
+    assert!(f.ingest(msg).await.unwrap().is_none());
+    let mut f = restart_factory(f, root.path(), relay, "restart1")
+        .await
+        .unwrap();
+    assert!(
+        f.consume("ask5", &digest(b"exact source-only operation"))
+            .is_err()
+    );
+    assert!(!f.held);
+    f.post(finite_original("ask6", &f.receiver.group))
+        .await
+        .unwrap();
+}

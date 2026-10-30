@@ -91,6 +91,8 @@ pub(crate) struct Capture {
     pub(crate) convergence_entered: bool,
     pub(crate) requested_group: Option<GroupId>,
     pub(crate) direct: Option<DirectMerge>,
+    #[cfg(test)]
+    pub(crate) fail_retain: bool,
 }
 impl Capture {
     pub(crate) fn for_group(group: GroupId) -> Self {
@@ -99,7 +101,17 @@ impl Capture {
             ..Self::default()
         }
     }
+    pub(crate) fn invalidate(&mut self) {
+        self.convergence_entered = true;
+        self.direct = None;
+    }
     pub(crate) fn retain(&mut self, evidence: DirectMerge) -> Result<(), EngineError> {
+        #[cfg(test)]
+        if self.fail_retain {
+            return Err(EngineError::Other(
+                "injected capture failure after native commit".into(),
+            ));
+        }
         if self.direct.is_some() {
             return Err(EngineError::Other(
                 "receiver observed multiple direct merges".into(),
