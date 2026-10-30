@@ -147,10 +147,10 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             latched: false,
         })
     }
-    /// Called only after the semantic projection and finite profile are ready.
-    /// A crash after retained enrollment but before its native acknowledgment is
-    /// accepted only for the exact actual captured original Welcome.
-    pub(super) fn acknowledge_reopened_pending(&mut self) -> Result<(), ReceiverHold> {
+    /// Validate all actual pending native data before semantic reconstruction
+    /// can append any decision, conflict or expiry. This performs no deletion.
+    /// A retained original Welcome is accepted only through its exact capture.
+    pub(super) fn check_reopened_pending(&self) -> Result<Vec<MessageId>, ReceiverHold> {
         let ReceiverJournal::Ordered(journal) = &self.journal else {
             return Err(ReceiverHold::Configuration);
         };
@@ -192,9 +192,17 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                 return Err(ReceiverHold::ChangedState);
             }
         }
+        Ok(ids)
+    }
+    /// The exclusive owner calls this only after the precheck and successful
+    /// semantic projection; no native ingress runs between these two steps.
+    pub(super) fn acknowledge_reopened_pending(
+        &mut self,
+        ids: &[MessageId],
+    ) -> Result<(), ReceiverHold> {
         self.engine
             .storage
-            .delete_pending_application_events(&ids)
+            .delete_pending_application_events(ids)
             .map_err(|_| ReceiverHold::Journal)?;
         self.engine.events_buf.clear(); // Every entry positively matched above.
         Ok(())

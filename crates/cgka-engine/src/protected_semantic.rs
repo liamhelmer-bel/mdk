@@ -552,6 +552,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        let held_before_expiry = self.held;
         for ask in expired {
             self.held = true;
             self.receiver.record(
@@ -561,8 +562,10 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
                 .get_mut(&ask)
                 .ok_or(ReceiverHold::ChangedState)?
                 .expired = true;
-            self.held = false;
         }
+        // Expiry must not clear an outer in-progress classification hold. Errors
+        // above deliberately retain the hold rather than restore it.
+        self.held = held_before_expiry;
         Ok(())
     }
     /// One-use evidence lookup. Caller IDs/digests select retained facts; they do not create them.

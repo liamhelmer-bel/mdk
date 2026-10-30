@@ -82,3 +82,30 @@ multi-card early removal, recovered native reply expiry, actual postcommit join 
 merge capture failures, and a cache symlink that cannot read or alter its target.
 Linear history lookup, fsynced disposable cache rebuild cost, and duplicated strict
 readback validation remain disclosed improvements rather than new qualification.
+
+
+## Round-two correctness repair and retained crash limits
+
+Expiry preserves an enclosing classification hold; a failed outer transition cannot
+become usable simply because an unrelated ask expired. Clean reopen checks all
+actual native pending events against the retained original Welcome and positively
+recorded application projections before catalog reconstruction can append decisions,
+conflicts, removals or expiry. Only after successful semantic reconstruction does
+the exclusive owner delete exactly the prechecked pending event IDs. No native
+ingress runs between check and acknowledgment.
+
+Card-complete and consumed transitions currently require two separately fsynced
+ordered records (semantic transition, then control/one-use anchor transition).
+A process or I/O failure between those records leaves an incomplete semantic
+boundary. Reconstruction refuses it with HOLD; it does not replay, consume again,
+or infer the missing terminal control. This accepted PoC crash-window limitation
+requires authenticated recovery rather than ordinary clean reopen. The chain alone
+does not make those two writes torn-write-free.
+
+Protected join/merge capture is an observational authority guard outside the
+OpenMLS transaction, an explicit exception to the general atomic native projection
+rule. Failure after durable native commit invalidates the protected capture and
+holds the receiver while ordinary native finalization continues. No protected
+receipt is granted and no original wire is retried. The private reopen transport
+parameter also retains the existing non-wasm transport-layering exception; no
+production authority or new external constructor is claimed.

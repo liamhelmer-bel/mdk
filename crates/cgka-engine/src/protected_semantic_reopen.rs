@@ -28,10 +28,11 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         files: ReopenFiles,
     ) -> Result<Self, ReceiverHold> {
         let receiver = ProtectedReceiver::reopen_ordered(engine, group, operators, journal)?;
+        let pending = receiver.check_reopened_pending()?;
         let mut factory =
             Self::new(receiver, transport, endpoints)?.with_expiry_profile(files.expiry)?;
         factory.enable_reopened_catalog(files.cache)?;
-        factory.receiver.acknowledge_reopened_pending()?;
+        factory.receiver.acknowledge_reopened_pending(&pending)?;
         factory.expire()?;
         factory.sync_catalog()?;
         Ok(factory)

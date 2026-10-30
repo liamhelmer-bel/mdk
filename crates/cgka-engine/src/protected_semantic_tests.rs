@@ -1602,3 +1602,71 @@ async fn actual_owner_multicard_removal_retains_early_third_approval_tombstone()
         .await
         .unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_expiry_preserves_outer_classification_hold() {
+    let (mut f, mut op, _root, relay) = fresh_recovery_factory().await;
+    f.post(short_original("ask3", &f.receiver.group, 1800))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let reply = reaction(&mut op, &f, &target, "👍").await;
+    let candidate = f.receiver.ingest(reply).await.unwrap().unwrap();
+    // An actual native outcome reaches the duplicate guard after time crosses
+    // expiry during the outer classification boundary. No candidate is forged.
+    f.seen_candidates.insert(candidate.message_id.clone());
+    f.held = true;
+    tokio::time::sleep(std::time::Duration::from_millis(1900)).await;
+    assert!(matches!(
+        f.classify(candidate),
+        Err(ReceiverHold::ChangedState)
+    ));
+    assert!(f.asks["ask3"].expired);
+    assert!(f.held, "expiry cannot erase the enclosing hold on failure");
+    let published = relay.wires.lock().unwrap().len();
+    assert!(matches!(
+        f.post(finite_original("ask4", &f.receiver.group)).await,
+        Err(ReceiverHold::Latched)
+    ));
+    assert_eq!(relay.wires.lock().unwrap().len(), published);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn actual_owner_unknown_pending_refuses_before_recovered_decision_write() {
+    use cgka_traits::MessageStorage;
+    let (mut f, mut op, root, relay) = fresh_recovery_factory().await;
+    f.post(finite_original("ask3", &f.receiver.group))
+        .await
+        .unwrap();
+    let target = f.asks["ask3"].app_ids[0].clone();
+    let reply = reaction(&mut op, &f, &target, "👍").await;
+    // Complete actual owned native ingress, interrupted before semantic decision.
+    f.receiver.ingest(reply).await.unwrap().unwrap();
+    let extra = app_wire(&mut op, &f, MARMOT_APP_EVENT_KIND_CHAT, vec![], "unowned").await;
+    f.receiver.engine.ingest(extra).await.unwrap();
+    let storage = f.receiver.engine.storage.clone();
+    let pending = serde_json::to_vec(&storage.list_pending_application_events().unwrap()).unwrap();
+    let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    let published = relay.wires.lock().unwrap().len();
+    assert!(matches!(
+        restart_factory(f, root.path(), relay.clone(), "unknown-pending").await,
+        Err(ReceiverHold::ChangedState)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        journal
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+        anchor
+    );
+    assert_eq!(
+        serde_json::to_vec(&storage.list_pending_application_events().unwrap()).unwrap(),
+        pending,
+        "unknown native data must remain intact"
+    );
+    assert_eq!(relay.wires.lock().unwrap().len(), published);
+}
