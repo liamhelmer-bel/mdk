@@ -26,6 +26,37 @@ pub(super) struct InstalledProducer {
     // Exact enrolled immutable interpreter/import closure; not a caller manifest.
     pub(super) closure: Vec<(PathBuf, String)>,
 }
+/// Exact pair read from the owned authenticated MLS group-context component.
+/// Neither a routing index nor a caller profile establishes this relationship.
+pub(super) struct GroupBinding {
+    native: GroupId,
+    transport: [u8; 32],
+}
+impl GroupBinding {
+    pub(super) fn read<S: cgka_traits::storage::StorageProvider + 'static>(
+        engine: &crate::Engine<S>,
+        native: &GroupId,
+        transport: &[u8],
+    ) -> Result<Self, ReceiverHold> {
+        let group = engine
+            .take_mls_group(native)
+            .map_err(|_| ReceiverHold::Engine)?
+            .ok_or(ReceiverHold::ChangedState)?;
+        let routing = crate::app_components::nostr_routing_of_group(&group)
+            .map_err(|_| ReceiverHold::ChangedState)?
+            .ok_or(ReceiverHold::ChangedState)?;
+        if group.group_id().as_slice() != native.as_slice()
+            || routing.nostr_group_id.as_slice() != transport
+        {
+            return Err(ReceiverHold::ChangedState);
+        }
+        Ok(Self {
+            native: native.clone(),
+            transport: routing.nostr_group_id,
+        })
+    }
+}
+
 pub(super) struct Inputs {
     pub(super) profile: File,
     pub(super) archive: File,
@@ -152,7 +183,7 @@ impl InstalledProducer {
         &self,
         inputs: Inputs,
         original: &[u8],
-        group: &GroupId,
+        binding: &GroupBinding,
     ) -> Result<OriginalAsk, ReceiverHold> {
         self.check()?;
         let files = [&inputs.profile, &inputs.archive, &inputs.commit];
@@ -171,7 +202,7 @@ impl InstalledProducer {
         }
         let profile = read_profile(&inputs.profile)?;
         if digest(original) != profile.operation_original_sha256
-            || hex::encode(group.as_slice()) != profile.group_hex
+            || hex::encode(binding.transport) != profile.group_hex
         {
             return Err(ReceiverHold::ChangedState);
         }
@@ -197,7 +228,7 @@ impl InstalledProducer {
         {
             return Err(ReceiverHold::ChangedState);
         }
-        correlate(&raw, original, group, &profile)
+        correlate(&raw, original, binding, &profile)
     }
 }
 fn decode(value: &str) -> Result<Vec<u8>, ReceiverHold> {
@@ -214,7 +245,7 @@ fn decode(value: &str) -> Result<Vec<u8>, ReceiverHold> {
 fn correlate(
     raw: &[u8],
     original: &[u8],
-    group: &GroupId,
+    binding: &GroupBinding,
     profile: &Profile,
 ) -> Result<OriginalAsk, ReceiverHold> {
     if raw.is_empty() || raw.len() > 256 * 1024 {
@@ -232,7 +263,7 @@ fn correlate(
         || value.packet_sha256 != digest(&canonical)
         || value.packet_sha256 != profile.packet_sha256
         || value.published_original_sha256 != value.packet_sha256
-        || value.group_hex != hex::encode(group.as_slice())
+        || value.group_hex != hex::encode(binding.transport)
         || value.group_hex != profile.group_hex
         || value.publication_url != profile.publication_url
         || value.request_sha256 != digest(&request)
@@ -252,7 +283,7 @@ fn correlate(
     }
     Ok(OriginalAsk {
         ask_id: value.ask_id,
-        expected_group: group.clone(),
+        expected_group: binding.native.clone(),
         operation: original.to_vec(),
         operation_canonical: canonical,
         original_request: request,
@@ -261,14 +292,35 @@ fn correlate(
 }
 
 #[cfg(test)]
+pub(super) fn qualification_original(
+    raw: &[u8],
+    binding: &GroupBinding,
+) -> Result<OriginalAsk, ReceiverHold> {
+    let value: Output = serde_json::from_slice(raw).unwrap();
+    let original = decode(&value.operation_original).unwrap();
+    let profile = Profile {
+        schema: "heterodyne-owned-card-profile.v1".into(),
+        operation_original_sha256: value.operation_original_sha256.clone(),
+        packet_sha256: value.packet_sha256.clone(),
+        group_hex: value.group_hex.clone(),
+        publication_url: value.publication_url.clone(),
+        targets: serde_json::json!([]),
+    };
+    correlate(raw, &original, binding, &profile)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (Output, Profile, Vec<u8>, GroupId) {
+    fn fixture() -> (Output, Profile, Vec<u8>, GroupBinding) {
         let value: serde_json::Value =
             serde_json::from_str(include_str!("protected_owned_fixture.json")).unwrap();
         let output: Output = serde_json::from_value(value["output"].clone()).unwrap();
         let original = decode(&output.operation_original).unwrap();
-        let group = GroupId::new(hex::decode(&output.group_hex).unwrap());
+        let group = GroupBinding {
+            native: GroupId::new(vec![0x81; 16]),
+            transport: hex::decode(&output.group_hex).unwrap().try_into().unwrap(),
+        };
         let profile = Profile {
             schema: "heterodyne-owned-card-profile.v1".into(),
             operation_original_sha256: output.operation_original_sha256.clone(),
@@ -284,8 +336,17 @@ mod tests {
         // Actual Product producer output under synthetic HTTPS/profile, not runtime custody.
         let (value, profile, original, group) = fixture();
         let raw = serde_json::to_vec(&value).unwrap();
+        let wrong_route = GroupBinding {
+            native: group.native.clone(),
+            transport: [0x91; 32],
+        };
+        assert!(matches!(
+            correlate(&raw, &original, &wrong_route, &profile),
+            Err(ReceiverHold::ChangedState)
+        ));
         let ask = correlate(&raw, &original, &group, &profile).unwrap();
         assert_eq!(ask.operation, original);
+        assert_eq!(ask.expected_group, group.native);
         assert_ne!(ask.operation, ask.operation_canonical);
         assert_eq!(
             ask.original_request,
@@ -293,6 +354,34 @@ mod tests {
         );
         assert_eq!(ask.card_chunks, vec![value.card]);
     }
+    #[test]
+    fn owned_output_refuses_product_routing_group_and_exact_card_tampering() {
+        let (mut value, mut profile, original, binding) = fixture();
+        // Matching Product profile/output still cannot replace native-authenticated routing.
+        value.group_hex = hex::encode([0x92; 32]);
+        profile.group_hex = value.group_hex.clone();
+        assert!(matches!(
+            correlate(
+                &serde_json::to_vec(&value).unwrap(),
+                &original,
+                &binding,
+                &profile
+            ),
+            Err(ReceiverHold::ChangedState)
+        ));
+        let (mut value, profile, original, binding) = fixture();
+        value.card.push('!');
+        assert!(matches!(
+            correlate(
+                &serde_json::to_vec(&value).unwrap(),
+                &original,
+                &binding,
+                &profile
+            ),
+            Err(ReceiverHold::ChangedState)
+        ));
+    }
+
     #[test]
     fn owned_output_correlation_refuses_changed_binding_and_noncanonical_bytes() {
         let (mut value, profile, original, group) = fixture();

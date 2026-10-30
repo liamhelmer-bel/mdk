@@ -1,0 +1,396 @@
+//! Disposable actual Product child/Git + real MLS; relay ACK and HTTPS/rendering
+//! are explicit fixtures. No runtime custody, operator or deployment authority.
+use super::*;
+use crate::Engine;
+use nostr::base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::process::Command;
+
+const PRODUCT_HEAD: &str = "faec83f17b92d3251e3118942c982661b085be59";
+
+#[tokio::test]
+#[ignore = "qualification requires pinned Product checkout and Python test dependencies; no live relay"]
+async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_frame() {
+    let product = std::env::var_os("HETERODYNE_QUALIFICATION_PRODUCT")
+        .expect("explicit test Product checkout");
+    let python = std::env::var_os("HETERODYNE_QUALIFICATION_PYTHON").expect("explicit test Python");
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&product)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), PRODUCT_HEAD);
+    assert!(
+        Command::new("git")
+            .args(["diff", "--quiet", "HEAD"])
+            .current_dir(&product)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (mut factory, mut operator, root, relay) = current_routed_fixture().await;
+    assert_eq!(factory.receiver.group.as_slice().len(), 16);
+    let transport_group = [7; 32];
+    let binding = super::super::owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &factory.receiver.group,
+        &transport_group,
+    )
+    .unwrap();
+    let fixture = root.path().join("current-whole-packet.json");
+    let generator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/support/current_whole_packet.py");
+    let generated = Command::new(python)
+        .arg(generator)
+        .arg("--product")
+        .arg(&product)
+        .arg("--output")
+        .arg(&fixture)
+        .arg("--group-hex")
+        .arg(hex::encode(transport_group))
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "test-only Product generator failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let fixture_bytes = std::fs::read(&fixture).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&fixture_bytes).unwrap();
+    assert_eq!(payload["product_head"], PRODUCT_HEAD);
+    assert!(
+        payload["qualification"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic HTTPS/rendering")
+    );
+    let raw = STANDARD
+        .decode(payload["output_original_base64"].as_str().unwrap())
+        .unwrap();
+    let ask = super::super::owned_producer::qualification_original(&raw, &binding).unwrap();
+    assert_eq!(ask.expected_group, factory.receiver.group);
+    assert_eq!(payload["output"]["group_hex"], hex::encode(transport_group));
+    let wrong_route_binding = super::super::owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &factory.receiver.group,
+        &[8; 32],
+    );
+    assert!(matches!(
+        wrong_route_binding,
+        Err(ReceiverHold::ChangedState)
+    ));
+    let expected = serde_json::to_value(&ask).unwrap();
+    let operation = digest(&ask.operation);
+    let canonical = digest(&ask.operation_canonical);
+    let id = ask.ask_id.clone();
+    assert_ne!(ask.operation, ask.operation_canonical);
+    assert_eq!(operation, payload["output"]["operation_original_sha256"]);
+    assert_eq!(canonical, payload["output"]["packet_sha256"]);
+    assert_eq!(
+        digest(&ask.original_request),
+        payload["output"]["request_sha256"]
+    );
+    assert_eq!(ask.card_chunks.len(), 1);
+    assert!(ask.card_chunks[0].contains("OUTAGE"));
+    let packet: serde_json::Value = serde_json::from_slice(&ask.operation_canonical).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    assert!(u128::from(packet["release"]["not_before_ns"].as_u64().unwrap()) <= now);
+    assert!(now < u128::from(packet["outage"]["deadline_ns"].as_u64().unwrap()));
+    factory.post(ask).await.unwrap();
+    assert_eq!(relay.wires.lock().unwrap().len(), 1);
+    for wire in relay.wires.lock().unwrap().clone() {
+        operator.ingest(wire).await.unwrap();
+    }
+    operator.drain_events();
+    let target = factory.asks[&id].app_ids[0].clone();
+    let reply = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
+    assert_eq!(factory.ingest(reply).await.unwrap(), Some(id.clone()));
+    assert!(factory.consume(&id, &canonical).is_err());
+    assert!(consumed_key(&factory, &id, &operation).is_err());
+    super::super::owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &factory.receiver.group,
+        &transport_group,
+    )
+    .unwrap();
+    factory.consume(&id, &operation).unwrap();
+    let key = consumed_key(&factory, &id, &operation).unwrap();
+    let receipt = factory.asks[&id].receipt.as_ref().unwrap();
+    let original = serde_json::to_value(&factory.asks[&id].original).unwrap();
+    assert_eq!(original, expected);
+    let (mut sender, mut consumer) = UnixStream::pair().unwrap();
+    let nonce = [0x39; 32];
+    consumer.write_all(&nonce).unwrap();
+    let mut challenge = [0; 32];
+    sender.read_exact(&mut challenge).unwrap();
+    let response = Consumed {
+        schema: "heterodyne-owned-consumed.v1",
+        nonce_hex: hex::encode(challenge),
+        startup_profile_sha256: &"01".repeat(32),
+        enrollment_sha256: &"02".repeat(32),
+        journal_profile_sha256: &"03".repeat(32),
+        producer_closure_sha256: &"04".repeat(32),
+        original: &original,
+        consumption_key: key,
+        receipt,
+    };
+    let bytes = serde_json::to_vec(&response).unwrap();
+    write_frame(&mut sender, &bytes).unwrap();
+    let mut prefix = [0; 4];
+    consumer.read_exact(&mut prefix).unwrap();
+    assert_eq!(u32::from_be_bytes(prefix) as usize, bytes.len());
+    let mut frame = vec![0; bytes.len()];
+    consumer.read_exact(&mut frame).unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(result["schema"], "heterodyne-owned-consumed.v1");
+    assert_eq!(result["nonce_hex"], hex::encode(nonce));
+    assert_eq!(result["original"], expected);
+    assert_eq!(result["receipt"]["decision"], "Approve");
+    assert_eq!(
+        result["receipt"]["operator"],
+        serde_json::to_value(operator.self_id()).unwrap()
+    );
+    assert_eq!(result["receipt"]["operation_sha256"], operation);
+    assert_eq!(
+        result["consumption_key"]["original_operation_sha256"],
+        operation
+    );
+    assert_eq!(result["consumption_key"]["ask_id"], id);
+    let records: Vec<serde_json::Value> =
+        std::fs::read_to_string(root.path().join("receiver/journal"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let consumed = records
+        .iter()
+        .find(|r| r["body"]["kind"] == "consumed")
+        .unwrap();
+    let card = records
+        .iter()
+        .find(|r| r["body"]["kind"] == "card-complete")
+        .unwrap();
+    assert_eq!(result["consumption_key"], consumed["body"]["key"]);
+    assert_eq!(
+        result["consumption_key"]["header_sha256"],
+        records[0]["sha256"]
+    );
+    assert_eq!(
+        result["consumption_key"]["card_complete_sequence"],
+        card["sequence"]
+    );
+    assert!(factory.consume(&id, &operation).is_err());
+    drop(consumer);
+    assert!(write_frame(&mut sender, &bytes).is_err());
+    assert!(factory.asks[&id].consumed); // lost reply never reverses durable one-use.
+    eprintln!(
+        "TEST ONLY: actual Product {} child/Git + real MLS approve/consume/frame PASS; synthetic HTTPS/render/relay ACK; generated fixture SHA256 {}",
+        PRODUCT_HEAD,
+        digest(&fixture_bytes)
+    );
+}
+
+// Current profile, actual Schnorr account proof signer and NIP-59/445 peeler.
+// Journal enrollment below is disposable test evidence, not host custody.
+async fn current_routed_fixture() -> (
+    SemanticFactory<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    Arc<super::super::tests::Relay>,
+) {
+    use cgka_traits::{
+        app_components::{
+            AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, default_group_components,
+            encode_nostr_routing_v1,
+        },
+        engine::{CreateGroupRequest, SendResult},
+        transport::TransportEnvelope,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let client = || {
+        let keys = nostr::Keys::generate();
+        let mut supported = default_group_components();
+        supported.insert(NOSTR_ROUTING_COMPONENT_ID);
+        EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+            .supported_app_components(supported)
+            .identity(keys.public_key().to_bytes().to_vec())
+            .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
+            .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
+            .build()
+            .unwrap()
+    };
+    let mut operator = client();
+    let mut controller = client();
+    let mut kp = controller.fresh_key_package().await.unwrap();
+    kp.source = Some(cgka_traits::engine::KeyPackageSource {
+        event_id: cgka_traits::types::MessageId::new(vec![4; 32]),
+    });
+    let components = vec![AppComponentData {
+        component_id: NOSTR_ROUTING_COMPONENT_ID,
+        data: encode_nostr_routing_v1(
+            &NostrRoutingV1::new([7; 32], vec!["wss://semantic.invalid".into()]).unwrap(),
+        )
+        .unwrap(),
+    }];
+    let (group, sent) = operator
+        .create_group(CreateGroupRequest {
+            name: "current protected qualification".into(),
+            description: String::new(),
+            members: vec![kp],
+            required_features: vec![],
+            app_components: components,
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::FoundingGroupCreated { welcomes } = sent else {
+        panic!("current profile must create canonical founding group")
+    };
+    let welcome = welcomes
+        .into_iter()
+        .find(|w| {
+            matches!(&w.envelope,
+        TransportEnvelope::Welcome{recipient} if recipient == &controller.self_id())
+        })
+        .unwrap();
+    controller.join_welcome(welcome).await.unwrap();
+    operator.drain_events();
+    controller.drain_events();
+    let root = tempfile::tempdir().unwrap();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema":"heterodyne-receiver-expiry.v1", "max_approval_lifetime_ms":60000,
+    }))
+    .unwrap();
+    std::fs::write(root.path().join("profile"), &bytes).unwrap();
+    std::fs::set_permissions(
+        root.path().join("profile"),
+        std::fs::Permissions::from_mode(0o400),
+    )
+    .unwrap();
+    let operators = vec![operator.self_id()];
+    let (journal, _) = crate::protected_receiver::tests::ordered_fixture_profile(
+        root.path(),
+        &controller,
+        &group,
+        &operators,
+        digest(&bytes),
+    );
+    let receiver =
+        ProtectedReceiver::new(controller, group, operators, tempfile::tempfile().unwrap())
+            .unwrap();
+    let relay = Arc::new(super::super::tests::Relay::default());
+    let adapter = NostrTransportAdapter::new(relay.clone());
+    adapter
+        .activate_account(TransportAccountActivation {
+            account_id: receiver.engine.self_id(),
+            inbox_endpoints: vec![],
+            group_subscriptions: vec![],
+            since: None,
+        })
+        .await
+        .unwrap();
+    let mut factory = SemanticFactory::new(
+        receiver,
+        adapter,
+        vec![TransportEndpoint::from("wss://semantic.invalid")],
+    )
+    .unwrap();
+    factory.receiver.journal = crate::protected_receiver::ReceiverJournal::Ordered(journal);
+    let factory = factory
+        .with_expiry_profile(File::open(root.path().join("profile")).unwrap())
+        .unwrap();
+    (factory, operator, root, relay)
+}
+
+#[tokio::test]
+async fn current_native_group_context_checks_both_enrolled_domains_and_requires_routing() {
+    let (mut factory, _, _, _) = current_routed_fixture().await;
+    let engine = &factory.receiver.engine;
+    let group = &factory.receiver.group;
+    assert_eq!(group.as_slice().len(), 16);
+    assert!(super::super::owned_producer::GroupBinding::read(engine, group, &[7; 32]).is_ok());
+    assert!(matches!(
+        super::super::owned_producer::GroupBinding::read(engine, group, &[8; 32]),
+        Err(ReceiverHold::ChangedState)
+    ));
+    assert!(matches!(
+        super::super::owned_producer::GroupBinding::read(
+            engine,
+            &GroupId::new(vec![0; 16]),
+            &[7; 32]
+        ),
+        Err(ReceiverHold::ChangedState)
+    ));
+    let (unrouted, _) = factory
+        .receiver
+        .engine
+        .create_group(cgka_traits::engine::CreateGroupRequest {
+            name: "unrouted current group".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            app_components: vec![],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    // No direct-native fallback, even when a profile supplies that same identity.
+    assert!(matches!(
+        super::super::owned_producer::GroupBinding::read(
+            &factory.receiver.engine,
+            &unrouted,
+            unrouted.as_slice(),
+        ),
+        Err(ReceiverHold::ChangedState)
+    ));
+}
+
+#[tokio::test]
+async fn owned_exchange_refuses_wrong_native_or_transport_before_external_publication() {
+    for wrong_native in [true, false] {
+        let (mut factory, _, _, relay) = current_routed_fixture().await;
+        let mut ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
+        let mut route = vec![7; 32];
+        if wrong_native {
+            ask.expected_group = GroupId::new(vec![0; 16]);
+        } else {
+            route = vec![8; 32];
+        }
+        let session = Session {
+            ask,
+            transport_group: route,
+            wait_seconds: 1,
+            profile_sha: "01".repeat(32),
+            enrollment_sha: "02".repeat(32),
+            journal_sha: "03".repeat(32),
+            closure_sha: "04".repeat(32),
+            nonce: [0x61; 32],
+        };
+        let adapter = factory.transport.clone();
+        let (_tx, rx) = tokio::sync::broadcast::channel(2);
+        let forwarder = forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
+        let (mut receiver, mut consumer) = UnixStream::pair().unwrap();
+        let subscriptions_before = relay.subscriptions.lock().unwrap().len();
+        assert!(matches!(
+            exchange(&mut factory, &adapter, &forwarder, &mut receiver, session).await,
+            Err(ReceiverHold::ChangedState)
+        ));
+        assert!(relay.wires.lock().unwrap().is_empty());
+        assert_eq!(
+            relay.subscriptions.lock().unwrap().len(),
+            subscriptions_before
+        );
+        assert!(factory.asks.is_empty());
+        let mut length = [0; 4];
+        consumer.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+        consumer.read_exact(&mut bytes).unwrap();
+        let hold: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(hold["schema"], "heterodyne-owned-receiver-hold.v1");
+        assert_eq!(hold["automatic_replay_permitted"], false);
+        forwarder.abort();
+    }
+}

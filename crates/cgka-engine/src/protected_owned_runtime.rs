@@ -235,6 +235,11 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
         profile.endpoints.clone(),
         reopen::ReopenFiles { expiry, cache },
     )?;
+    let binding = owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &group,
+        &profile.transport_group,
+    )?;
     let producer = owned_producer::InstalledProducer {
         python: profile.python,
         source: profile.product_source,
@@ -248,7 +253,7 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
             commit,
         },
         &original,
-        &group,
+        &binding,
     )?;
     let forwarder = forward(sdk.clone(), adapter.clone(), relay_spool);
     let result = exchange(
@@ -339,6 +344,14 @@ async fn exchange_inner<S: StorageProvider + 'static>(
     session: Session,
 ) -> Result<(), ReceiverHold> {
     let ask = session.ask;
+    owned_producer::GroupBinding::read(
+        &factory.receiver.engine,
+        &ask.expected_group,
+        &session.transport_group,
+    )?;
+    if ask.expected_group != factory.receiver.group {
+        return Err(ReceiverHold::ChangedState);
+    }
     let ask_id = ask.ask_id.clone();
     let operation_sha = digest(&ask.operation);
     let expected_ask = serde_json::to_value(&ask).map_err(|_| ReceiverHold::Malformed)?;
@@ -350,7 +363,7 @@ async fn exchange_inner<S: StorageProvider + 'static>(
             inbox_endpoints: vec![],
             group_subscriptions: vec![TransportGroupSubscription {
                 group_id: factory.receiver.group.clone(),
-                transport_group_id: session.transport_group,
+                transport_group_id: session.transport_group.clone(),
                 endpoints: factory.endpoints.clone(),
             }],
             since: None,
@@ -438,6 +451,11 @@ async fn exchange_inner<S: StorageProvider + 'static>(
             if forwarder.is_finished() {
                 return Err(ReceiverHold::Engine);
             }
+            owned_producer::GroupBinding::read(
+                &factory.receiver.engine,
+                &factory.receiver.group,
+                &session.transport_group,
+            )?;
             factory.consume(&ask_id, &operation_sha)?;
             let consumption_key = consumed_key(factory, &ask_id, &operation_sha)?;
             let receipt = factory.asks[&ask_id]
@@ -963,3 +981,7 @@ mod enroll;
 pub(crate) fn enroll_entry() -> bool {
     enroll::entry()
 }
+
+#[cfg(test)]
+#[path = "protected_whole_packet_tests.rs"]
+mod whole_packet_qualification;
