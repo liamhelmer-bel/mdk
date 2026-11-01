@@ -61,6 +61,7 @@ impl Installation {
             return Err(Error::Encoding);
         }
         crate::runtime_recipe::qualify_index(&index.as_value()?).map_err(|_| Error::Encoding)?;
+        crate::runtime_config::require_fixed_etc(&root)?;
         // The complete baseline bytes are corroborated independently of the tree.
         let external = index.inspect_external_baseline(&open_protected(Path::new("/"))?)?;
         crate::runtime_platform::qualify(&index, &root, &external)?;
