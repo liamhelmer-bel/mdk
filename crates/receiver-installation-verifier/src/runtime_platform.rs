@@ -155,12 +155,11 @@ fn dependency_set(
     objects: &BTreeMap<&str, &Dependencies>,
     cache: &BTreeMap<String, Vec<String>>,
 ) -> Result<()> {
-    if let Some(interpreter) = &deps.interpreter {
-        if interpreter != "/lib64/ld-linux-x86-64.so.2"
-            || !objects.contains_key(library_path(interpreter)?.as_str())
-        {
-            return Err(Error::Path);
-        }
+    if let Some(interpreter) = &deps.interpreter
+        && (interpreter != "/lib64/ld-linux-x86-64.so.2"
+            || !objects.contains_key(library_path(interpreter)?.as_str()))
+    {
+        return Err(Error::Path);
     }
     for name in &deps.needed {
         let paths = cache.get(name).ok_or(Error::Path)?;
@@ -191,11 +190,18 @@ pub fn qualify(index: &Index, root: &File, external: &[ExternalObject]) -> Resul
         absent(path)?;
     }
     protected_dir(Path::new("/etc"))?;
-    let value=index.as_value()?;
-    let expected=value["external"].as_array().ok_or(Error::Encoding)?.iter()
-        .find(|e|e["path"]=="/etc/ld.so.cache").ok_or(Error::Path)?;
+    let value = index.as_value()?;
+    let expected = value["external"]
+        .as_array()
+        .ok_or(Error::Encoding)?
+        .iter()
+        .find(|e| e["path"] == "/etc/ld.so.cache")
+        .ok_or(Error::Path)?;
     let raw = std::fs::read("/etc/ld.so.cache").map_err(|_| Error::Path)?;
-    if raw.len() as u64 != expected["size"].as_u64().ok_or(Error::Encoding)? || crate::installation::digest(&raw) != expected["sha256"].as_str().ok_or(Error::Encoding)? {
+    if raw.len() as u64 != expected["size"].as_u64().ok_or(Error::Encoding)?
+        || crate::installation::digest(&raw)
+            != expected["sha256"].as_str().ok_or(Error::Encoding)?
+    {
         return Err(Error::Path);
     }
     let cache = cache(&raw)?;
