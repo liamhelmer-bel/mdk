@@ -172,8 +172,8 @@ pub(crate) fn entry() -> Result<()> {
         || facts.capability_policy_sha256 != profile.capability_policy_sha256
         || !input::hash(&facts.account, 64)
         || profile.operators.contains(&facts.account)
-        || facts.key_package_ref.is_empty()
-        || facts.key_package_ref.len() > 256
+        || facts.account == profile.expected_welcomer
+        || !input::hash(&facts.key_package_ref, 64)
     {
         return Err(());
     }
