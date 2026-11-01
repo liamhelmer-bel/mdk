@@ -173,10 +173,7 @@ fn frame(raw: &[u8], nonce: &[u8; 32], schema: &str) -> Result<Value> {
 /// All must be prepared by the retained root launcher, never accepted from an
 /// operator JSON command, sandbox mount, or mutable pathname request.
 fn retain_process_result(state: &File, response: &[u8], nonce: &[u8; 32]) -> Result<()> {
-    let v = crate::native_frame::read(response)?;
-    if v.get("nonce_hex").and_then(Value::as_str) != Some(hex::encode(nonce).as_str()) {
-        return Err(());
-    }
+    frame(response, nonce, "heterodyne-owned-consumed.v3")?;
     create(state, "07-process-result.json", 0, 0o400, response)?;
     Ok(())
 }
@@ -397,7 +394,7 @@ mod tests {
         let f = File::open(d.path()).unwrap();
         let nonce = [7; 32];
         let raw = format!(
-            "{{\"nonce_hex\":\"{}\",\"message\":\"line\\nvalue\"}}",
+            "{{\"schema\":\"heterodyne-owned-consumed.v3\",\"nonce_hex\":\"{}\",\"message\":\"line\\nvalue\"}}",
             hex::encode(nonce)
         )
         .into_bytes();
@@ -409,6 +406,18 @@ mod tests {
         assert!(retain_process_result(&f, duplicate.as_bytes(), &nonce).is_err());
         let float = format!("{{\"nonce_hex\":\"{}\",\"value\":1.5}}", hex::encode(nonce));
         assert!(retain_process_result(&f, float.as_bytes(), &nonce).is_err());
+        for schema in [
+            "heterodyne-owned-consumed-hold.v1",
+            "heterodyne-owned-fresh-enrollment.v3",
+            "",
+        ] {
+            let refused =
+                serde_json::to_vec(&json!({"schema":schema,"nonce_hex":hex::encode(nonce)}))
+                    .unwrap();
+            assert!(retain_process_result(&f, &refused, &nonce).is_err());
+            assert!(!d.path().join("07-process-result.json").exists());
+        }
+        assert!(retain_process_result(&f, &raw, &[8; 32]).is_err());
         assert!(!d.path().join("07-process-result.json").exists());
         retain_process_result(&f, &raw, &nonce).unwrap();
         assert_eq!(

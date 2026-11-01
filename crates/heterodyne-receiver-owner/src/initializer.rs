@@ -1,7 +1,9 @@
 //! Durable initialization phases. No receive runtime or network entry exists here.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::{BufRead, BufReader, Read};
+use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
@@ -177,6 +179,7 @@ impl Ledger {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reopen(
         mut file: File,
         directory: File,
@@ -371,6 +374,7 @@ impl Ledger {
         self.advance(Phase::Published)
     }
 
+    #[cfg(test)]
     pub(crate) fn receiver_started(&mut self) -> Result<(), Error> {
         self.advance(Phase::ReceiverStarted)
     }
