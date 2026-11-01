@@ -143,7 +143,10 @@ fn dynamic(raw: &[u8], s: Segment) -> Result<Vec<(u64, u64)>> {
             | 35..=37
             | 0x6ffffef5
             | 0x6ffffff0
-            | 0x6ffffff9..=0x6fffffff => {}
+            | 0x6ffffff9..=0x6fffffff
+            // x86-64 psABI PLT address/size/entry-size metadata, not loader search.
+            // https://sourceware.org/pipermail/binutils/2023-September/129718.html
+            | 0x70000000 | 0x70000001 | 0x70000003 => {}
             _ => return Err(Error::Unsupported),
         }
         // DT_RUNPATH is included in the numeric data range but never admitted.
@@ -291,6 +294,59 @@ mod tests {
         assert!(inspect(&raw).is_err());
         for length in 0..original.len() {
             assert!(inspect(&original[..length]).is_err())
+        }
+    }
+    #[test]
+    fn x86_64_plt_metadata_does_not_admit_other_processor_tags() {
+        for tag in [0x70000000, 0x70000001, 0x70000003] {
+            let mut raw = fixture();
+            // Replace only SONAME; dependency extraction is otherwise unchanged.
+            put(&mut raw, 256 + 3 * 16, tag, 8);
+            let got = inspect(&raw).unwrap();
+            assert_eq!(got.needed, ["libc.so.6"]);
+            assert_eq!(got.soname, None);
+            put(&mut raw, 18, 183, 2);
+            assert_eq!(inspect(&raw), Err(Error::Unsupported));
+        }
+        for tag in [0x70000002, 0x70000004, 0x7fffffff] {
+            let mut raw = fixture();
+            put(&mut raw, 256 + 3 * 16, tag, 8);
+            assert_eq!(inspect(&raw), Err(Error::Unsupported));
+        }
+    }
+    #[test]
+    #[ignore = "actual host libc/libm control; requires x86-64 PLT-marked libraries"]
+    fn actual_host_plt_marked_libraries_preserve_dependency_checks() {
+        for (path, soname) in [
+            ("/usr/lib/x86_64-linux-gnu/libc.so.6", "libc.so.6"),
+            ("/usr/lib/x86_64-linux-gnu/libm.so.6", "libm.so.6"),
+        ] {
+            let raw = std::fs::read(path).unwrap();
+            let segment = single(&segments(&raw).unwrap(), 2).unwrap().unwrap();
+            let got = inspect(&raw).unwrap();
+            assert_eq!(got.soname.as_deref(), Some(soname));
+            assert!(!got.needed.is_empty());
+            for tag in [0x70000000, 0x70000001, 0x70000003] {
+                let offsets: Vec<_> = (0..segment.size / 16)
+                    .map(|i| segment.offset + i * 16)
+                    .filter(|at| word(&raw, *at, 8).unwrap() == tag)
+                    .collect();
+                assert_eq!(offsets.len(), 1, "{path}: missing/duplicate tag {tag:x}");
+                let mut corrupt = raw.clone();
+                put(&mut corrupt, offsets[0] as usize, 0x70000002, 8);
+                assert_eq!(inspect(&corrupt), Err(Error::Unsupported));
+            }
+            // Even a real otherwise-admitted library cannot override search paths.
+            let needed_at = (0..segment.size / 16)
+                .map(|i| segment.offset + i * 16)
+                .find(|at| word(&raw, *at, 8).unwrap() == 1)
+                .unwrap();
+            let mut corrupt = raw.clone();
+            put(&mut corrupt, needed_at as usize, 29, 8);
+            assert_eq!(inspect(&corrupt), Err(Error::Unsupported));
+            let mut malformed = raw.clone();
+            put(&mut malformed, needed_at as usize + 8, u64::MAX, 8);
+            assert!(inspect(&malformed).is_err());
         }
     }
     #[test]
