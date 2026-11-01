@@ -60,8 +60,10 @@ impl Installation {
         if index.recipe_id != self.recipe_id || index.platform_id != self.platform_id {
             return Err(Error::Encoding);
         }
+        crate::runtime_recipe::qualify_index(&index.as_value()?).map_err(|_| Error::Encoding)?;
         // The complete baseline bytes are corroborated independently of the tree.
-        index.inspect_external_baseline(&open_protected(Path::new("/"))?)?;
+        let external=index.inspect_external_baseline(&open_protected(Path::new("/"))?)?;
+        crate::runtime_platform::qualify(&index,&root,&external)?;
         Ok(Verified {
             reference: self.clone(),
             root,
