@@ -986,19 +986,85 @@ async fn actual_v013_welcome_and_commit_enter_exact_admind_v010_policy() {
         recipient.storage.list_groups().unwrap(),
         vec![reply.group.clone()]
     );
+    // Use the real protected joined-owner continuation and ordered journal,
+    // not a manually installed merge capture or a convergence clock shortcut.
+    let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v3".into(),
+        account: hex::encode(recipient.self_id().as_slice()),
+        group: hex::encode(reply.group.as_slice()),
+        operators: vec![hex::encode(reply.welcomer.as_slice())],
+        expected_welcomer: hex::encode(reply.welcomer.as_slice()),
+        source_profile_sha256: "55".repeat(32),
+        storage_generation: "66".repeat(32),
+        initial_native_state_sha256: hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&evidence.joined).unwrap(),
+        )),
+        welcome_provenance_sha256: evidence.digest().unwrap(),
+        expiry_profile_sha256: "77".repeat(32),
+        installation_index_sha256: "aa".repeat(32),
+        installation_source_sha256: "bb".repeat(32),
+        capability_template: template.id().into(),
+        capability_policy_sha256: template.policy_sha256(),
+    }; // Fixture-only profile/install pins, never production custody evidence.
+    let journal = crate::protected_recovery::Journal::enroll(
+        crate::protected_join::tests::recovery_files(root.path()),
+        enrollment.clone(),
+    )
+    .unwrap();
     let before = recipient.group_record(&reply.group).unwrap().epoch;
-    let mut capture = crate::protected_merge::Capture::for_group(reply.group.clone());
-    capture.template = Some(template);
-    recipient.receiver_merge_capture = Some(capture);
-    let outcome = recipient.ingest(reply.commit).await.unwrap();
-    eprintln!("actual0.13 commit outcome: {outcome:?}");
-    recipient
-        .advance_convergence_inputs_until_settled(&reply.group, u64::MAX)
-        .await
+    let mut receiver = crate::protected_receiver::ProtectedReceiver::from_native_join(
+        recipient,
+        reply.group.clone(),
+        vec![reply.welcomer.clone()],
+        journal,
+        evidence,
+    )
+    .unwrap();
+    assert!(receiver.ingest(reply.commit).await.unwrap().is_none());
+    assert_eq!(
+        receiver.engine.group_record(&reply.group).unwrap().epoch.0,
+        before.0 + 1
+    );
+    receiver
+        .engine
+        .with_mls_group(&reply.group, |native| template.validate_group(native))
         .unwrap();
-    let after = recipient.group_record(&reply.group).unwrap().epoch;
-    assert!(
-        after > before,
-        "actual0.13 postjoin native commit advances receiver epoch"
+    let history = std::fs::read_to_string(root.path().join("receiver/journal")).unwrap();
+    let rows: Vec<serde_json::Value> = history
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let outcome: serde_json::Value = serde_json::from_slice(
+        &hex::decode(
+            rows.last().unwrap()["body"]["payload_hex"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome["schema"], "receiver-outcome.v1");
+    assert!(outcome["native_merge"].is_object());
+    // Positive ordered recovery must independently derive the new native
+    // projection from the retained direct merge, not the original join epoch.
+    let crate::protected_receiver::ProtectedReceiver {
+        engine, journal, ..
+    } = receiver;
+    drop(journal);
+    let journal = crate::protected_recovery::Journal::reopen(
+        crate::protected_join::tests::recovery_files(root.path()),
+        &enrollment,
+    )
+    .unwrap();
+    let reopened = crate::protected_receiver::ProtectedReceiver::reopen_ordered(
+        engine,
+        reply.group.clone(),
+        vec![reply.welcomer],
+        journal,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.engine.group_record(&reply.group).unwrap().epoch.0,
+        before.0 + 1
     );
 }

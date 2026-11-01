@@ -2,12 +2,13 @@
 
 Source-only implementation within approved438y. This does not select a new
 protected generation, publish any KeyPackage, enroll a group, enable a network
-service or claim compatibility with the current MarmotApp group. Its required
-SelfRemove Proposal10 remains unsupported. Closed v3 descriptor composition is
-separate and is not implemented here.
+service or claim installed compatibility with the live MarmotApp group.
+The separately qualified exact `admind-receiver-v1` template adds native
+SelfRemove Proposal10 to the bounded receive policy for current-group admission.
+Closed v3 descriptors bind this exact template and digest.
 
-`routing_only_v1()` and `bounded_app_receiver_v1()` return closed parameter-free
-Template values. Components are pinned source constants, independent of future
+`routing_only_v1()`, `bounded_app_receiver_v1()` and `admind_receiver_v1()`
+return closed parameter-free Template values. Components are pinned source constants, independent of future
 mutable defaults. The bounded registry advertises only Optional receive F2D1;
 no send/fanout extension or Proposal10 is advertised. Actual current wire
 metadata is checked as sorted exact sets: extensions[6,F2D1], proposals[8] and
@@ -18,7 +19,8 @@ retained as source evidence; future generation composition must bind the exact
 closed recipe rather than silently interpreting old profiles differently.
 
 The existing fixed native constructor now uses the explicit routing factory
-with the same actual metadata; it never selects the bounded factory. Generic
+with the same actual metadata. Fixed startup also accepts the exact independently
+bound admind template; generic bounded profiles remain refused. Generic
 engine defaults are unchanged. The private JoinConstraint additionally carries
 a closed Template. Capture checks the authenticated staged MLS group after
 native validation and before original intent writing/native commit. Bounded
@@ -67,3 +69,12 @@ These causal tests require Linux and the protected-owner-runtime feature. The
 recorded commands enable it explicitly; ordinary CI without that feature does
 not exercise this private protected-owner test module. Future generation
 composition must unify the separately fixed routing engine/constraint choices.
+
+Current admind template metadata is extensions[6,F2D1], proposals[8,10], with
+the same bounded component set. The unchanged routing/bounded goldens retain
+their original meanings. Proposal10 advertisement permits genuine native join;
+it does not promise automatic departure handling. SelfRemove or any roster
+change can conservatively HOLD, preserving native evidence without replay.
+Cross-version ordinary SelfUpdate is separately qualified through the actual
+ProtectedReceiver ordered ingest and clean reopen, without deterministic
+convergence shortcuts. Disposable profile/install pins are not host custody.
