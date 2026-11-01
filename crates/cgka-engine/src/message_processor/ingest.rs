@@ -1722,6 +1722,16 @@ impl<S: StorageProvider> Engine<S> {
                         crate::app_components::validate_current_profile_group_invariants(
                             &mls_group,
                         )?;
+                        // The protected owner selected this exact compiled template
+                        // from the anchored generation. Validate inside the same
+                        // rollbackable native transaction, before durable mirror.
+                        if let Some(template) = self
+                            .receiver_merge_capture
+                            .as_ref()
+                            .and_then(|c| c.template)
+                        {
+                            template.validate_group(&mls_group)?;
+                        }
                         if private_direct_update {
                             let before_projection = &receiver_merge_before
                                 .as_ref()

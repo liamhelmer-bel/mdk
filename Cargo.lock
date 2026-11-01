@@ -937,6 +937,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_traits",
  "rand 0.8.6",
+ "receiver-installation-verifier",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5025,6 +5026,18 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "receiver-installation-verifier"
+version = "0.10.3"
+dependencies = [
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

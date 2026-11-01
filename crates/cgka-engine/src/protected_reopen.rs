@@ -69,6 +69,14 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         {
             return Err(ReceiverHold::ChangedState);
         }
+        let template = crate::protected_capability_policy::Template::from_policy(
+            &enrollment.capability_template,
+            &enrollment.capability_policy_sha256,
+        )
+        .map_err(|_| ReceiverHold::Configuration)?;
+        engine
+            .with_mls_group(&group, |native| template.validate_group(native))
+            .map_err(|_| ReceiverHold::ChangedState)?;
         let mut cursor = journal.source_cursor().map_err(|_| ReceiverHold::Journal)?;
         cursor
             .next()

@@ -91,6 +91,7 @@ pub(crate) struct Capture {
     pub(crate) convergence_entered: bool,
     pub(crate) requested_group: Option<GroupId>,
     pub(crate) direct: Option<DirectMerge>,
+    pub(crate) template: Option<crate::protected_capability_policy::Template>,
     #[cfg(test)]
     pub(crate) fail_retain: bool,
 }

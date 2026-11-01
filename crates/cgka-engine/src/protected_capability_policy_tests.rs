@@ -27,6 +27,7 @@ async fn closed_templates_match_actual_persisted_private_package_metadata() {
             owned_routed_engine(
                 SqliteAccountStorage::in_memory().unwrap(),
                 nostr::Keys::generate(),
+                routing_only_v1(),
             )
             .unwrap()
         } else {
@@ -91,6 +92,11 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             client(bounded_app_receiver_v1())
         };
         let mut recipient = client(bounded_app_receiver_v1());
+        let mut native_control = client(bounded_app_receiver_v1());
+        let mut control_kp = native_control.fresh_key_package().await.unwrap();
+        control_kp.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: cgka_traits::types::MessageId::new(vec![5; 32]),
+        });
         let mut kp = recipient.fresh_key_package().await.unwrap();
         let reference = hex::decode(
             crate::key_package_metadata(&kp)
@@ -114,7 +120,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 CreateGroupRequest {
                     name: "bounded handling fixture".into(),
                     description: String::new(),
-                    members: vec![kp],
+                    members: vec![kp, control_kp],
                     required_features: vec![],
                     initial_admins: vec![],
                     app_components: vec![
@@ -154,7 +160,9 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
         let SendResult::FoundingGroupCreated { mut welcomes } = sent else {
             panic!("Current founding group")
         };
-        let wire = welcomes.remove(0);
+        let position=welcomes.iter().position(|w|matches!(&w.envelope,cgka_traits::TransportEnvelope::Welcome{recipient:r} if r==&recipient.self_id())).unwrap();
+        let wire = welcomes.remove(position);
+        let control_wire = welcomes.remove(0);
         let root = tempfile::tempdir().unwrap();
         let original = OpenOptions::new()
             .create_new(true)
@@ -182,6 +190,24 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             .await
             .unwrap();
         if variant == "bounded" {
+            let control_intent = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.path().join("control-intent"))
+                .unwrap();
+            native_control
+                .receiver_join_owned(
+                    control_wire,
+                    JoinIntent {
+                        file: control_intent,
+                        directory: File::open(root.path()).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            native_control.drain_events();
             assert!(result.is_some());
             assert_eq!(
                 recipient.storage.list_groups().unwrap(),
@@ -262,6 +288,43 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             assert_eq!(outcomes.len(), 4);
             assert!(outcomes[1]["candidate"].is_null());
             assert_eq!(outcomes[3]["candidate"]["application"]["kind"], 9);
+
+            // Actual post-join commit: the same native-valid wider policy must
+            // roll back inside SQL before durable state, then succeed without
+            // the private enrolled-template guard as a causal control.
+            let before = receiver.engine.group_authority(&group).unwrap().facts.epoch;
+            let mut wider = AgentTextStreamQuicPolicyV1::user_to_agent_default();
+            wider.max_plaintext_frame_len = 8192;
+            let SendResult::GroupEvolution { msg: commit, .. } = inviter
+                .do_send_update_app_components(
+                    group.clone(),
+                    vec![wider.to_app_component_data().unwrap()],
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("policy commit")
+            };
+            let mut capture = crate::protected_merge::Capture::for_group(group.clone());
+            capture.template = Some(bounded_app_receiver_v1());
+            receiver.engine.receiver_merge_capture = Some(capture);
+            assert!(receiver.engine.ingest(commit.clone()).await.is_err());
+            assert_eq!(
+                receiver.engine.storage.get_group(&group).unwrap().epoch,
+                before
+            );
+            // Independently joined native control accepts the exact commit;
+            // the protected receiver never retries its refused original.
+            assert!(matches!(
+                native_control.ingest(commit).await.unwrap(),
+                cgka_traits::ingest::IngestOutcome::Processed
+            ));
+            assert!(
+                native_control
+                    .with_mls_group(&group, |native| bounded_app_receiver_v1()
+                        .validate_group(native))
+                    .is_err()
+            );
         } else {
             assert!(result.is_none());
             assert_eq!(original.metadata().unwrap().len(), 0);
@@ -680,4 +743,28 @@ async fn unrequired_group_context_extension_refuses_before_intent_with_native_co
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn exact_closed_policy_codec_matches_design_bytes_and_rejects_cross_binding() {
+    for template in [routing_only_v1(), bounded_app_receiver_v1()] {
+        let raw = template.canonical_policy();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["template"], template.id());
+        assert_eq!(value["mls_proposals"], serde_json::json!([8]));
+        assert_eq!(serde_json::to_vec(&value).unwrap(), raw);
+        assert_eq!(
+            Template::from_policy(template.id(), &template.policy_sha256()).unwrap(),
+            template
+        );
+        assert!(Template::from_policy(template.id(), &"00".repeat(32)).is_err());
+    }
+    assert!(
+        Template::from_policy(
+            routing_only_v1().id(),
+            &bounded_app_receiver_v1().policy_sha256()
+        )
+        .is_err()
+    );
+    assert!(Template::from_policy("default", &routing_only_v1().policy_sha256()).is_err());
 }

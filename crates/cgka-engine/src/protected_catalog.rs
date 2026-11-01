@@ -445,7 +445,7 @@ impl Builder<'_> {
             self.disk.put(Space::Ask, &id, &ask)?;
             return Ok(());
         }
-        if record.body["kind"] == "header-v2" && record.sequence == 1 {
+        if record.body["kind"] == "header-v3" && record.sequence == 1 {
             return Ok(());
         }
         if record.body["kind"] != "source" {

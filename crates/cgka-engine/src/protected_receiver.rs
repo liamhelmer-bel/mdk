@@ -437,6 +437,20 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         self.engine.receiver_merge_capture = Some(crate::protected_merge::Capture::for_group(
             self.group.clone(),
         ));
+        #[cfg(unix)]
+        if let ReceiverJournal::Ordered(journal) = &self.journal {
+            let enrollment = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
+            let template = crate::protected_capability_policy::Template::from_policy(
+                &enrollment.capability_template,
+                &enrollment.capability_policy_sha256,
+            )
+            .map_err(|_| ReceiverHold::Configuration)?;
+            self.engine
+                .receiver_merge_capture
+                .as_mut()
+                .ok_or(ReceiverHold::ChangedState)?
+                .template = Some(template);
+        }
         let result = self.engine.ingest(wire.clone()).await;
         let content_id = self
             .engine

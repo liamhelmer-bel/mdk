@@ -37,6 +37,60 @@ impl Template {
             "routing-only-v1"
         }
     }
+    /// Exact reviewed policy bytes, independent of mutable Engine defaults.
+    pub fn canonical_policy(self) -> Vec<u8> {
+        let bounded = self.bounded;
+        let components: Vec<u16> = self.components().into_iter().collect();
+        let key_components = if bounded {
+            vec![1, 0x8001, 0x8003, 0x8004, 0x8006, 0x8009, 0x800b, 0x800c]
+        } else {
+            vec![1, 0x8001, 0x8003, 0x8004, 0x8009, 0x800c]
+        };
+        let extensions = if bounded { vec![6, 0xf2d1] } else { vec![6] };
+        let effective_extensions = if bounded {
+            vec![1, 2, 3, 4, 5, 6, 0xf2d1]
+        } else {
+            vec![1, 2, 3, 4, 5, 6]
+        };
+        let features: Vec<&str> = if bounded {
+            vec!["marmot.feature.agent_text_stream_quic.receive.v1"]
+        } else {
+            vec![]
+        };
+        let quic = if bounded {
+            serde_json::json!({
+                "required_roles": 1, "allowed_roles": 3, "max_plaintext_frame": 4096,
+                "replay_ttl": 0, "padding": 0
+            })
+        } else {
+            serde_json::Value::Null
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "heterodyne-receiver-capability-policy.v1", "template": self.id(),
+            "protocol": "current", "component_inputs": components,
+            "key_package_components": key_components, "mls_extensions": extensions,
+            "mls_proposals": [8], "effective_extensions": effective_extensions,
+            "effective_proposals": [1,2,3,4,5,6,7,8], "features": features,
+            "quic": quic, "media": if bounded { "v2-validated-no-fetch" } else { "none" }
+        }))
+        .expect("closed integer policy is JSON serializable")
+    }
+    pub fn policy_sha256(self) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(self.canonical_policy()))
+    }
+    /// Exact closed policy selection; no capability lists or caller override.
+    pub fn from_policy(id: &str, sha256: &str) -> Result<Self, EngineError> {
+        let template = match id {
+            "routing-only-v1" => routing_only_v1(),
+            "bounded-app-receiver-v1" => bounded_app_receiver_v1(),
+            _ => return Err(refused()),
+        };
+        if template.policy_sha256() != sha256 {
+            return Err(refused());
+        }
+        Ok(template)
+    }
     pub fn components(self) -> std::collections::BTreeSet<u16> {
         (if self.bounded {
             vec![0x8001, 0x8003, 0x8004, 0x8006, 0x800b, 0x800c]

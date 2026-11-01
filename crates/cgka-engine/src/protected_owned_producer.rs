@@ -206,10 +206,21 @@ impl InstalledProducer {
         {
             return Err(ReceiverHold::ChangedState);
         }
-        let paths = serde_json::to_string(&[&self.source, &self.purelib])
-            .map_err(|_| ReceiverHold::Configuration)?;
+        let stdlib = self
+            .python
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or(ReceiverHold::Configuration)?
+            .join("lib/python3.12");
+        let paths = serde_json::to_string(&[
+            &stdlib,
+            &stdlib.join("lib-dynload"),
+            &self.source,
+            &self.purelib,
+        ])
+        .map_err(|_| ReceiverHold::Configuration)?;
         let bootstrap = format!(
-            "import sys; sys.path.extend({paths}); from heterodyne.actions.deployment_producer_process import _entry; sys.exit(_entry())"
+            "import sys; sys.path={paths}; from heterodyne.actions.deployment_producer_process import _entry; sys.exit(_entry())"
         );
         let mut command = Command::new(&self.python);
         command

@@ -255,7 +255,14 @@ async fn qualify_owned_exchange(
             profile_sha: "01".repeat(32),
             enrollment_sha: "02".repeat(32),
             journal_sha: "03".repeat(32),
-            closure_sha: "04".repeat(32),
+            installation_index_sha256: "04".repeat(32),
+            installation_source_sha256: "05".repeat(32),
+            capability_template: crate::protected_capability_policy::routing_only_v1()
+                .id()
+                .into(),
+            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
+            installation: None,
             nonce,
         },
     )
@@ -271,7 +278,7 @@ async fn qualify_owned_exchange(
     let mut frame = vec![0; u32::from_be_bytes(prefix) as usize];
     consumer.read_exact(&mut frame).unwrap();
     let result: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-    assert_eq!(result["schema"], "heterodyne-owned-consumed.v1");
+    assert_eq!(result["schema"], "heterodyne-owned-consumed.v3");
     assert_eq!(result["nonce_hex"], hex::encode(nonce));
     assert_eq!(result["original"], expected);
     assert_eq!(result["receipt"]["decision"], "Approve");
@@ -502,7 +509,14 @@ async fn owned_exchange_refuses_wrong_native_or_transport_before_external_public
             profile_sha: "01".repeat(32),
             enrollment_sha: "02".repeat(32),
             journal_sha: "03".repeat(32),
-            closure_sha: "04".repeat(32),
+            installation_index_sha256: "04".repeat(32),
+            installation_source_sha256: "05".repeat(32),
+            capability_template: crate::protected_capability_policy::routing_only_v1()
+                .id()
+                .into(),
+            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
+            installation: None,
             nonce: [0x61; 32],
         };
         let adapter = factory.transport.clone();
@@ -625,7 +639,12 @@ async fn owned_routing_construction_preserves_default_refusals_and_accepts_curre
     ) -> Engine<SqliteAccountStorage> {
         if routing {
             // This is the production constructor shared by both fixed entries.
-            owned_routed_engine(storage, keys).unwrap()
+            owned_routed_engine(
+                storage,
+                keys,
+                crate::protected_capability_policy::routing_only_v1(),
+            )
+            .unwrap()
         } else {
             EngineBuilder::new(storage)
                 .identity(keys.public_key().to_bytes().to_vec())
@@ -706,7 +725,12 @@ async fn owned_routing_construction_preserves_default_refusals_and_accepts_curre
                     );
                     drop(recipient);
                     // The resumed receiver uses the exact same constructor.
-                    let reopened = owned_routed_engine(storage, keys).unwrap();
+                    let reopened = owned_routed_engine(
+                        storage,
+                        keys,
+                        crate::protected_capability_policy::routing_only_v1(),
+                    )
+                    .unwrap();
                     assert!(
                         super::super::owned_producer::GroupBinding::read(
                             &reopened, &group, &[7; 32]

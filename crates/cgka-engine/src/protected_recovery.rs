@@ -51,10 +51,14 @@ pub(super) struct Enrollment {
     pub(super) initial_native_state_sha256: String,
     pub(super) welcome_provenance_sha256: String,
     pub(super) expiry_profile_sha256: String,
+    pub(super) installation_index_sha256: String,
+    pub(super) installation_source_sha256: String,
+    pub(super) capability_template: String,
+    pub(super) capability_policy_sha256: String,
 }
 
 impl Enrollment {
-    pub(super) const SCHEMA: &str = "heterodyne-receiver-enrollment.v2";
+    pub(super) const SCHEMA: &str = "heterodyne-receiver-enrollment.v3";
     pub(super) fn check(&self) -> Result<()> {
         if self.schema != Self::SCHEMA
             || self.operators.is_empty()
@@ -68,9 +72,17 @@ impl Enrollment {
                 &self.initial_native_state_sha256,
                 &self.welcome_provenance_sha256,
                 &self.expiry_profile_sha256,
+                &self.installation_index_sha256,
+                &self.installation_source_sha256,
+                &self.capability_policy_sha256,
             ]
             .iter()
             .all(|v| is_hash(v))
+            || crate::protected_capability_policy::Template::from_policy(
+                &self.capability_template,
+                &self.capability_policy_sha256,
+            )
+            .is_err()
             || !valid_group(&self.group)
             || !self.operators.iter().all(|v| is_hash(v))
         {
@@ -118,7 +130,7 @@ enum Body {
         enrollment: LegacyEnrollment,
         generation: String,
     },
-    HeaderV2 {
+    HeaderV3 {
         enrollment: Enrollment,
         generation: String,
     },
@@ -307,8 +319,8 @@ impl SourceCursor {
         }
         match &record.body {
             Body::Header { .. } => return Err(Hold::Changed),
-            Body::HeaderV2 { enrollment, .. } if record.sequence == 1 => enrollment.check()?,
-            Body::HeaderV2 { .. } => return Err(Hold::Changed),
+            Body::HeaderV3 { enrollment, .. } if record.sequence == 1 => enrollment.check()?,
+            Body::HeaderV3 { .. } => return Err(Hold::Changed),
             _ if record.sequence == 1 => return Err(Hold::Changed),
             _ => (),
         }
@@ -357,7 +369,7 @@ impl Journal {
             last_time: 0,
             latched: false,
         };
-        journal.write(Body::HeaderV2 {
+        journal.write(Body::HeaderV3 {
             enrollment,
             generation: hex::encode(generation),
         })?;
@@ -398,14 +410,14 @@ impl Journal {
             }
             if sequence == 0 {
                 match &record.body {
-                    Body::HeaderV2 {
+                    Body::HeaderV3 {
                         enrollment,
                         generation,
                     } if enrollment == expected && is_hash(generation) => {}
                     _ => return Err(Hold::Changed),
                 }
                 header_digest = record.sha256.clone();
-            } else if matches!(record.body, Body::HeaderV2 { .. } | Body::Header { .. }) {
+            } else if matches!(record.body, Body::HeaderV3 { .. } | Body::Header { .. }) {
                 return Err(Hold::Changed);
             }
             let use_key = match &record.body {
@@ -536,7 +548,7 @@ impl Journal {
         io((&self.files.journal).seek(SeekFrom::Start(0)))?;
         let header =
             next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
-        let Body::HeaderV2 { enrollment, .. } = header.body else {
+        let Body::HeaderV3 { enrollment, .. } = header.body else {
             return Err(Hold::Changed);
         };
         if enrollment.welcome_provenance_sha256 != evidence.digest().map_err(|_| Hold::Changed)? {
@@ -584,7 +596,7 @@ impl Journal {
     }
     pub(super) fn enrollment(&self) -> Result<Enrollment> {
         let record = self.source_at(1)?;
-        if record.sequence != 1 || record.body["kind"] != "header-v2" {
+        if record.sequence != 1 || record.body["kind"] != "header-v3" {
             return Err(Hold::Changed);
         }
         let enrollment: Enrollment = serde_json::from_value(record.body["enrollment"].clone())
@@ -654,7 +666,7 @@ impl Journal {
             next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
         let mut operators = operators.to_vec();
         operators.sort();
-        Ok(matches!(record.body, Body::HeaderV2 { enrollment, .. }
+        Ok(matches!(record.body, Body::HeaderV3 { enrollment, .. }
             if enrollment.account == account && enrollment.group == group
                 && enrollment.operators == operators && enrollment.initial_native_state_sha256 == native))
     }
@@ -857,12 +869,12 @@ impl Journal {
     }
 
     fn validate_body(&self, body: &Body) -> Result<()> {
-        if self.sequence == 0 && !matches!(body, Body::HeaderV2 { .. }) {
+        if self.sequence == 0 && !matches!(body, Body::HeaderV3 { .. }) {
             return Err(Hold::Changed);
         }
         match body {
             Body::Header { .. } => Err(Hold::Changed),
-            Body::HeaderV2 {
+            Body::HeaderV3 {
                 enrollment,
                 generation,
             } => {

@@ -2,17 +2,10 @@
 //! enrolled profile descriptor. This parser does not replace Product validation
 //! or qualify the missing installed producer/custody opener.
 use super::{ReceiverHold, digest};
-use serde::Deserialize;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Policy {
-    schema: String,
-    max_approval_lifetime_ms: u64,
-}
 pub(super) struct Profile {
     file: File,
     sha256: String,
@@ -20,19 +13,12 @@ pub(super) struct Profile {
 }
 impl Profile {
     pub(super) fn open(file: File, expected: &str) -> Result<Self, ReceiverHold> {
-        let bytes = read(&file)?;
-        let policy: Policy =
-            serde_json::from_slice(&bytes).map_err(|_| ReceiverHold::Configuration)?;
-        if policy.schema != "heterodyne-receiver-expiry.v1"
-            || policy.max_approval_lifetime_ms == 0
-            || digest(&bytes) != expected
-        {
-            return Err(ReceiverHold::Configuration);
-        }
+        let lifetime = crate::protected_expiry_policy::verify_descriptor(&file, expected)
+            .map_err(|_| ReceiverHold::Configuration)?;
         Ok(Self {
             file,
             sha256: expected.into(),
-            lifetime: policy.max_approval_lifetime_ms,
+            lifetime,
         })
     }
     pub(super) fn check(&self) -> Result<(), ReceiverHold> {

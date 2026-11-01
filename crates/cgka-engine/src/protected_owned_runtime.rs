@@ -36,7 +36,7 @@ struct Profile {
     python: PathBuf,
     product_source: PathBuf,
     purelib: PathBuf,
-    producer_closure: Vec<(PathBuf, String)>,
+    installation: receiver_installation_verifier::reference::Installation,
     // Exact Product deadline must also pass the independently retained expiry profile.
     wait_seconds: u32,
 }
@@ -70,8 +70,8 @@ impl crate::account_identity_proof::AccountIdentityProofSigner for Signer {
 fn owned_routed_engine(
     storage: SqliteAccountStorage,
     keys: nostr::Keys,
+    template: crate::protected_capability_policy::Template,
 ) -> Result<crate::Engine<SqliteAccountStorage>, ReceiverHold> {
-    let template = crate::protected_capability_policy::routing_only_v1();
     EngineBuilder::new(storage)
         .supported_app_components(template.components())
         .feature_registry(template.registry())
@@ -99,7 +99,7 @@ pub(crate) fn entry() -> bool {
         }
         let raw = read(&profile_file, 65536)?;
         let profile: Profile = serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
-        if profile.schema != "heterodyne-protected-receiver-process.v2"
+        if profile.schema != "heterodyne-protected-receiver-process.v3"
             || profile.receiver_uid != unsafe { libc::geteuid() }
             || profile.consumer_uid == 0
             || profile.consumer_uid == profile.receiver_uid
@@ -108,12 +108,29 @@ pub(crate) fn entry() -> bool {
         {
             return Err(ReceiverHold::Configuration);
         }
+        anchor_custody::harden_process(profile.receiver_uid)?;
         profile
             .enrollment
             .check()
             .map_err(|_| ReceiverHold::Configuration)?;
         // Claim every inherited slot before Tokio can allocate epoll/eventfd into
         // a missing descriptor number. No runtime owns any of these slots yet.
+        let installation = profile
+            .installation
+            .verify()
+            .map_err(|_| ReceiverHold::Configuration)?;
+        if installation.python() != profile.python
+            || installation.product_source() != profile.product_source
+            || installation.purelib() != profile.purelib
+            || profile.installation.index_sha256 != profile.enrollment.installation_index_sha256
+            || profile
+                .installation
+                .source_sha256()
+                .map_err(|_| ReceiverHold::Configuration)?
+                != profile.enrollment.installation_source_sha256
+        {
+            return Err(ReceiverHold::ChangedState);
+        }
         let files: [File; 15] = (4..=18)
             .map(inherited)
             .collect::<Result<Vec<_>, _>>()?
@@ -124,18 +141,20 @@ pub(crate) fn entry() -> bool {
             .enable_all()
             .build()
             .map_err(|_| ReceiverHold::Engine)?;
-        rt.block_on(run(profile, digest(&raw), files))
+        rt.block_on(run(profile, digest(&raw), files, installation))
     })();
     result.is_ok()
 }
-async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result<(), ReceiverHold> {
+async fn run(
+    profile: Profile,
+    profile_sha: String,
+    files: [File; 15],
+    installation: receiver_installation_verifier::reference::Verified,
+) -> Result<(), ReceiverHold> {
     let enrollment_sha = profile
         .enrollment
         .canonical_sha256()
         .map_err(|_| ReceiverHold::Configuration)?;
-    let closure_sha = digest(
-        &serde_json::to_vec(&profile.producer_closure).map_err(|_| ReceiverHold::Malformed)?,
-    );
     // Retain all custody handles through SDK shutdown, not merely through reopen.
     let [
         key_file,
@@ -154,6 +173,7 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
         peer_file,
         original_file,
     ] = files;
+    anchor_custody::check_descriptors(&anchor, &anchor_dir, &journal_dir, &account_dir)?;
     let mut key = read(&key_file, 64)?;
     let mut dbkey = read(&dbkey_file, 64)?;
     if key.len() != 32 || dbkey.len() != 32 {
@@ -228,7 +248,12 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
     if reopened.dev() != db_meta.dev() || reopened.ino() != db_meta.ino() {
         return Err(ReceiverHold::ChangedState);
     }
-    let engine = owned_routed_engine(storage, keys)?;
+    let template = crate::protected_capability_policy::Template::from_policy(
+        &profile.enrollment.capability_template,
+        &profile.enrollment.capability_policy_sha256,
+    )
+    .map_err(|_| ReceiverHold::Configuration)?;
+    let engine = owned_routed_engine(storage, keys, template)?;
     let group =
         GroupId::new(hex::decode(&profile.enrollment.group).map_err(|_| ReceiverHold::Malformed)?);
     let operators = profile
@@ -263,7 +288,9 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
         python: profile.python,
         source: profile.product_source,
         purelib: profile.purelib,
-        closure: profile.producer_closure,
+        closure: installation
+            .closure()
+            .map_err(|_| ReceiverHold::Configuration)?,
     };
     let ask = producer.produce(
         owned_producer::Inputs {
@@ -287,7 +314,11 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
             profile_sha,
             enrollment_sha,
             journal_sha,
-            closure_sha,
+            installation_index_sha256: profile.enrollment.installation_index_sha256,
+            installation_source_sha256: profile.enrollment.installation_source_sha256,
+            capability_template: profile.enrollment.capability_template,
+            capability_policy_sha256: profile.enrollment.capability_policy_sha256,
+            installation: Some(installation),
             nonce,
         },
     )
@@ -311,7 +342,11 @@ struct Session {
     profile_sha: String,
     enrollment_sha: String,
     journal_sha: String,
-    closure_sha: String,
+    installation_index_sha256: String,
+    installation_source_sha256: String,
+    capability_template: String,
+    capability_policy_sha256: String,
+    installation: Option<receiver_installation_verifier::reference::Verified>,
     nonce: [u8; 32],
 }
 /// Actual production activation/post/replay/consume/frame state machine.
@@ -475,6 +510,11 @@ async fn exchange_inner<S: StorageProvider + 'static>(
                 &factory.receiver.group,
                 &session.transport_group,
             )?;
+            if let Some(installation) = &session.installation {
+                installation
+                    .check()
+                    .map_err(|_| ReceiverHold::ChangedState)?;
+            }
             factory.consume(&ask_id, &operation_sha)?;
             let consumption_key = consumed_key(factory, &ask_id, &operation_sha)?;
             let receipt = factory.asks[&ask_id]
@@ -484,12 +524,15 @@ async fn exchange_inner<S: StorageProvider + 'static>(
             // Exact consumed source result over the already authenticated peer;
             // a lost write is UNKNOWN, never unconsume or replay.
             let response = Consumed {
-                schema: "heterodyne-owned-consumed.v1",
+                schema: "heterodyne-owned-consumed.v3",
                 nonce_hex: hex::encode(session.nonce),
                 startup_profile_sha256: &session.profile_sha,
                 enrollment_sha256: &session.enrollment_sha,
                 journal_profile_sha256: &session.journal_sha,
-                producer_closure_sha256: &session.closure_sha,
+                installation_index_sha256: &session.installation_index_sha256,
+                installation_source_sha256: &session.installation_source_sha256,
+                capability_template: &session.capability_template,
+                capability_policy_sha256: &session.capability_policy_sha256,
                 original: &retained_original,
                 consumption_key,
                 receipt,
@@ -510,7 +553,10 @@ struct Consumed<'a> {
     startup_profile_sha256: &'a str,
     enrollment_sha256: &'a str,
     journal_profile_sha256: &'a str,
-    producer_closure_sha256: &'a str,
+    installation_index_sha256: &'a str,
+    installation_source_sha256: &'a str,
+    capability_template: &'a str,
+    capability_policy_sha256: &'a str,
     original: &'a serde_json::Value,
     consumption_key: crate::protected_recovery::UseKey,
     receipt: &'a SemanticReceipt,
@@ -584,12 +630,16 @@ mod tests {
         assert!(consumed_key(&factory, "ask3", &"ff".repeat(32)).is_err());
         let receipt = factory.asks["ask3"].receipt.as_ref().unwrap();
         let response = Consumed {
-            schema: "heterodyne-owned-consumed.v1",
+            schema: "heterodyne-owned-consumed.v3",
             nonce_hex: hex::encode(challenge),
             startup_profile_sha256: &"00".repeat(32),
             enrollment_sha256: &"01".repeat(32),
             journal_profile_sha256: &"02".repeat(32),
-            producer_closure_sha256: &"03".repeat(32),
+            installation_index_sha256: &"03".repeat(32),
+            installation_source_sha256: &"04".repeat(32),
+            capability_template: "routing-only-v1",
+            capability_policy_sha256: &crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
             original: &original,
             consumption_key,
             receipt,
@@ -673,7 +723,14 @@ mod tests {
             profile_sha: "00".repeat(32),
             enrollment_sha: "01".repeat(32),
             journal_sha: "02".repeat(32),
-            closure_sha: "03".repeat(32),
+            installation_index_sha256: "04".repeat(32),
+            installation_source_sha256: "05".repeat(32),
+            capability_template: crate::protected_capability_policy::routing_only_v1()
+                .id()
+                .into(),
+            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
+            installation: None,
             nonce: [0x61; 32],
         }
     }

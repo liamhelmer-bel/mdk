@@ -26,8 +26,15 @@ fn files(root: &Path) -> OwnedFiles {
 }
 fn enrollment() -> Enrollment {
     Enrollment {
-        schema: "heterodyne-receiver-enrollment.v2".into(),
+        schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: "66".repeat(32),
+        installation_index_sha256: "aa".repeat(32),
+        installation_source_sha256: "bb".repeat(32),
+        capability_template: crate::protected_capability_policy::routing_only_v1()
+            .id()
+            .into(),
+        capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+            .policy_sha256(),
         account: "11".repeat(32),
         group: "22".repeat(32),
         operators: vec!["33".repeat(32), "44".repeat(32)],
@@ -467,7 +474,7 @@ fn v2_enrollment_canonical_digest_and_distinct_profile_pins_are_exact() {
     assert!(
         std::str::from_utf8(&bytes)
             .unwrap()
-            .starts_with("{\"schema\":\"heterodyne-receiver-enrollment.v2\",\"account\":")
+            .starts_with("{\"schema\":\"heterodyne-receiver-enrollment.v3\",\"account\":")
     );
     assert_eq!(
         enrolled.canonical_sha256().unwrap(),
@@ -498,7 +505,7 @@ fn v2_enrollment_canonical_digest_and_distinct_profile_pins_are_exact() {
     );
     let bytes = std::fs::read(root.path().join("receiver/journal")).unwrap();
     assert!(matches!(
-        journal.write(Body::HeaderV2 {
+        journal.write(Body::HeaderV3 {
             enrollment: enrolled,
             generation: "aa".repeat(32)
         }),

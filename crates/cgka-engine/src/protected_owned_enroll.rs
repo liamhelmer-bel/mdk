@@ -21,12 +21,24 @@ struct FreshProfile {
     endpoints: Vec<TransportEndpoint>,
     wait_seconds: u32,
     expiry_profile_sha256: String,
+    installation: receiver_installation_verifier::reference::Installation,
+    capability_template: String,
+    capability_policy_sha256: String,
 }
 
 impl FreshProfile {
+    fn template(&self) -> Result<crate::protected_capability_policy::Template, ReceiverHold> {
+        crate::protected_capability_policy::Template::from_policy(
+            &self.capability_template,
+            &self.capability_policy_sha256,
+        )
+        .map_err(|_| ReceiverHold::Configuration)
+    }
     fn check(&self) -> Result<(), ReceiverHold> {
         use cgka_traits::reporting::event_id_is_valid;
-        if self.schema != "heterodyne-protected-receiver-fresh.v2"
+        if self.schema != "heterodyne-protected-receiver-fresh.v3"
+            || self.installation.check().is_err()
+            || self.template().is_err()
             || self.receiver_uid != unsafe { libc::geteuid() }
             || self.consumer_uid == 0
             || self.consumer_uid == self.receiver_uid
@@ -62,6 +74,7 @@ struct FreshBinding {
     source: File,
     source_sha256: String,
     expiry: expiry::Profile,
+    installation: Option<receiver_installation_verifier::reference::Verified>,
 }
 impl FreshBinding {
     fn new(
@@ -71,6 +84,12 @@ impl FreshBinding {
         source_sha256: String,
     ) -> Result<Self, ReceiverHold> {
         let bound = Self {
+            installation: Some(
+                profile
+                    .installation
+                    .verify()
+                    .map_err(|_| ReceiverHold::Configuration)?,
+            ),
             source,
             source_sha256,
             expiry: expiry::Profile::open(expiry, &profile.expiry_profile_sha256)?,
@@ -88,6 +107,11 @@ impl FreshBinding {
             || digest(&read(&self.source, 65536)?) != self.source_sha256
         {
             return Err(ReceiverHold::ChangedState);
+        }
+        if let Some(installation) = &self.installation {
+            installation
+                .check()
+                .map_err(|_| ReceiverHold::ChangedState)?;
         }
         self.expiry.check()
     }
@@ -111,6 +135,7 @@ pub(super) fn entry() -> bool {
         let profile: FreshProfile =
             serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         profile.check()?;
+        anchor_custody::harden_process(profile.receiver_uid)?;
         let mut claimed = (4..=16).map(inherited).collect::<Result<Vec<_>, _>>()?;
         let expiry = claimed.pop().ok_or(ReceiverHold::Configuration)?;
         let files: [File; 12] = claimed
@@ -188,7 +213,7 @@ async fn finish<S: StorageProvider + 'static>(
 
 fn constraint(profile: &FreshProfile) -> Result<JoinConstraint, ReceiverHold> {
     Ok(JoinConstraint {
-        template: crate::protected_capability_policy::routing_only_v1(),
+        template: profile.template()?,
         group: GroupId::new(hex::decode(&profile.group).map_err(|_| ReceiverHold::Malformed)?),
         operators: profile
             .operators
@@ -221,6 +246,13 @@ fn enroll_joined<S: StorageProvider + 'static>(
     canonical_operators.sort();
     let enrollment = Enrollment {
         schema: Enrollment::SCHEMA.into(),
+        installation_index_sha256: profile.installation.index_sha256.clone(),
+        installation_source_sha256: profile
+            .installation
+            .source_sha256()
+            .map_err(|_| ReceiverHold::Configuration)?,
+        capability_template: profile.capability_template.clone(),
+        capability_policy_sha256: profile.capability_policy_sha256.clone(),
         expiry_profile_sha256: profile.expiry_profile_sha256.clone(),
         account: profile.account.clone(),
         group: profile.group.clone(),
@@ -256,6 +288,12 @@ async fn run(
         peer,
         cache_directory,
     ] = files;
+    anchor_custody::check_descriptors(
+        &anchor,
+        &anchor_directory,
+        &journal_directory,
+        &account_dir,
+    )?;
     // Keep the original storage lease through account opening, join and shutdown.
     storage_lease
         .try_lock()
@@ -272,8 +310,6 @@ async fn run(
     peer.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Configuration)?;
     let mut nonce = [0; 32];
-    peer.read_exact(&mut nonce)
-        .map_err(|_| ReceiverHold::Configuration)?;
     let key = zeroize::Zeroizing::new(read(&key_file, 64)?);
     let dbkey = zeroize::Zeroizing::new(read(&dbkey_file, 64)?);
     if key.len() != 32 || dbkey.len() != 32 {
@@ -321,7 +357,7 @@ async fn run(
     // Keep the actual SQLCipher connection alive even if enrollment consumes and
     // drops the Engine on an error after the native Welcome committed.
     let retained_storage = storage.clone();
-    let mut engine = owned_routed_engine(storage, keys)?;
+    let mut engine = owned_routed_engine(storage, keys, profile.template()?)?;
     check_cache_devices(
         &cache_directory,
         &[
@@ -339,6 +375,8 @@ async fn run(
         check_writable(file)?;
     }
     check_fresh_account(&engine, &profile)?;
+    peer.read_exact(&mut nonce)
+        .map_err(|_| ReceiverHold::Configuration)?;
     let spool = relay_spool::anonymous(&cache_directory)?;
     let files = Journal::prepare_fresh(OwnedFiles {
         journal,
@@ -382,7 +420,7 @@ async fn run(
         let enrolled = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
         let header = journal.source_at(1).map_err(|_| ReceiverHold::Journal)?;
         let output = serde_json::to_vec(&serde_json::json!({
-            "schema":"heterodyne-owned-fresh-enrollment.v2", "nonce_hex":hex::encode(nonce),
+            "schema":"heterodyne-owned-fresh-enrollment.v3", "nonce_hex":hex::encode(nonce),
             "startup_profile_sha256":profile_sha,"enrollment_sha256":enrolled.canonical_sha256().map_err(|_| ReceiverHold::Malformed)?,"enrollment":enrolled,
             "header_record":header.body,"header_sha256":journal.header_digest().map_err(|_| ReceiverHold::Journal)?,"checkpoint":journal.checkpoint(),
         })).map_err(|_| ReceiverHold::Malformed)?;
@@ -531,8 +569,12 @@ fn check_fresh_account<S: StorageProvider + 'static>(
             .map_err(|_| ReceiverHold::Engine)?
             .iter()
             .any(|kp| {
-                crate::key_package::key_package_metadata(kp)
-                    .is_ok_and(|metadata| metadata.key_package_ref_hex == profile.key_package_ref)
+                crate::key_package::key_package_metadata(kp).is_ok_and(|metadata| {
+                    metadata.key_package_ref_hex == profile.key_package_ref
+                        && profile
+                            .template()
+                            .is_ok_and(|t| t.validate_metadata(&metadata).is_ok())
+                })
             })
     {
         return Err(ReceiverHold::ChangedState);
@@ -575,13 +617,15 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
         }
         let sha = digest(&std::fs::read(&source).unwrap());
-        FreshBinding::new(
-            File::open(source).unwrap(),
-            File::open(policy).unwrap(),
-            p,
-            sha,
-        )
-        .unwrap()
+        // Mechanical native join/expiry fixture. Production constructor always
+        // verifies a complete installed tree; these tests do not qualify custody.
+        FreshBinding {
+            source: File::open(source).unwrap(),
+            source_sha256: sha,
+            expiry: expiry::Profile::open(File::open(policy).unwrap(), &p.expiry_profile_sha256)
+                .unwrap(),
+            installation: None,
+        }
     }
 
     #[tokio::test]
@@ -683,7 +727,7 @@ mod tests {
         let enrolled = journal.enrollment().unwrap();
         assert_eq!(enrolled.source_profile_sha256, binding.source_sha256);
         assert_eq!(enrolled.expiry_profile_sha256, p.expiry_profile_sha256);
-        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v2");
+        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v3");
         let bytes = std::fs::read(root.path().join("receiver/journal")).unwrap();
         // A separate owner cannot acquire the account lease during postcommit HOLD.
         let other = recovery_files(root.path());
@@ -812,7 +856,7 @@ mod tests {
         let wire = welcomes.remove(0);
         let root = tempfile::tempdir().unwrap();
         let mut p = FreshProfile {
-            schema: "heterodyne-protected-receiver-fresh.v2".into(),
+            schema: "heterodyne-protected-receiver-fresh.v3".into(),
             receiver_uid: unsafe { libc::geteuid() },
             consumer_uid: unsafe { libc::geteuid() } + 1,
             account: hex::encode(engine.self_id().as_slice()),
@@ -827,6 +871,18 @@ mod tests {
             endpoints: vec![TransportEndpoint::from("wss://semantic.invalid")],
             wait_seconds: 1,
             expiry_profile_sha256: "77".repeat(32),
+            installation: receiver_installation_verifier::reference::Installation {
+                root: std::path::PathBuf::from(format!(
+                    "/opt/heterodyne-receiver/releases/{}",
+                    "aa".repeat(32)
+                )),
+                index_sha256: "aa".repeat(32),
+                recipe_id: "fixture-only".into(),
+                platform_id: "fixture-only".into(),
+            },
+            capability_template: "routing-only-v1".into(),
+            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
         };
         let binding = binding(root.path(), &mut p);
         let files = Journal::prepare_fresh(recovery_files(root.path())).unwrap();
@@ -939,7 +995,20 @@ mod tests {
     async fn fresh_account_preflight_checks_actual_owned_key_package_and_native_state() {
         let (mut engine, _, wire, group, operator) = invitation().await;
         let mut p = profile(&engine, &group, &operator, &wire);
-        assert!(check_fresh_account(&engine, &p).is_ok());
+        // Legacy generic Engine defaults cannot stand in for the enrolled factory.
+        assert!(check_fresh_account(&engine, &p).is_err());
+        let mut selected = owned_routed_engine(
+            SqliteAccountStorage::in_memory().unwrap(),
+            nostr::Keys::generate(),
+            crate::protected_capability_policy::routing_only_v1(),
+        )
+        .unwrap();
+        let kp = selected.fresh_key_package().await.unwrap();
+        let mut matching = profile(&selected, &group, &operator, &wire);
+        matching.key_package_ref = crate::key_package_metadata(&kp)
+            .unwrap()
+            .key_package_ref_hex;
+        assert!(check_fresh_account(&selected, &matching).is_ok());
         p.key_package_ref = "aa".repeat(32);
         assert!(matches!(
             check_fresh_account(&engine, &p),
@@ -964,7 +1033,7 @@ mod tests {
         wire: &cgka_traits::TransportMessage,
     ) -> FreshProfile {
         FreshProfile {
-            schema: "heterodyne-protected-receiver-fresh.v2".into(),
+            schema: "heterodyne-protected-receiver-fresh.v3".into(),
             receiver_uid: unsafe { libc::geteuid() },
             consumer_uid: unsafe { libc::geteuid() }.checked_add(1).unwrap(),
             account: hex::encode(engine.self_id().as_slice()),
@@ -975,6 +1044,18 @@ mod tests {
             endpoints: vec![TransportEndpoint("wss://fixture.invalid".into())],
             wait_seconds: 1,
             expiry_profile_sha256: "77".repeat(32),
+            installation: receiver_installation_verifier::reference::Installation {
+                root: std::path::PathBuf::from(format!(
+                    "/opt/heterodyne-receiver/releases/{}",
+                    "aa".repeat(32)
+                )),
+                index_sha256: "aa".repeat(32),
+                recipe_id: "fixture-only".into(),
+                platform_id: "fixture-only".into(),
+            },
+            capability_template: "routing-only-v1".into(),
+            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+                .policy_sha256(),
         }
     }
 
@@ -1029,7 +1110,7 @@ mod tests {
             enrolled.source_profile_sha256,
             enrolled.expiry_profile_sha256
         );
-        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v2");
+        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v3");
         let source = journal.source_at(2).unwrap();
         assert_eq!(
             source.body["value"]["native_join"]["original_wire"],
