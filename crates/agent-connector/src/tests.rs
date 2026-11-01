@@ -3609,14 +3609,14 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             .unwrap();
         bytes
     });
-    assert!(matches!(
-        result,
-        Err(crate::ConnectorError::InvalidNativeGroupRoster)
-    ));
+    result.unwrap();
+    assert!(bytes.len() <= agent_control::MAX_AGENT_CONTROL_FRAME_BYTES);
+    let error = decode_frame::<AgentControlEnvelope<AgentControlResponse>>(&bytes).unwrap();
+    assert_eq!(error.id, request.id);
     assert!(
-        bytes.is_empty(),
-        "oversized authority response must never be written"
+        matches!(error.payload, AgentControlResponse::Error { code, .. } if code == "invalid_native_group_roster")
     );
+    assert!(crate::ConnectorError::App(AppError::AccountWorkerBusy).retryable());
 
     assert!(
         connector

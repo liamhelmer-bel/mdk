@@ -171,7 +171,11 @@ impl ConnectorError {
         matches!(
             self,
             Self::SendInProgress
-                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+                | Self::App(
+                    AppError::AccountWorkerBusy
+                        | AppError::MediaUploadTimedOut
+                        | AppError::AgentStreamSendFailed(_)
+                )
         )
     }
 

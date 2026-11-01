@@ -125,13 +125,22 @@ impl AgentConnector {
             Err(err) => self.error_response("handle_connection", &err),
         };
         let native_roster = matches!(&response, AgentControlResponse::GroupRoster { .. });
-        let response = AgentControlEnvelope::new(request.id, response);
+        let mut response = AgentControlEnvelope::new(request.id, response);
         if native_roster
             && agent_control::encode_frame(&response)?.len()
                 > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
         {
-            // No partial or oversized authority projection crosses the socket.
-            return Err(ConnectorError::InvalidNativeGroupRoster);
+            response.payload = self.error_response(
+                "group_roster_envelope",
+                &ConnectorError::InvalidNativeGroupRoster,
+            );
+            // Prefer preserving correlation. If the echoed ID alone prevents a
+            // bounded error, omit it rather than writing an oversized frame.
+            if agent_control::encode_frame(&response)?.len()
+                > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+            {
+                response.id = None;
+            }
         }
         write_control_frame(&mut write_half, &response).await?;
         Ok(())
