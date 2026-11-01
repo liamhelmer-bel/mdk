@@ -110,56 +110,6 @@ fn canonical(value: &Value) -> Result<Vec<u8>> {
 fn record(parent: &File, name: &str, value: &Value) -> Result<File> {
     create(parent, name, 0, 0o400, &canonical(value)?)
 }
-fn selected(
-    verified: &receiver_installation_verifier::reference::Verified,
-    name: &str,
-) -> Result<File> {
-    let python = verified.python();
-    let root = python
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .ok_or(())?;
-    let path = root.join("bin").join(name);
-    let expected = verified
-        .closure()
-        .map_err(|_| ())?
-        .into_iter()
-        .find(|(p, _)| p == &path)
-        .ok_or(())?
-        .1;
-    let f = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| ())?;
-    let m = f.metadata().map_err(|_| ())?;
-    if !m.is_file()
-        || m.uid() != 0
-        || m.gid() != 0
-        || m.nlink() != 1
-        || m.mode() & 0o7777 != 0o555
-        || m.len() > 256 * 1024 * 1024
-    {
-        return Err(());
-    }
-    let mut h = Sha256::new();
-    let mut offset = 0;
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = std::os::unix::fs::FileExt::read_at(&f, &mut buf, offset).map_err(|_| ())?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        offset += n as u64;
-    }
-    if offset != m.len() || hex::encode(h.finalize()) != expected {
-        return Err(());
-    }
-    verified.check().map_err(|_| ())?;
-    Ok(f)
-}
 pub(super) fn mount_configuration(
     installation: &receiver_installation_verifier::reference::Installation,
 ) -> Result<()> {
@@ -222,6 +172,14 @@ fn frame(raw: &[u8], nonce: &[u8; 32], schema: &str) -> Result<Value> {
 /// Initializer input FD3..7; permanent verified-publication inputs FD13,14,15,18.
 /// All must be prepared by the retained root launcher, never accepted from an
 /// operator JSON command, sandbox mount, or mutable pathname request.
+fn retain_process_result(state: &File, response: &[u8], nonce: &[u8; 32]) -> Result<()> {
+    let v = crate::native_frame::read(response)?;
+    if v.get("nonce_hex").and_then(Value::as_str) != Some(hex::encode(nonce).as_str()) {
+        return Err(());
+    }
+    create(state, "07-process-result.json", 0, 0o400, response)?;
+    Ok(())
+}
 pub(crate) fn entry() -> Result<()> {
     if unsafe { libc::geteuid() } != 0
         || std::env::args_os().count() != 1
@@ -269,7 +227,7 @@ pub(crate) fn entry() -> Result<()> {
     )?;
     let (incoming, outgoing) = crate::owner_entry::channel()?;
     handoff::enable_credentials(&incoming).map_err(|_| ())?;
-    let exe = selected(&verified, "heterodyne-receiver-owner-init")?;
+    let exe = crate::owner_entry::selected(&verified, "heterodyne-receiver-owner-init")?;
     let owner = OwnedChild::owner_init(
         &exe,
         &[
@@ -283,20 +241,15 @@ pub(crate) fn entry() -> Result<()> {
         lease.try_clone().map_err(|_| ())?,
     )
     .map_err(|_| ())?;
-    let mut poll = libc::pollfd {
-        fd: incoming.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    if unsafe { libc::poll(&mut poll, 1, ((p.wait_seconds + 15) * 1000) as i32) } != 1
-        || poll.revents & libc::POLLIN == 0
-    {
-        return Err(());
-    }
+    drop(outgoing);
+    crate::supervision::ready(
+        &incoming,
+        crate::supervision::initialization(p.deadline_unix_ms, true)?,
+    )?;
     // owner-init forwards only AFTER its dedicated child ceased. Its own
     // credentials are root; nested initializer facts were independently checked.
     let (facts, handles) = handoff::receive(&incoming, owner.pid(), 0).map_err(|_| ())?;
-    let _same_root_lease = positive(owner, Duration::from_secs(10))?;
+    let _same_root_lease = positive(owner, crate::supervision::CESSATION)?;
     crate::owner_entry::validate_handles(&handles, 899)?;
     if facts.request_sha256 != p.request_sha256
         || facts.storage_generation != p.storage_generation
@@ -325,9 +278,9 @@ pub(crate) fn entry() -> Result<()> {
     let fresh = json!({"schema":"heterodyne-protected-receiver-fresh.v3","receiver_uid":899,"consumer_uid":898,"account":facts.account,"group":p.group,"operators":p.operators,"expected_welcomer":p.expected_welcomer,"storage_generation":p.storage_generation,"key_package_ref":facts.key_package_ref,"endpoints":p.inbox_endpoints,"wait_seconds":p.wait_seconds,"expiry_profile_sha256":p.expiry_profile_sha256,"installation":p.installation,"capability_template":p.capability_template,"capability_policy_sha256":p.capability_policy_sha256});
     let fresh_profile = record(&state, "02-fresh-profile.json", &fresh)?;
     let fresh_sha = hex::encode(Sha256::digest(canonical(&fresh)?));
-    let peer = Peer::start(Duration::from_secs(p.wait_seconds + 15)).map_err(|_| ())?;
+    let exe = crate::owner_entry::selected(&verified, "protected-receiver-enroll")?;
+    let peer = Peer::start().map_err(|_| ())?;
     let nonce = peer.nonce;
-    let exe = selected(&verified, "protected-receiver-enroll")?;
     record(
         &state,
         "03-fresh-issued.json",
@@ -347,7 +300,7 @@ pub(crate) fn entry() -> Result<()> {
             (11, &intent),
             (12, &intents),
             (13, &account),
-            (14, &peer.stream),
+            (14, peer.stream().map_err(|_| ())?),
             (15, &cache),
             (16, &expiry),
         ],
@@ -356,10 +309,10 @@ pub(crate) fn entry() -> Result<()> {
     )
     .map_err(|_| ())?;
     let response = peer
-        .result(Duration::from_secs(p.wait_seconds + 15))
+        .result(crate::supervision::receiver(p.wait_seconds)?)
         .map_err(|_| ())?;
     create(&state, "03-fresh-observed.json", 0, 0o400, &response)?;
-    let _fresh_cessation = positive(child, Duration::from_secs(10))?;
+    let _fresh_cessation = positive(child, crate::supervision::CESSATION)?;
     let enrolled = frame(&response, &nonce, "heterodyne-owned-fresh-enrollment.v3")?;
     if enrolled
         .get("startup_profile_sha256")
@@ -383,9 +336,9 @@ pub(crate) fn entry() -> Result<()> {
     record(&state, "04-enrolled.json", &enrolled)?;
     let process = json!({"schema":"heterodyne-protected-receiver-process.v3","receiver_uid":899,"consumer_uid":898,"enrollment":enrollment,"endpoints":p.inbox_endpoints,"transport_group":transport_group,"python":verified.python(),"product_source":verified.product_source(),"purelib":verified.purelib(),"installation":p.installation,"wait_seconds":p.wait_seconds});
     let process_profile = record(&state, "05-process-profile.json", &process)?;
-    let peer = Peer::start(Duration::from_secs(p.wait_seconds + 15)).map_err(|_| ())?;
+    let exe = crate::owner_entry::selected(&verified, "protected-receiver")?;
+    let peer = Peer::start().map_err(|_| ())?;
     let nonce = peer.nonce;
-    let exe = selected(&verified, "protected-receiver")?;
     record(
         &state,
         "06-process-issued.json",
@@ -408,7 +361,7 @@ pub(crate) fn entry() -> Result<()> {
             (14, &archive),
             (15, &commit),
             (16, &account),
-            (17, &peer.stream),
+            (17, peer.stream().map_err(|_| ())?),
             (18, &packet),
         ],
         lease.try_clone().map_err(|_| ())?,
@@ -416,15 +369,11 @@ pub(crate) fn entry() -> Result<()> {
     )
     .map_err(|_| ())?;
     let response = peer
-        .result(Duration::from_secs(p.wait_seconds + 15))
+        .result(crate::supervision::receiver(p.wait_seconds)?)
         .map_err(|_| ())?;
     create(&state, "06-process-observed.json", 0, 0o400, &response)?;
-    let _process_cessation = positive(child, Duration::from_secs(10))?;
-    let v: Value = serde_json::from_slice(&response).map_err(|_| ())?;
-    if v.get("nonce_hex").and_then(Value::as_str) != Some(hex::encode(nonce).as_str()) {
-        return Err(());
-    }
-    record(&state, "07-process-result.json", &v)?;
+    let _process_cessation = positive(child, crate::supervision::CESSATION)?;
+    retain_process_result(&state, &response, &nonce)?;
     // Actual result is retained verbatim; exit is cessation, never consent.
     Ok(())
 }
@@ -440,6 +389,33 @@ mod tests {
         assert!(frame(&good, &[8; 32], "heterodyne-owned-fresh-enrollment.v3").is_err());
         assert!(frame(&good, &nonce, "heterodyne-owned-fresh-enrollment-hold.v1").is_err());
         assert!(frame(b"{\"schema\":\"a\",\"schema\":\"b\"}", &nonce, "b").is_err());
+    }
+    #[test]
+    #[ignore = "actual root result-file ownership and exact raw native output"]
+    fn final_native_result_retains_exact_bytes_and_refuses_duplicate_or_float() {
+        let d = tempfile::tempdir().unwrap();
+        let f = File::open(d.path()).unwrap();
+        let nonce = [7; 32];
+        let raw = format!(
+            "{{\"nonce_hex\":\"{}\",\"message\":\"line\\nvalue\"}}",
+            hex::encode(nonce)
+        )
+        .into_bytes();
+        assert!(receiver_installation_verifier::installation::parse_canonical(&raw).is_err());
+        let duplicate = format!(
+            "{{\"nonce_hex\":\"bad\",\"nonce_hex\":\"{}\"}}",
+            hex::encode(nonce)
+        );
+        assert!(retain_process_result(&f, duplicate.as_bytes(), &nonce).is_err());
+        let float = format!("{{\"nonce_hex\":\"{}\",\"value\":1.5}}", hex::encode(nonce));
+        assert!(retain_process_result(&f, float.as_bytes(), &nonce).is_err());
+        assert!(!d.path().join("07-process-result.json").exists());
+        retain_process_result(&f, &raw, &nonce).unwrap();
+        assert_eq!(
+            std::fs::read(d.path().join("07-process-result.json")).unwrap(),
+            raw
+        );
+        assert!(retain_process_result(&f, &raw, &nonce).is_err());
     }
     #[test]
     #[ignore = "actual root private exclusive filesystem custody"]

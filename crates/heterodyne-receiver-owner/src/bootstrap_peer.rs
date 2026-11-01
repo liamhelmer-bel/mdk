@@ -20,16 +20,13 @@ struct Control([u8; 128]);
 pub(crate) struct Peer {
     pid: i32,
     channel: File,
-    pub(crate) stream: File,
+    stream: Option<File>,
     pub(crate) nonce: [u8; 32],
     reaped: bool,
 }
 impl Peer {
-    pub(crate) fn start(timeout: Duration) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0
-            || timeout.is_zero()
-            || timeout > Duration::from_secs(86400)
-        {
+    pub(crate) fn start() -> Result<Self> {
+        if unsafe { libc::geteuid() } != 0 {
             return Err(hold());
         }
         let mut fds = [-1; 2];
@@ -60,7 +57,6 @@ impl Peer {
         }
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| hold())?;
-        let placeholder = File::open("/dev/null")?;
         let parent = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -83,7 +79,7 @@ impl Peer {
                     libc::_exit(125);
                 }
             }
-            let result = helper(&nonce, timeout);
+            let result = helper(&nonce);
             unsafe {
                 libc::_exit(if result.is_ok() { 0 } else { 125 });
             }
@@ -92,26 +88,19 @@ impl Peer {
         let mut peer = Self {
             pid,
             channel,
-            stream: placeholder,
+            stream: None,
             nonce,
             reaped: false,
         };
         peer.ready(Duration::from_secs(5))?;
-        peer.stream = peer.receive_stream()?;
+        peer.stream = Some(peer.receive_stream()?);
         Ok(peer)
     }
+    pub(crate) fn stream(&self) -> Result<&File> {
+        self.stream.as_ref().ok_or_else(hold)
+    }
     fn ready(&self, timeout: Duration) -> Result<()> {
-        let mut p = libc::pollfd {
-            fd: self.channel.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut p, 1, timeout.as_millis().min(i32::MAX as u128) as i32) } != 1
-            || p.revents & libc::POLLIN == 0
-        {
-            return Err(hold());
-        }
-        Ok(())
+        crate::supervision::ready(&self.channel, timeout).map_err(|_| hold())
     }
     fn receive_stream(&self) -> Result<File> {
         let mut byte = [0u8; 1];
@@ -171,6 +160,8 @@ impl Peer {
         Ok(handles.remove(0))
     }
     pub(crate) fn result(mut self, timeout: Duration) -> Result<Vec<u8>> {
+        // After child inheritance, retaining this endpoint masks dead-child EOF.
+        drop(self.stream.take());
         self.ready(timeout)?;
         let mut raw = vec![0; 65536];
         let n = unsafe {
@@ -216,9 +207,10 @@ impl Drop for Peer {
         }
     }
 }
-fn helper(nonce: &[u8; 32], timeout: Duration) -> Result<()> {
+fn helper(nonce: &[u8; 32]) -> Result<()> {
     let (mut local, receiver) = UnixStream::pair()?;
-    local.set_read_timeout(Some(timeout))?;
+    // One parent-owned phase watchdog covers preflight and result; this helper
+    // has no independent early timer. Parent Drop always kills/reaps it.
     local.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut byte = [1u8];
     let mut c = Control([0; 128]);
@@ -266,13 +258,13 @@ mod tests {
     #[ignore = "actual root fork and dedicated consumer UID898"]
     fn actual_consumer_credential_nonce_and_framed_result() {
         assert_eq!(unsafe { libc::geteuid() }, 0);
-        let peer = Peer::start(Duration::from_secs(5)).unwrap();
+        let peer = Peer::start().unwrap();
         let mut u: libc::ucred = unsafe { zeroed() };
         let mut len = size_of::<libc::ucred>() as u32;
         assert_eq!(
             unsafe {
                 libc::getsockopt(
-                    peer.stream.as_raw_fd(),
+                    peer.stream().unwrap().as_raw_fd(),
                     libc::SOL_SOCKET,
                     libc::SO_PEERCRED,
                     (&mut u as *mut libc::ucred).cast(),
@@ -282,8 +274,9 @@ mod tests {
             0
         );
         assert_eq!((u.pid, u.uid, u.gid), (peer.pid, 898, 898));
-        let mut stream =
-            UnixStream::from(std::os::fd::OwnedFd::from(peer.stream.try_clone().unwrap()));
+        let mut stream = UnixStream::from(std::os::fd::OwnedFd::from(
+            peer.stream().unwrap().try_clone().unwrap(),
+        ));
         let mut nonce = [0; 32];
         stream.read_exact(&mut nonce).unwrap();
         assert_eq!(nonce, peer.nonce);
@@ -295,12 +288,34 @@ mod tests {
     #[test]
     #[ignore = "actual root fork and dedicated consumer UID898"]
     fn malformed_or_oversize_frame_cannot_produce_acknowledgement() {
-        let peer = Peer::start(Duration::from_secs(1)).unwrap();
-        let mut stream =
-            UnixStream::from(std::os::fd::OwnedFd::from(peer.stream.try_clone().unwrap()));
+        let peer = Peer::start().unwrap();
+        let mut stream = UnixStream::from(std::os::fd::OwnedFd::from(
+            peer.stream().unwrap().try_clone().unwrap(),
+        ));
         let mut nonce = [0; 32];
         stream.read_exact(&mut nonce).unwrap();
         stream.write_all(&65537u32.to_be_bytes()).unwrap();
         assert!(peer.result(Duration::from_secs(2)).is_err());
+    }
+    #[test]
+    #[ignore = "actual root UID898 peer survives slow preflight without own early timer"]
+    fn slow_preflight_then_result_and_dead_child_are_distinguished() {
+        let peer = Peer::start().unwrap();
+        let mut stream = UnixStream::from(std::os::fd::OwnedFd::from(
+            peer.stream().unwrap().try_clone().unwrap(),
+        ));
+        std::thread::sleep(Duration::from_millis(1100));
+        let mut nonce = [0; 32];
+        stream.read_exact(&mut nonce).unwrap();
+        assert_eq!(nonce, peer.nonce);
+        let raw = b"{\"result\":\"actual\"}";
+        stream.write_all(&(raw.len() as u32).to_be_bytes()).unwrap();
+        stream.write_all(raw).unwrap();
+        drop(stream);
+        assert_eq!(peer.result(Duration::from_secs(2)).unwrap(), raw);
+        let peer = Peer::start().unwrap();
+        let started = std::time::Instant::now();
+        assert!(peer.result(Duration::from_secs(2)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

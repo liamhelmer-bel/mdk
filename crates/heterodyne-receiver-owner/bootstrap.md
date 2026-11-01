@@ -138,3 +138,21 @@ external root deployment receipt. Runtime index roles remain exactly four.
 Full positive installed bootstrap, real-group capability compatibility and
 actual publication/MLS response are separate qualification; unit/root mechanical
 checks do not establish them.
+
+### Supervisor budgets and exact final result
+
+The initializer's network timeout retains its original absolute profile deadline
+and bounded network wait. Owner-init waits through that same deadline plus60s
+cessation; the outer bootstrap additionally reserves600s for owner-init's final
+complete installation reread plus60s cessation. Receiver phases use a separate
+600s preflight allowance, their original1..300s network wait, and60s cessation.
+These are finite resource watchdogs, not claims of an OS I/O worst-case bound.
+A watchdog failure retains UNKNOWN and never asserts that publication/join did
+not occur. Full installation checks remain mandatory.
+
+The UID898 helper has no competing read timer. Bootstrap starts it after source
+ELF selection and drops its own transferred stream endpoint before waiting, so
+a dead receiver is observed as EOF. The one parent-owned watchdog kills/reaps
+the helper on failure. Both fresh and permanent results use the duplicate-key/
+float-refusing native-frame decoder; permanent success retains exact observed
+bytes in the exclusive final result file, without canonical reserialization.

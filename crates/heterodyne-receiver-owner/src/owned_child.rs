@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -264,38 +264,12 @@ impl OwnedChild {
         }
     }
     pub(crate) fn wait(mut self, timeout: Duration) -> Result<Cessation> {
-        if timeout.is_zero() || timeout > Duration::from_secs(86400) {
-            return Err(Error::Hold);
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Error::Hold);
-            }
-            let mut poll = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let result = unsafe {
-                libc::poll(
-                    &mut poll,
-                    1,
-                    remaining.as_millis().clamp(1, i32::MAX as u128) as i32,
-                )
-            };
-            if result > 0 && poll.revents & libc::POLLIN != 0 {
-                let status = self.reap()?;
-                return Ok(Cessation {
-                    status,
-                    lease: self.lease.take().ok_or(Error::Hold)?,
-                });
-            }
-            if result < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                return Err(io::Error::last_os_error().into());
-            }
-        }
+        crate::supervision::ready(&self.pidfd, timeout).map_err(|_| Error::Hold)?;
+        let status = self.reap()?;
+        Ok(Cessation {
+            status,
+            lease: self.lease.take().ok_or(Error::Hold)?,
+        })
     }
 }
 impl Drop for OwnedChild {
@@ -319,7 +293,7 @@ impl Drop for OwnedChild {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::FileExt;
+    use std::{os::unix::fs::FileExt, time::Instant};
 
     fn fixture(command: &str) -> (OwnedChild, File, File, tempfile::TempDir) {
         assert_eq!(

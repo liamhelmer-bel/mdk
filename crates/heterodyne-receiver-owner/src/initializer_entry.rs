@@ -50,7 +50,7 @@ pub(super) fn hash(value: &str, len: usize) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn now() -> Result<u64> {
+pub(super) fn now() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?

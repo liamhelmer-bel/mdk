@@ -42,3 +42,5 @@ pub fn protected_assembly_entry() -> bool {
 }
 
 mod native_frame;
+
+mod supervision;

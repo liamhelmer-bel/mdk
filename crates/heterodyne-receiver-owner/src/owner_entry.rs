@@ -9,13 +9,22 @@ use std::{
         fd::{AsRawFd, FromRawFd},
         unix::fs::{MetadataExt, OpenOptionsExt},
     },
-    time::Duration,
 };
 type Result<T> = std::result::Result<T, ()>;
 
-pub(super) fn selected_initializer(
+pub(super) fn selected(
     verified: &receiver_installation_verifier::reference::Verified,
+    name: &str,
 ) -> Result<File> {
+    if !matches!(
+        name,
+        "heterodyne-receiver-initialize"
+            | "heterodyne-receiver-owner-init"
+            | "protected-receiver-enroll"
+            | "protected-receiver"
+    ) {
+        return Err(());
+    }
     let path = verified
         .python()
         .parent()
@@ -24,7 +33,8 @@ pub(super) fn selected_initializer(
         .ok_or(())?
         .parent()
         .ok_or(())?
-        .join("bin/heterodyne-receiver-initialize");
+        .join("bin")
+        .join(name);
     let expected = verified
         .closure()
         .map_err(|_| ())?
@@ -49,7 +59,10 @@ pub(super) fn selected_initializer(
         return Err(());
     }
     let mut raw = Vec::new();
-    file.read_to_end(&mut raw).map_err(|_| ())?;
+    (&mut file)
+        .take(256 * 1024 * 1024 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| ())?;
     let after = file.metadata().map_err(|_| ())?;
     if raw.len() as u64 != before.len()
         || hex::encode(Sha256::digest(raw)) != expected
@@ -59,12 +72,16 @@ pub(super) fn selected_initializer(
             before.len(),
             before.ctime(),
             before.ctime_nsec(),
+            before.mtime(),
+            before.mtime_nsec(),
         ) != (
             after.dev(),
             after.ino(),
             after.len(),
             after.ctime(),
             after.ctime_nsec(),
+            after.mtime(),
+            after.mtime_nsec(),
         )
     {
         return Err(());
@@ -138,7 +155,7 @@ pub(crate) fn entry() -> Result<()> {
     )
     .map_err(|_| ())?;
     let verified = profile.installation.verify().map_err(|_| ())?;
-    let executable = selected_initializer(&verified)?;
+    let executable = selected(&verified, "heterodyne-receiver-initialize")?;
     let (incoming, child_channel) = channel()?;
     handoff::enable_credentials(&incoming).map_err(|_| ())?;
     let child = OwnedChild::initializer(
@@ -156,18 +173,13 @@ pub(crate) fn entry() -> Result<()> {
     .map_err(|_| ())?;
     let pid = child.pid();
     drop(child_channel);
-    let mut ready = libc::pollfd {
-        fd: incoming.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = (profile.wait_seconds * 1000).min(i32::MAX as u64) as i32;
-    if unsafe { libc::poll(&mut ready, 1, timeout) } != 1 || ready.revents & libc::POLLIN == 0 {
-        return Err(());
-    }
+    crate::supervision::ready(
+        &incoming,
+        crate::supervision::initialization(profile.deadline_unix_ms, false)?,
+    )?;
     let (facts, handles) =
         handoff::receive(&incoming, pid, profile.receiver_uid).map_err(|_| ())?;
-    let ceased = child.wait(Duration::from_secs(10)).map_err(|_| ())?;
+    let ceased = child.wait(crate::supervision::CESSATION).map_err(|_| ())?;
     if !libc::WIFEXITED(ceased.status) || libc::WEXITSTATUS(ceased.status) != 0 {
         return Err(());
     }
