@@ -641,6 +641,76 @@ mod tests {
     use crate::protected_join::tests::{intent, invitation, recovery_files};
     use cgka_traits::{GroupStorage, MessageStorage};
 
+    #[test]
+    #[ignore = "actual root private tmpfs and dropped receiver UID899"]
+    fn cache_device_guard_and_anonymous_spool() {
+        use std::os::unix::fs::PermissionsExt;
+        const CONTROL: &str = "OIZOH_CACHE_DEVICE_CHILD";
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        if std::env::var_os(CONTROL).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "protected_owned_enroll::tests::cache_device_guard_and_anonymous_spool",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CONTROL, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let durable = File::open(root.path()).unwrap();
+        assert!(check_cache_devices(&durable, &[&durable]).is_err());
+        let path = root.path().join("cache");
+        std::fs::create_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        unsafe {
+            assert_eq!(libc::unshare(libc::CLONE_NEWNS), 0);
+            assert_eq!(
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null()
+                ),
+                0
+            );
+            assert_eq!(
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    name.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"mode=0700,uid=899,gid=899,size=67108864".as_ptr().cast()
+                ),
+                0
+            );
+        }
+        let cache = File::open(&path).unwrap();
+        check_cache_devices(&cache, &[&durable]).unwrap();
+        unsafe {
+            assert_eq!(libc::setgroups(0, std::ptr::null()), 0);
+            assert_eq!(libc::setresgid(899, 899, 899), 0);
+            assert_eq!(libc::setresuid(899, 899, 899), 0);
+        }
+        let spool = relay_spool::anonymous(&cache).unwrap();
+        assert_eq!(spool.metadata().unwrap().nlink(), 0);
+        assert_ne!(
+            spool.metadata().unwrap().dev(),
+            durable.metadata().unwrap().dev()
+        );
+    }
+
     fn binding(root: &std::path::Path, p: &mut FreshProfile) -> FreshBinding {
         use std::os::unix::fs::PermissionsExt;
         let bytes =

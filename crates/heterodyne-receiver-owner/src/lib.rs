@@ -3,6 +3,7 @@
 //! Mechanics remain private until the concrete bootstrap admission and fixed
 //! descriptor entry are composed. Linking this crate grants no authority.
 
+mod cache_mount;
 mod generation;
 mod initializer;
 mod material_mount;

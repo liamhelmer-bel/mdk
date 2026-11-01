@@ -295,6 +295,96 @@ mod tests {
     use super::*;
     use std::{os::unix::fs::FileExt, time::Instant};
 
+    #[test]
+    #[ignore = "actual root tmpfs, receiver UID899 and owned PID namespace"]
+    fn receiver_inherits_private_ephemeral_cache() {
+        const CONTROL: &str = "OIZOH_CACHE_MOUNT_CHILD";
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        if std::env::var_os(CONTROL).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_child::tests::receiver_inherits_private_ephemeral_cache",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(CONTROL, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let material = dir.path().join("material");
+        std::fs::create_dir(&material).unwrap();
+        let path = CString::new(material.as_os_str().as_encoded_bytes()).unwrap();
+        unsafe {
+            assert_eq!(libc::chown(path.as_ptr(), 899, 899), 0);
+            assert_eq!(libc::chmod(path.as_ptr(), 0o700), 0);
+        }
+        let parent = crate::material_mount::bind(&File::open(&material).unwrap(), 899).unwrap();
+        let output = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("out"))
+            .unwrap();
+        let lease = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("lease"))
+            .unwrap();
+        lease.try_lock().unwrap();
+        let old_cache = File::open(dir.path()).unwrap();
+        assert_eq!(
+            old_cache.metadata().unwrap().dev(),
+            output.metadata().unwrap().dev()
+        );
+        assert!(crate::cache_mount::create(&[]).is_err());
+        let cache = crate::cache_mount::create(&[&parent, &output]).unwrap();
+        assert_ne!(
+            cache.metadata().unwrap().dev(),
+            output.metadata().unwrap().dev()
+        );
+        assert!(
+            crate::cache_mount::create(&[&parent, &output]).is_err(),
+            "no adoption of existing mount"
+        );
+        let script = "import os; assert os.getpid()==1 and os.getuid()==899 and os.getgid()==899; assert os.fstat(15).st_dev != os.fstat(6).st_dev; assert os.fstat(15).st_uid==899; f=os.open('.',os.O_TMPFILE|os.O_RDWR,0o600,dir_fd=15); os.write(f,b'cache'); assert os.fstat(f).st_nlink==0; os.write(9,b'actual-cache')";
+        let args = [
+            CString::new("python3").unwrap(),
+            CString::new("-I").unwrap(),
+            CString::new("-S").unwrap(),
+            CString::new("-B").unwrap(),
+            CString::new("-c").unwrap(),
+            CString::new(script).unwrap(),
+        ];
+        let descriptors = (3..=16)
+            .map(|fd| (fd, if fd == 15 { &cache } else { &output }))
+            .collect::<Vec<_>>();
+        let child = OwnedChild::launch(
+            &File::open("/usr/bin/python3.12").unwrap(),
+            &descriptors,
+            lease,
+            &args,
+            19,
+            Some(899),
+        )
+        .unwrap();
+        let ceased = child.wait(Duration::from_secs(10)).unwrap();
+        assert!(libc::WIFEXITED(ceased.status));
+        assert_eq!(libc::WEXITSTATUS(ceased.status), 0);
+        let mut raw = [0; 12];
+        output.read_exact_at(&mut raw, 0).unwrap();
+        assert_eq!(&raw, b"actual-cache");
+    }
+
     fn fixture(command: &str) -> (OwnedChild, File, File, tempfile::TempDir) {
         assert_eq!(
             unsafe { libc::geteuid() },

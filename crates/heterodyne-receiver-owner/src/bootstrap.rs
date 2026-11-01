@@ -317,7 +317,8 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
     let journals = directory(&state, "journal", 899)?;
     let intents = directory(&state, "intent", 899)?;
     let anchors = directory(&state, "anchor", 0)?;
-    let cache = directory(&state, "cache", 899)?;
+    let cache =
+        crate::cache_mount::create(&[&account, &journals, &intents, &anchors]).map_err(|_| ())?;
     let journal = create(&journals, "journal", 899, 0o600, &[])?;
     let intent = create(&intents, "intent", 899, 0o600, &[])?;
     let anchor = create(&anchors, "anchor", 0, 0o600, &[])?;
