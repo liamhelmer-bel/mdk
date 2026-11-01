@@ -17,6 +17,17 @@ pub(crate) fn retain(files: Vec<File>) -> ! {
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd};
+    struct Child(libc::pid_t);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
     #[test]
     fn original_ofd_lock_survives_manual_hold_until_supervisor_ceases() {
         let dir = tempfile::tempdir().unwrap();
@@ -42,7 +53,14 @@ mod tests {
         unsafe {
             libc::close(pipe[1]);
         }
+        let mut child = Child(pid);
         let read = unsafe { File::from_raw_fd(pipe[0]) };
+        let mut poll = libc::pollfd {
+            fd: read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
         let mut ready = [0u8];
         assert_eq!(
             unsafe { libc::read(read.as_raw_fd(), ready.as_mut_ptr().cast(), 1) },
@@ -54,6 +72,7 @@ mod tests {
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        child.0 = 0;
         assert!(libc::WIFSIGNALED(status));
         independent.try_lock().unwrap();
     }

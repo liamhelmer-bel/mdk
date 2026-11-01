@@ -203,10 +203,32 @@ impl Publication {
 /// generation. The separate manual entry cannot run the publication branch.
 pub(crate) fn entry() -> Result<()> {
     validate_entry()?;
-    run(Some(Publication::inherited()?))
+    // Claim original initializer descriptors before consuming the sealed nonce.
+    let originals = original_inputs()?;
+    run(originals, Some(Publication::inherited()?))
 }
 pub(crate) fn manual_entry() -> Result<()> {
-    run(None)
+    validate_entry()?;
+    refuse_publication_descriptors()?;
+    run(original_inputs()?, None)
+}
+fn refuse_publication_descriptors() -> Result<()> {
+    for n in [8, 9, 13, 14, 15, 18] {
+        if unsafe { libc::fcntl(n, libc::F_GETFD) } >= 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+fn original_inputs() -> Result<[File; 5]> {
+    [3, 4, 5, 6, 7]
+        .map(inherited)
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .try_into()
+        .map_err(|_| ())
 }
 fn validate_entry() -> Result<()> {
     if unsafe { libc::geteuid() } != 0
@@ -217,14 +239,8 @@ fn validate_entry() -> Result<()> {
     }
     Ok(())
 }
-fn run(publication: Option<Publication>) -> Result<()> {
-    validate_entry()?;
-    let [original, parent, ledger, lease, expiry] = [3, 4, 5, 6, 7]
-        .map(inherited)
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .map_err(|_| ())?;
+fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
+    let [original, parent, ledger, lease, expiry] = originals;
     let lm = lease.metadata().map_err(|_| ())?;
     if !lm.is_file()
         || lm.uid() != 0
@@ -511,5 +527,49 @@ mod tests {
         assert!(directory(&f, "generation", 0).is_err());
         assert!(std::fs::read_dir(dir.path()).unwrap().count() == 2);
         drop(state);
+    }
+}
+
+#[cfg(test)]
+mod manual_ingress_tests {
+    #[test]
+    fn manual_ingress_refuses_each_publication_descriptor_and_accepts_absence() {
+        let source = std::fs::File::open("/dev/null").unwrap();
+        use std::os::fd::AsRawFd;
+        let high = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+        assert!(high >= 64);
+        let source = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(high) };
+        for selected in [
+            None,
+            Some(8),
+            Some(9),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(18),
+        ] {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                for n in [8, 9, 13, 14, 15, 18] {
+                    unsafe {
+                        libc::close(n);
+                    }
+                }
+                if let Some(n) = selected {
+                    unsafe {
+                        libc::dup2(source.as_raw_fd(), n);
+                    }
+                }
+                let correct = super::refuse_publication_descriptors().is_ok() == selected.is_none();
+                unsafe {
+                    libc::_exit(if correct { 0 } else { 1 });
+                }
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
     }
 }
