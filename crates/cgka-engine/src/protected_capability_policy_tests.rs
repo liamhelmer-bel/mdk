@@ -1,6 +1,8 @@
 use super::*;
 use crate::Engine;
-use crate::protected_capability_policy::{Template, bounded_app_receiver_v1, routing_only_v1};
+use crate::protected_capability_policy::{
+    Template, admind_receiver_v1, bounded_app_receiver_v1, routing_only_v1,
+};
 use crate::protected_join::{JoinConstraint, JoinIntent};
 use cgka_traits::{
     engine::{CgkaEngine, CreateGroupRequest, SendResult},
@@ -22,7 +24,11 @@ fn client(template: Template) -> Engine<SqliteAccountStorage> {
 }
 #[tokio::test]
 async fn closed_templates_match_actual_persisted_private_package_metadata() {
-    for template in [routing_only_v1(), bounded_app_receiver_v1()] {
+    for template in [
+        routing_only_v1(),
+        bounded_app_receiver_v1(),
+        admind_receiver_v1(),
+    ] {
         let mut engine = if template == routing_only_v1() {
             owned_routed_engine(
                 SqliteAccountStorage::in_memory().unwrap(),
@@ -64,6 +70,11 @@ async fn closed_templates_match_actual_persisted_private_package_metadata() {
 }
 #[tokio::test]
 async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_spending_package() {
+    for template in [bounded_app_receiver_v1(), admind_receiver_v1()] {
+        rollbackable_policy_cases(template).await;
+    }
+}
+async fn rollbackable_policy_cases(template: Template) {
     use cgka_traits::agent_text_stream::AgentTextStreamQuicPolicyV1;
     use cgka_traits::app_components::{
         AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
@@ -78,22 +89,22 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
     ] {
         let mut inviter = if variant == "optional-unknown" {
             let keys = nostr::Keys::generate();
-            let mut components = bounded_app_receiver_v1().components();
+            let mut components = template.components();
             components.insert(0x9000);
             EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
                 .supported_app_components(components)
-                .feature_registry(bounded_app_receiver_v1().registry())
+                .feature_registry(template.registry())
                 .identity(keys.public_key().to_bytes().to_vec())
                 .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
                 .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
                 .build()
                 .unwrap()
         } else {
-            client(bounded_app_receiver_v1())
+            client(template)
         };
-        let mut recipient = client(bounded_app_receiver_v1());
-        let mut native_control = client(bounded_app_receiver_v1());
-        let mut replay_control = client(bounded_app_receiver_v1());
+        let mut recipient = client(template);
+        let mut native_control = client(template);
+        let mut replay_control = client(template);
         let mut replay_kp = replay_control.fresh_key_package().await.unwrap();
         replay_kp.source = Some(cgka_traits::engine::KeyPackageSource {
             event_id: cgka_traits::types::MessageId::new(vec![6; 32]),
@@ -190,11 +201,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             directory: File::open(root.path()).unwrap(),
         };
         let result = recipient
-            .receiver_join_enrolled(
-                wire.clone(),
-                intent(),
-                constraint(bounded_app_receiver_v1()),
-            )
+            .receiver_join_enrolled(wire.clone(), intent(), constraint(template))
             .await
             .unwrap();
         if variant == "bounded" {
@@ -332,7 +339,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 panic!("policy commit")
             };
             let mut capture = crate::protected_merge::Capture::for_group(group.clone());
-            capture.template = Some(bounded_app_receiver_v1());
+            capture.template = Some(template);
             receiver.engine.receiver_merge_capture = Some(capture);
             assert!(receiver.engine.ingest(commit.clone()).await.is_err());
             assert_eq!(
@@ -374,7 +381,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             let refusal = crate::openmls_projection::apply_openmls_canonicalization_result_with_profile_policy(
                 &replay_control.storage, &group, &ordinary, 64,
                 crate::openmls_projection::ReplayProfilePolicy {
-                    receiver_template: Some(bounded_app_receiver_v1()), ..Default::default()
+                    receiver_template: Some(template), ..Default::default()
                 },
             ).unwrap_err();
             assert!(
@@ -389,7 +396,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 control_before
             );
             let mut replay_capture = crate::protected_merge::Capture::for_group(group.clone());
-            replay_capture.template = Some(bounded_app_receiver_v1());
+            replay_capture.template = Some(template);
             replay_control.receiver_merge_capture = Some(replay_capture);
             assert!(
                 replay_control
@@ -402,16 +409,14 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 control_before
             );
             replay_control
-                .with_mls_group(&group, |native| {
-                    bounded_app_receiver_v1().validate_group(native)
-                })
+                .with_mls_group(&group, |native| template.validate_group(native))
                 .unwrap();
             // The same receiver policy captured for a different group must not
             // constrain this independently joined group's canonical replay.
             let mut unrelated = crate::protected_merge::Capture::for_group(
                 cgka_traits::types::GroupId::new(vec![0x99; 16]),
             );
-            unrelated.template = Some(bounded_app_receiver_v1());
+            unrelated.template = Some(template);
             native_control.receiver_merge_capture = Some(unrelated);
             assert!(
                 native_control
@@ -421,8 +426,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             );
             assert!(
                 native_control
-                    .with_mls_group(&group, |native| bounded_app_receiver_v1()
-                        .validate_group(native))
+                    .with_mls_group(&group, |native| template.validate_group(native))
                     .is_err()
             );
         } else {
@@ -849,17 +853,30 @@ async fn unrequired_group_context_extension_refuses_before_intent_with_native_co
 
 #[test]
 fn exact_closed_policy_codec_matches_design_bytes_and_rejects_cross_binding() {
-    for template in [routing_only_v1(), bounded_app_receiver_v1()] {
+    for template in [
+        routing_only_v1(),
+        bounded_app_receiver_v1(),
+        admind_receiver_v1(),
+    ] {
         let raw = template.canonical_policy();
         let golden: &[u8] = if template == routing_only_v1() {
             include_bytes!("../tests/fixtures/receiver-v3/routing-only-v1.json")
-        } else {
+        } else if template == bounded_app_receiver_v1() {
             include_bytes!("../tests/fixtures/receiver-v3/bounded-app-receiver-v1.json")
+        } else {
+            include_bytes!("../tests/fixtures/receiver-v3/admind-receiver-v1.json")
         };
         assert_eq!(raw, golden);
         let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(value["template"], template.id());
-        assert_eq!(value["mls_proposals"], serde_json::json!([8]));
+        assert_eq!(
+            value["mls_proposals"],
+            if template == admind_receiver_v1() {
+                serde_json::json!([8, 10])
+            } else {
+                serde_json::json!([8])
+            }
+        );
         assert_eq!(serde_json::to_vec(&value).unwrap(), raw);
         assert_eq!(
             Template::from_policy(template.id(), &template.policy_sha256()).unwrap(),
@@ -875,4 +892,179 @@ fn exact_closed_policy_codec_matches_design_bytes_and_rejects_cross_binding() {
         .is_err()
     );
     assert!(Template::from_policy("default", &routing_only_v1().policy_sha256()).is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires separately built actual0.13 disposable helper test binary"]
+async fn actual_v013_welcome_and_commit_enter_exact_admind_v010_policy() {
+    use cgka_traits::{GroupId, MemberId, TransportMessage};
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Reply {
+        group: GroupId,
+        welcomer: MemberId,
+        welcome: TransportMessage,
+        commit: TransportMessage,
+    }
+    let template = admind_receiver_v1();
+    let mut recipient = client(template);
+    let kp = recipient.fresh_key_package().await.unwrap();
+    let metadata = crate::key_package_metadata(&kp).unwrap();
+    template.validate_metadata(&metadata).unwrap();
+    assert_eq!(metadata.mls_proposals, [8, 10]);
+    let mut unsupported = metadata.clone();
+    unsupported.mls_proposals.push(9);
+    assert!(template.validate_metadata(&unsupported).is_err());
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("package.json"),
+        serde_json::to_vec(&kp).unwrap(),
+    )
+    .unwrap();
+    let binary =
+        std::env::var_os("HD_INTEROP_V013_TEST").expect("actual separately built0.13 helper");
+    let child = std::process::Command::new(binary)
+        .args([
+            "--ignored",
+            "client::export_current_admind_receiver_interop_fixture",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("HD_INTEROP_ROOT", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "0.13 helper failed: {} {}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let reply: Reply =
+        serde_json::from_slice(&std::fs::read(root.path().join("reply.json")).unwrap()).unwrap();
+    let constraint = |template| JoinConstraint {
+        group: reply.group.clone(),
+        expected_welcomer: reply.welcomer.clone(),
+        operators: vec![reply.welcomer.clone()],
+        key_package_ref: hex::decode(&metadata.key_package_ref_hex).unwrap(),
+        template,
+    };
+    let wrong_intent = crate::protected_join::tests::intent(root.path());
+    assert!(
+        recipient
+            .receiver_join_enrolled(
+                reply.welcome.clone(),
+                wrong_intent,
+                constraint(bounded_app_receiver_v1())
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "old policy must refuse required Proposal10 rather than silently widening"
+    );
+    assert!(recipient.storage.list_groups().unwrap().is_empty());
+    assert_eq!(
+        crate::key_package::durably_owned_key_packages(
+            &recipient.storage,
+            cgka_traits::group::ProtocolProfile::Current
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    std::fs::remove_file(root.path().join("join-intent")).unwrap();
+    let evidence = recipient
+        .receiver_join_enrolled(
+            reply.welcome,
+            crate::protected_join::tests::intent(root.path()),
+            constraint(template),
+        )
+        .await
+        .unwrap()
+        .expect("actual0.13 native Welcome accepted by exact0.10 policy");
+    assert_eq!(evidence.group, reply.group);
+    assert_eq!(
+        recipient.storage.list_groups().unwrap(),
+        vec![reply.group.clone()]
+    );
+    // Use the real protected joined-owner continuation and ordered journal,
+    // not a manually installed merge capture or a convergence clock shortcut.
+    let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v3".into(),
+        account: hex::encode(recipient.self_id().as_slice()),
+        group: hex::encode(reply.group.as_slice()),
+        operators: vec![hex::encode(reply.welcomer.as_slice())],
+        expected_welcomer: hex::encode(reply.welcomer.as_slice()),
+        source_profile_sha256: "55".repeat(32),
+        storage_generation: "66".repeat(32),
+        initial_native_state_sha256: hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(&evidence.joined).unwrap(),
+        )),
+        welcome_provenance_sha256: evidence.digest().unwrap(),
+        expiry_profile_sha256: "77".repeat(32),
+        installation_index_sha256: "aa".repeat(32),
+        installation_source_sha256: "bb".repeat(32),
+        capability_template: template.id().into(),
+        capability_policy_sha256: template.policy_sha256(),
+    }; // Fixture-only profile/install pins, never production custody evidence.
+    let journal = crate::protected_recovery::Journal::enroll(
+        crate::protected_join::tests::recovery_files(root.path()),
+        enrollment.clone(),
+    )
+    .unwrap();
+    let before = recipient.group_record(&reply.group).unwrap().epoch;
+    let mut receiver = crate::protected_receiver::ProtectedReceiver::from_native_join(
+        recipient,
+        reply.group.clone(),
+        vec![reply.welcomer.clone()],
+        journal,
+        evidence,
+    )
+    .unwrap();
+    assert!(receiver.ingest(reply.commit).await.unwrap().is_none());
+    assert_eq!(
+        receiver.engine.group_record(&reply.group).unwrap().epoch.0,
+        before.0 + 1
+    );
+    receiver
+        .engine
+        .with_mls_group(&reply.group, |native| template.validate_group(native))
+        .unwrap();
+    let history = std::fs::read_to_string(root.path().join("receiver/journal")).unwrap();
+    let rows: Vec<serde_json::Value> = history
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let outcome: serde_json::Value = serde_json::from_slice(
+        &hex::decode(
+            rows.last().unwrap()["body"]["payload_hex"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome["schema"], "receiver-outcome.v1");
+    assert!(outcome["native_merge"].is_object());
+    // Positive ordered recovery must independently derive the new native
+    // projection from the retained direct merge, not the original join epoch.
+    let crate::protected_receiver::ProtectedReceiver {
+        engine, journal, ..
+    } = receiver;
+    drop(journal);
+    let journal = crate::protected_recovery::Journal::reopen(
+        crate::protected_join::tests::recovery_files(root.path()),
+        &enrollment,
+    )
+    .unwrap();
+    let reopened = crate::protected_receiver::ProtectedReceiver::reopen_ordered(
+        engine,
+        reply.group.clone(),
+        vec![reply.welcomer],
+        journal,
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.engine.group_record(&reply.group).unwrap().epoch.0,
+        before.0 + 1
+    );
 }

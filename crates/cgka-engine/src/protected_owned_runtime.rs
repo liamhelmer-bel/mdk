@@ -120,12 +120,13 @@ pub(crate) fn entry() -> bool {
             .enrollment
             .check()
             .map_err(|_| ReceiverHold::Configuration)?;
-        if crate::protected_capability_policy::Template::from_policy(
+        let template = crate::protected_capability_policy::Template::from_policy(
             &profile.enrollment.capability_template,
             &profile.enrollment.capability_policy_sha256,
         )
-        .map_err(|_| ReceiverHold::Configuration)?
-            != crate::protected_capability_policy::routing_only_v1()
+        .map_err(|_| ReceiverHold::Configuration)?;
+        if template != crate::protected_capability_policy::routing_only_v1()
+            && template != crate::protected_capability_policy::admind_receiver_v1()
         {
             return Err(ReceiverHold::Configuration);
         }

@@ -140,7 +140,10 @@ pub(super) fn entry() -> bool {
         profile.check()?;
         // The bounded factory remains available for native qualification; its
         // full receive/publication gate is not cleared for an installed generation.
-        if profile.template()? != crate::protected_capability_policy::routing_only_v1() {
+        let template = profile.template()?;
+        if template != crate::protected_capability_policy::routing_only_v1()
+            && template != crate::protected_capability_policy::admind_receiver_v1()
+        {
             return Err(ReceiverHold::Configuration);
         }
         anchor_custody::harden_process(profile.receiver_uid)?;
