@@ -126,11 +126,29 @@ fn duplicate_operator_rejected_and_order_is_canonical_but_changed_profile_holds(
         Journal::reopen(files(root.path()), &reversed),
         Err(Hold::Changed)
     ));
-    reversed.source_profile_sha256 = "ff".repeat(32);
-    assert!(matches!(
-        Journal::reopen(files(root.path()), &reversed),
-        Err(Hold::Changed)
-    ));
+    let before = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    drop(Journal::reopen(files(root.path()), &enrollment()).unwrap());
+    for source in [true, false] {
+        let mut changed = enrollment();
+        if source {
+            changed.source_profile_sha256 = "ff".repeat(32);
+        } else {
+            changed.expiry_profile_sha256 = "ee".repeat(32);
+        }
+        assert!(matches!(
+            Journal::reopen(files(root.path()), &changed),
+            Err(Hold::Changed)
+        ));
+        assert_eq!(
+            std::fs::read(root.path().join("receiver/journal")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+            anchor
+        );
+    }
 }
 #[test]
 fn second_independent_opener_and_same_inode_alias_are_refused() {
@@ -564,4 +582,19 @@ fn well_formed_v1_header_is_refused_without_migrating_either_retained_file() {
         std::fs::read(root.path().join("consumer/anchor")).unwrap(),
         before_anchor
     );
+}
+
+#[test]
+fn namespace_report_requires_exactly_one_matching_executed_test() {
+    let report = b"{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n{\"type\":\"test\",\"event\":\"ok\",\"name\":\"actual\"}\n{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0}\n";
+    assert!(single_root_fixture_passed(report, "actual"));
+    assert!(!single_root_fixture_passed(report, "missing"));
+    assert!(!single_root_fixture_passed(
+        b"{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0}",
+        "actual"
+    ));
+    assert!(!single_root_fixture_passed(
+        &[report.as_slice(), report.as_slice()].concat(),
+        "actual"
+    ));
 }

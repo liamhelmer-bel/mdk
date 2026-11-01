@@ -317,6 +317,9 @@ async fn run(
     if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
         return Err(ReceiverHold::ChangedState);
     }
+    // Keep the actual SQLCipher connection alive even if enrollment consumes and
+    // drops the Engine on an error after the native Welcome committed.
+    let retained_storage = storage.clone();
     let mut engine = owned_routed_engine(storage, keys)?;
     check_cache_devices(
         &cache_directory,
@@ -349,6 +352,7 @@ async fn run(
         directory: intent_directory,
     };
     check_intent_alias(&files, &intent)?;
+    let retained_locks = retain_lock_descriptions(&files)?;
     let sdk = nostr_sdk::Client::builder().build();
     let adapter = NostrTransportAdapter::new(Arc::new(NostrSdkRelayClient::new(sdk.clone())));
     let forwarder = forward(sdk.clone(), adapter.clone(), spool);
@@ -400,11 +404,39 @@ async fn run(
     forwarder.abort();
     let _ = forwarder.await;
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
-    drop((retained, key_file, dbkey_file, account_dir, db_file));
+    drop((
+        retained,
+        retained_locks,
+        retained_storage,
+        key_file,
+        dbkey_file,
+        account_dir,
+        db_file,
+    ));
     if shutdown.is_err() {
         return Err(ReceiverHold::Engine);
     }
     result
+}
+
+// Duplicates share the original locked open-file descriptions. Keep them outside
+// the consuming enrollment future: every error path must retain ownership until
+// the forwarder is reaped and finite SDK shutdown has finished.
+fn retain_lock_descriptions(files: &OwnedFiles) -> Result<[File; 3], ReceiverHold> {
+    Ok([
+        files
+            .storage_lease
+            .try_clone()
+            .map_err(|_| ReceiverHold::Journal)?,
+        files
+            .journal
+            .try_clone()
+            .map_err(|_| ReceiverHold::Journal)?,
+        files
+            .anchor
+            .try_clone()
+            .map_err(|_| ReceiverHold::Journal)?,
+    ])
 }
 
 // One production postcommit operation: durable enrollment and retention must precede
@@ -665,6 +697,65 @@ mod tests {
         );
         assert!(
             storage
+                .list_pending_application_events()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_postcommit_journal_enrollment_keeps_original_locks_until_cleanup() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+        let (mut engine, storage, wire, group, operator) = invitation().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut p = profile(&engine, &group, &operator, &wire);
+        let binding = binding(root.path(), &mut p);
+        let files = Journal::prepare_fresh(recovery_files(root.path())).unwrap();
+        let locks = retain_lock_descriptions(&files).unwrap();
+        let evidence = attempt_welcome(&mut engine, &p, &intent(root.path()), &binding, wire)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.list_groups().unwrap(), vec![group]);
+        // Real Journal::enroll now fails after actual native commit and consumes
+        // its Engine/files. This is not the successful-return policy-check path.
+        std::fs::write(
+            root.path().join("receiver/journal"),
+            b"incomplete external journal",
+        )
+        .unwrap();
+        let mut retained = None;
+        assert!(matches!(
+            retain_enrollment(
+                &mut retained,
+                engine,
+                &p,
+                &binding.source_sha256,
+                files,
+                evidence,
+                &binding
+            ),
+            Err(ReceiverHold::Journal)
+        ));
+        assert!(retained.is_none());
+        let other = recovery_files(root.path());
+        for file in [&other.storage_lease, &other.journal, &other.anchor] {
+            assert!(file.try_lock().is_err());
+        }
+        // Production holds these original descriptions through forwarder reaping
+        // and SDK shutdown, even though the enrollment future has returned Err.
+        drop(locks);
+        for file in [&other.storage_lease, &other.journal, &other.anchor] {
+            file.try_lock().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("receiver/journal")).unwrap(),
+            b"incomplete external journal"
+        );
+        assert!(
+            !storage
                 .list_pending_application_events()
                 .unwrap()
                 .is_empty()

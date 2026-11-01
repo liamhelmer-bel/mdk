@@ -170,3 +170,24 @@ custody remain fixture-selected; this is not a no-argument installed-entry,
 whole Product producer, host enrollment or deployment qualification. Separate
 root-publisher, anchor custody, account initializer and finite bootstrap slices
 remain independent prerequisites; this patch does not install them.
+
+Cleanup qualification: the actual SQLCipher storage clone and duplicate original
+storage-lease/journal/anchor open-file descriptions stay outside the consuming
+enrollment future until the forwarder is reaped and finite SDK shutdown returns.
+This also covers an error after native commit inside Journal::enroll or native
+receiver construction, when no ProtectedReceiver is returned. Partial durable
+state remains UNKNOWN; a generic HOLD does not supply an enrollment identity or
+permit automatic recovery. Its protected original files require reconciliation.
+The causal test forces actual Journal enrollment failure after native commit and
+checks all three competing locks before and after releasing retained descriptions;
+it is not a full no-argument shutdown qualification.
+
+Linux tests for root-owned expiry positives require `unshare` and working
+unprivileged user namespaces on an ordinary nonroot CI host. Each subprocess
+runs the exact named test under namespace uid0 and emits libtest JSON; the parent
+requires one matching passed test and one successful single-test suite. Zero
+matches and missing namespace facilities fail visibly. `RUSTC_BOOTSTRAP=1` enables
+only the test binary's JSON reporting option, not a production authority path.
+Root CI runs those cases directly. The fresh FD3 source profile currently checks
+root ownership and retained bytes; its declared read-only/single-link/mode0400
+publisher contract is not completely enforced here (FD16 expiry is enforced).

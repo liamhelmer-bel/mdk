@@ -962,12 +962,53 @@ pub(crate) fn root_expiry_fixture_available() -> bool {
     }
     let thread = std::thread::current();
     let name = thread.name().expect("named libtest fixture");
-    let status = std::process::Command::new("unshare")
+    let output = std::process::Command::new("unshare")
         .args(["--user", "--map-root-user"])
         .arg(std::env::current_exe().unwrap())
-        .args(["--exact", name, "--nocapture", "--test-threads=1"])
-        .status()
-        .expect("Linux protected-owner tests require unshare for disposable uid0 fixtures");
-    assert!(status.success(), "disposable uid0 fixture failed: {name}");
+        .args([
+            "--exact",
+            name,
+            "--nocapture",
+            "--test-threads=1",
+            "--format=json",
+            "-Z",
+            "unstable-options",
+        ])
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("Linux protected-owner tests require unprivileged user namespaces and unshare");
+    assert!(
+        output.status.success() && single_root_fixture_passed(&output.stdout, name),
+        "disposable uid0 fixture must execute exactly one matching test: {name}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     false
+}
+
+#[cfg(test)]
+fn single_root_fixture_passed(stdout: &[u8], name: &str) -> bool {
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let executed = events
+        .iter()
+        .filter(|event| event["type"] == "test" && event["event"] == "ok" && event["name"] == name)
+        .count();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "suite" && event["event"] == "started")
+        .collect();
+    let suites: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "suite" && event["event"] == "ok")
+        .collect();
+    executed == 1
+        && starts.len() == 1
+        && starts[0]["test_count"] == 1
+        && suites.len() == 1
+        && suites[0]["passed"] == 1
+        && suites[0]["failed"] == 0
+        && suites[0]["ignored"] == 0
 }
