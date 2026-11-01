@@ -519,6 +519,12 @@ pub mod index_tests {
         let unused = source_path.join("python/unused.py");
         fs::write(&unused, b"not imported").unwrap();
         fs::set_permissions(&unused, fs::Permissions::from_mode(0o444)).unwrap();
+        let readonly = source_path.join("python/empty-certs");
+        fs::create_dir(&readonly).unwrap();
+        let child = readonly.join("configuration");
+        fs::write(&child, b"retained configuration").unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
         let entries = inventory_candidate(&source).unwrap();
         value["entries"] = Value::Array(entries.clone());
         value["tree_sha256"] = Value::String(digest(&canonical(&Value::Array(entries)).unwrap()));
@@ -552,6 +558,20 @@ pub mod index_tests {
         fs::write(&index_path, &raw).unwrap();
         fs::set_permissions(&index_path, fs::Permissions::from_mode(0o444)).unwrap();
         index.compare_published(&destination, &raw).unwrap();
+        let copied_readonly = destination_path.join("python/empty-certs");
+        assert_eq!(
+            fs::metadata(&copied_readonly).unwrap().permissions().mode() & 0o7777,
+            0o555
+        );
+        assert_eq!(
+            fs::read(copied_readonly.join("configuration")).unwrap(),
+            b"retained configuration"
+        );
+        fs::set_permissions(&copied_readonly, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(index.compare_published(&destination, &raw).is_err());
+        fs::set_permissions(&copied_readonly, fs::Permissions::from_mode(0o555)).unwrap();
+        index.compare_published(&destination, &raw).unwrap();
+
         assert!(inventory_candidate(&destination).is_err());
         fs::set_permissions(&index_path, fs::Permissions::from_mode(0o600)).unwrap();
         fs::write(&index_path, b"{}").unwrap();

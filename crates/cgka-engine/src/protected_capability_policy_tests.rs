@@ -353,12 +353,50 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 cgka_traits::ingest::IngestOutcome::Buffered { .. }
             ));
             let control_before = replay_control.storage.get_group(&group).unwrap().epoch;
+            let ordinary = crate::openmls_projection::canonicalize_stored_openmls_messages(
+                &replay_control.storage,
+                &group,
+                crate::canonicalization::CanonicalizationState {
+                    current_tip_epoch: control_before.0,
+                    retained_anchor_epoch: control_before.0,
+                    last_convergence_relevant_input_ms: 0,
+                    seen_message_ids: Default::default(),
+                },
+                vec![],
+                Default::default(),
+                u64::MAX,
+            )
+            .unwrap();
+            assert!(
+                !ordinary.accepted_commits.is_empty(),
+                "ordinary replay accepts wider commit"
+            );
+            let refusal = crate::openmls_projection::apply_openmls_canonicalization_result_with_profile_policy(
+                &replay_control.storage, &group, &ordinary, 64,
+                crate::openmls_projection::ReplayProfilePolicy {
+                    receiver_template: Some(bounded_app_receiver_v1()), ..Default::default()
+                },
+            ).unwrap_err();
+            assert!(
+                matches!(refusal,
+                    crate::openmls_projection::OpenMlsProjectionError::InvalidCommit { ref reason, .. }
+                    if reason.contains("protected receiver replayed state") && reason.contains("protected capability policy mismatch")
+                ),
+                "exact protected-policy rejection required, got {refusal:?}"
+            );
+            assert_eq!(
+                replay_control.storage.get_group(&group).unwrap().epoch,
+                control_before
+            );
             let mut replay_capture = crate::protected_merge::Capture::for_group(group.clone());
             replay_capture.template = Some(bounded_app_receiver_v1());
             replay_control.receiver_merge_capture = Some(replay_capture);
-            let _refused = replay_control
-                .advance_convergence_inputs_until_settled(&group, u64::MAX)
-                .await;
+            assert!(
+                replay_control
+                    .advance_convergence_inputs_until_settled(&group, u64::MAX)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
                 replay_control.storage.get_group(&group).unwrap().epoch,
                 control_before
@@ -368,7 +406,13 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                     bounded_app_receiver_v1().validate_group(native)
                 })
                 .unwrap();
-            // The ordinary engine may adopt the exact same native-valid policy.
+            // The same receiver policy captured for a different group must not
+            // constrain this independently joined group's canonical replay.
+            let mut unrelated = crate::protected_merge::Capture::for_group(
+                cgka_traits::types::GroupId::new(vec![0x99; 16]),
+            );
+            unrelated.template = Some(bounded_app_receiver_v1());
+            native_control.receiver_merge_capture = Some(unrelated);
             assert!(
                 native_control
                     .advance_convergence_inputs_until_settled(&group, u64::MAX)
