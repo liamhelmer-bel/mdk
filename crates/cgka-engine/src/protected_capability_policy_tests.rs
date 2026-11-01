@@ -23,7 +23,15 @@ fn client(template: Template) -> Engine<SqliteAccountStorage> {
 #[tokio::test]
 async fn closed_templates_match_actual_persisted_private_package_metadata() {
     for template in [routing_only_v1(), bounded_app_receiver_v1()] {
-        let mut engine = client(template);
+        let mut engine = if template == routing_only_v1() {
+            owned_routed_engine(
+                SqliteAccountStorage::in_memory().unwrap(),
+                nostr::Keys::generate(),
+            )
+            .unwrap()
+        } else {
+            client(template)
+        };
         let kp = engine.fresh_key_package().await.unwrap();
         let actual = crate::key_package_metadata(&kp).unwrap();
         template.validate_metadata(&actual).unwrap();
@@ -59,8 +67,29 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
     use cgka_traits::app_components::{
         AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1, encode_nostr_routing_v1,
     };
-    for variant in ["bounded", "frame8192", "fanout", "replay", "padding"] {
-        let mut inviter = client(bounded_app_receiver_v1());
+    for variant in [
+        "bounded",
+        "frame8192",
+        "fanout",
+        "replay",
+        "padding",
+        "optional-unknown",
+    ] {
+        let mut inviter = if variant == "optional-unknown" {
+            let keys = nostr::Keys::generate();
+            let mut components = bounded_app_receiver_v1().components();
+            components.insert(0x9000);
+            EngineBuilder::new(SqliteAccountStorage::in_memory().unwrap())
+                .supported_app_components(components)
+                .feature_registry(bounded_app_receiver_v1().registry())
+                .identity(keys.public_key().to_bytes().to_vec())
+                .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
+                .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
+                .build()
+                .unwrap()
+        } else {
+            client(bounded_app_receiver_v1())
+        };
         let mut recipient = client(bounded_app_receiver_v1());
         let mut kp = recipient.fresh_key_package().await.unwrap();
         let reference = hex::decode(
@@ -81,13 +110,14 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             _ => {}
         }
         let (group, sent) = inviter
-            .create_group(CreateGroupRequest {
-                name: "bounded handling fixture".into(),
-                description: String::new(),
-                members: vec![kp],
-                required_features: vec![],
-                initial_admins: vec![],
-                app_components: vec![
+            .create_group_with_optional_app_components(
+                CreateGroupRequest {
+                    name: "bounded handling fixture".into(),
+                    description: String::new(),
+                    members: vec![kp],
+                    required_features: vec![],
+                    initial_admins: vec![],
+                    app_components: vec![
                     AppComponentData {
                         component_id: NOSTR_ROUTING_COMPONENT_ID,
                         data: encode_nostr_routing_v1(
@@ -109,7 +139,16 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                         .unwrap(),
                     },
                 ],
-            })
+                },
+                if variant == "optional-unknown" {
+                    vec![AppComponentData {
+                        component_id: 0x9000,
+                        data: vec![0x41],
+                    }]
+                } else {
+                    vec![]
+                },
+            )
             .await
             .unwrap();
         let SendResult::FoundingGroupCreated { mut welcomes } = sent else {

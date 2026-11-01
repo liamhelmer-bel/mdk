@@ -97,6 +97,20 @@ impl Template {
         if components.ids.iter().any(|id| !supported.contains(id)) {
             return Err(refused());
         }
+        // Optional dictionary state is authenticated too, but it must not widen
+        // this closed template merely by omitting an ID from the required list.
+        if group
+            .extensions()
+            .app_data_dictionary()
+            .is_some_and(|dictionary| {
+                dictionary
+                    .dictionary()
+                    .entries()
+                    .any(|entry| !supported.contains(&entry.id()))
+            })
+        {
+            return Err(refused());
+        }
         let required = crate::capability_manager::required_capabilities_from_group(group);
         if required
             .extensions

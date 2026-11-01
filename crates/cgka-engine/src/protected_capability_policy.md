@@ -22,15 +22,19 @@ with the same actual metadata; it never selects the bounded factory. Generic
 engine defaults are unchanged. The private JoinConstraint additionally carries
 a closed Template. Capture checks the authenticated staged MLS group after
 native validation and before original intent writing/native commit. Bounded
-checks reject unsupported required components, proposals and extensions; require
+checks reject every out-of-template dictionary entry, including optional entries
+absent from the required component list, and unsupported required components,
+proposals and extensions; require
 Current profile; constrain QUIC policy to receive-required, receive|send allowed,
 frame4096, replayTTL0, padding0; and reuse native V2 media validation with no V1
 policy. Rejection is nonterminal rollback: unchanged Welcome can still pass the
 native control, and no private package/group/intent/dedup state is spent. I/O or
 commit uncertainty retains the existing UNKNOWN behavior.
 
-Actual disposable tests verify both persisted private KP metadata sets;
-native-valid frame8192/fanout/replay/padding refusals with identical-Welcome
+Actual disposable tests verify both persisted private KP metadata sets, using
+the production owned constructor for the routing metadata control;
+native-valid optional-unknown dictionary and frame8192/fanout/replay/padding
+refusals with identical-Welcome
 native controls; required Proposal10 and an unknown extension in deliberately
 wider test engines; preexisting native unknown-component rejection; malformed
 V2 and V1/V2 mixed creation refusal. Unsupported component/media creation
