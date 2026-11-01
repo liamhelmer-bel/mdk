@@ -228,6 +228,15 @@ impl InstalledProducer {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C.UTF-8")
+            .env("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+            .env(
+                "SSL_CERT_DIR",
+                stdlib
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .ok_or(ReceiverHold::Configuration)?
+                    .join("empty-certs"),
+            )
             .current_dir("/");
         let raw = process::run(command, files, original, Duration::from_secs(30))?;
         self.check()?;

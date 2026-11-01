@@ -91,6 +91,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         }
         let join: Join = decode(&original.body["value"]["native_join"])?;
         if join.group != group
+            || hex::encode(join.authenticated_welcomer.as_slice()) != enrollment.expected_welcomer
             || sha(&join)? != enrollment.welcome_provenance_sha256
             || sha(&join.original_wire)? != join.original_wire_sha256
             || sha(&join.joined)? != enrollment.initial_native_state_sha256

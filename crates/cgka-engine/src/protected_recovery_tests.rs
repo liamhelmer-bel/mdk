@@ -26,6 +26,7 @@ fn files(root: &Path) -> OwnedFiles {
 }
 fn enrollment() -> Enrollment {
     Enrollment {
+        expected_welcomer: "55".repeat(32),
         schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: "66".repeat(32),
         installation_index_sha256: "aa".repeat(32),

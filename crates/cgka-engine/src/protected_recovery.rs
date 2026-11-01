@@ -46,6 +46,7 @@ pub(super) struct Enrollment {
     pub(super) account: String,
     pub(super) group: String,
     pub(super) operators: Vec<String>,
+    pub(super) expected_welcomer: String,
     pub(super) source_profile_sha256: String,
     pub(super) storage_generation: String,
     pub(super) initial_native_state_sha256: String,
@@ -63,10 +64,12 @@ impl Enrollment {
         if self.schema != Self::SCHEMA
             || self.operators.is_empty()
             || self.operators.len() > 64
+            || self.expected_welcomer == self.account
             || self.operators.contains(&self.account)
             || self.operators.windows(2).any(|p| p[0] >= p[1])
             || ![
                 &self.account,
+                &self.expected_welcomer,
                 &self.source_profile_sha256,
                 &self.storage_generation,
                 &self.initial_native_state_sha256,
