@@ -1,5 +1,5 @@
 //! Closed, source-bound capability templates for future protected generations.
-//! No startup schema selects the bounded template until generation composition.
+//! Startup admits only routing or the exact qualified admind receive template.
 use crate::{FeatureRegistry, key_package::KeyPackageMetadata};
 use cgka_traits::{
     EngineError,
@@ -20,18 +20,35 @@ use openmls::prelude::{Extension, MlsGroup};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Template {
     bounded: bool,
+    self_remove: bool,
 }
 /// Original pinned routing support, independent of future generic defaults.
 pub fn routing_only_v1() -> Template {
-    Template { bounded: false }
+    Template {
+        bounded: false,
+        self_remove: false,
+    }
 }
 /// Receive-only support. Publication still requires generation and functional gates.
 pub fn bounded_app_receiver_v1() -> Template {
-    Template { bounded: true }
+    Template {
+        bounded: true,
+        self_remove: false,
+    }
+}
+/// Exact current admind receive policy: bounded app data plus native SelfRemove.
+/// This does not enable arbitrary proposals or active stream/media consumers.
+pub fn admind_receiver_v1() -> Template {
+    Template {
+        bounded: true,
+        self_remove: true,
+    }
 }
 impl Template {
     pub fn id(self) -> &'static str {
-        if self.bounded {
+        if self.self_remove {
+            "admind-receiver-v1"
+        } else if self.bounded {
             "bounded-app-receiver-v1"
         } else {
             "routing-only-v1"
@@ -52,11 +69,14 @@ impl Template {
         } else {
             vec![1, 2, 3, 4, 5, 6]
         };
-        let features: Vec<&str> = if bounded {
+        let mut features: Vec<&str> = if bounded {
             vec!["marmot.feature.agent_text_stream_quic.receive.v1"]
         } else {
             vec![]
         };
+        if self.self_remove {
+            features.push("heterodyne.receiver.self_remove.v1");
+        }
         let quic = if bounded {
             serde_json::json!({
                 "required_roles": 1, "allowed_roles": 3, "max_plaintext_frame": 4096,
@@ -65,12 +85,21 @@ impl Template {
         } else {
             serde_json::Value::Null
         };
+        let proposals = if self.self_remove {
+            vec![8, 10]
+        } else {
+            vec![8]
+        };
+        let mut effective_proposals = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        if self.self_remove {
+            effective_proposals.push(10);
+        }
         serde_json::to_vec(&serde_json::json!({
             "schema": "heterodyne-receiver-capability-policy.v1", "template": self.id(),
             "protocol": "current", "component_inputs": components,
             "key_package_components": key_components, "mls_extensions": extensions,
-            "mls_proposals": [8], "effective_extensions": effective_extensions,
-            "effective_proposals": [1,2,3,4,5,6,7,8], "features": features,
+            "mls_proposals": proposals, "effective_extensions": effective_extensions,
+            "effective_proposals": effective_proposals, "features": features,
             "quic": quic, "media": if bounded { "v2-validated-no-fetch" } else { "none" }
         }))
         .expect("closed integer policy is JSON serializable")
@@ -84,6 +113,7 @@ impl Template {
         let template = match id {
             "routing-only-v1" => routing_only_v1(),
             "bounded-app-receiver-v1" => bounded_app_receiver_v1(),
+            "admind-receiver-v1" => admind_receiver_v1(),
             _ => return Err(refused()),
         };
         if template.policy_sha256() != sha256 {
@@ -112,6 +142,16 @@ impl Template {
                 },
             );
         }
+        if self.self_remove {
+            registry.register(
+                cgka_traits::capabilities::Feature("heterodyne.receiver.self_remove.v1"),
+                CapabilityRequirement {
+                    requires: cgka_traits::capabilities::Capability::Proposal(10),
+                    level: RequirementLevel::Optional,
+                    description: "native SelfRemove compatibility for the current admind group",
+                },
+            );
+        }
         registry
     }
     pub fn validate_metadata(self, metadata: &KeyPackageMetadata) -> Result<(), EngineError> {
@@ -125,11 +165,16 @@ impl Template {
         } else {
             vec![6]
         };
+        let proposals = if self.self_remove {
+            vec![8, 10]
+        } else {
+            vec![8]
+        };
         if metadata.protocol_profile != ProtocolProfile::Current
             || metadata.ciphersuite != 1
             || metadata.app_components != components
             || metadata.mls_extensions != extensions
-            || metadata.mls_proposals != [8]
+            || metadata.mls_proposals != proposals
         {
             return Err(refused());
         }
@@ -181,7 +226,10 @@ impl Template {
             .extensions
             .iter()
             .any(|id| ![1, 2, 3, 4, 5, 6, 0xf2d1].contains(id))
-            || required.proposals.iter().any(|id| !(1..=8).contains(id))
+            || required
+                .proposals
+                .iter()
+                .any(|id| !(1..=8).contains(id) && !(self.self_remove && *id == 10))
         {
             return Err(refused());
         }
