@@ -71,7 +71,10 @@ pub(crate) fn ready(file: &File, timeout: Duration) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::net::UnixStream};
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+    };
     #[test]
     fn parent_deadline_includes_child_preflight_and_outer_final_reread() {
         let inner = initialization_at(160000, 100000, false).unwrap();
@@ -96,12 +99,13 @@ mod tests {
         thread.join().unwrap();
     }
     #[test]
-    fn closed_transferred_endpoint_reports_immediate_hold() {
+    fn closed_transferred_endpoint_is_immediately_readable_as_eof() {
         let (reader, writer) = UnixStream::pair().unwrap();
         let file = File::from(std::os::fd::OwnedFd::from(reader));
         drop(writer);
         let started = Instant::now();
-        assert!(ready(&file, Duration::from_secs(2)).is_err());
+        ready(&file, Duration::from_secs(2)).unwrap();
+        assert_eq!((&file).read(&mut [0; 1]).unwrap(), 0);
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
