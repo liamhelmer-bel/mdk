@@ -524,3 +524,160 @@ async fn native_media_validation_refuses_malformed_v2_and_mixed_policy() {
         );
     }
 }
+
+#[tokio::test]
+async fn unrequired_group_context_extension_refuses_before_intent_with_native_control() {
+    use crate::provider::EngineOpenMlsProvider;
+    use cgka_traits::engine::SendIntent;
+    use openmls::prelude::{Extension, Extensions, ExternalSender, MlsGroup};
+    use openmls_traits::OpenMlsProvider;
+    let mut inviter = client(bounded_app_receiver_v1());
+    let mut recipient = client(bounded_app_receiver_v1());
+    let mut kp = recipient.fresh_key_package().await.unwrap();
+    let reference = hex::decode(
+        crate::key_package_metadata(&kp)
+            .unwrap()
+            .key_package_ref_hex,
+    )
+    .unwrap();
+    kp.source = Some(cgka_traits::engine::KeyPackageSource {
+        event_id: cgka_traits::types::MessageId::new(vec![0x35; 32]),
+    });
+    let (group, _) = inviter
+        .create_group(CreateGroupRequest {
+            name: "unrequired outer extension".into(),
+            description: String::new(),
+            members: vec![],
+            required_features: vec![],
+            initial_admins: vec![],
+            app_components: vec![cgka_traits::app_components::AppComponentData {
+                component_id: cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID,
+                data: cgka_traits::app_components::encode_nostr_routing_v1(
+                    &cgka_traits::app_components::NostrRoutingV1::new(
+                        [7; 32],
+                        vec!["wss://bounded.invalid".into()],
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            }],
+        })
+        .await
+        .unwrap();
+    {
+        // Actual OpenMLS state transition on the disposable inviter, not a
+        // serialized Welcome rewrite or a production policy escape hatch.
+        let provider = EngineOpenMlsProvider::<SqliteAccountStorage>::new(
+            &inviter.crypto,
+            inviter.storage.mls_storage(),
+        );
+        let mut native = MlsGroup::load(
+            provider.storage(),
+            &openmls::group::GroupId::from_slice(group.as_slice()),
+        )
+        .unwrap()
+        .unwrap();
+        bounded_app_receiver_v1().validate_group(&native).unwrap();
+        let mut extensions: Vec<_> = native.extensions().iter().cloned().collect();
+        let leaf = native.own_leaf_node().unwrap();
+        extensions.push(Extension::ExternalSenders(vec![ExternalSender::new(
+            leaf.signature_key().clone(),
+            leaf.credential().clone(),
+        )]));
+        let extensions = Extensions::from_vec(extensions).unwrap();
+        let bundle = native
+            .commit_builder()
+            .propose_group_context_extensions(extensions)
+            .unwrap()
+            .load_psks(provider.storage())
+            .unwrap()
+            .build(
+                provider.rand(),
+                provider.crypto(),
+                &inviter.identity.signer,
+                |_| true,
+            )
+            .unwrap()
+            .stage_commit(&provider)
+            .unwrap();
+        drop(bundle);
+        native.merge_pending_commit(&provider).unwrap();
+        assert!(
+            native
+                .extensions()
+                .iter()
+                .any(|extension| matches!(extension, Extension::ExternalSenders(_)))
+        );
+        assert!(
+            !crate::capability_manager::required_capabilities_from_group(&native)
+                .extensions
+                .contains(&5)
+        );
+    }
+    let sent = inviter
+        .send(SendIntent::Invite {
+            group_id: group.clone(),
+            key_packages: vec![kp],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    let SendResult::GroupEvolution { mut welcomes, .. } = sent else {
+        panic!("invite commit")
+    };
+    let wire = welcomes.remove(0);
+    let root = tempfile::tempdir().unwrap();
+    let file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.path().join("intent"))
+        .unwrap();
+    let intent = || JoinIntent {
+        file: file.try_clone().unwrap(),
+        directory: File::open(root.path()).unwrap(),
+    };
+    let constraint = |template| JoinConstraint {
+        group: group.clone(),
+        operators: vec![inviter.self_id()],
+        key_package_ref: reference.clone(),
+        template,
+    };
+    assert!(
+        recipient
+            .receiver_join_enrolled(
+                wire.clone(),
+                intent(),
+                constraint(bounded_app_receiver_v1())
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(file.metadata().unwrap().len(), 0);
+    assert!(recipient.storage.list_groups().unwrap().is_empty());
+    assert!(
+        recipient
+            .storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        crate::key_package::durably_owned_key_packages(
+            &recipient.storage,
+            cgka_traits::group::ProtocolProfile::Current
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert!(
+        recipient
+            .receiver_join_enrolled(wire, intent(), constraint(routing_only_v1()))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

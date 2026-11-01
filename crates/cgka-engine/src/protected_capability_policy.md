@@ -24,7 +24,9 @@ a closed Template. Capture checks the authenticated staged MLS group after
 native validation and before original intent writing/native commit. Bounded
 checks reject every out-of-template dictionary entry, including optional entries
 absent from the required component list, and unsupported required components,
-proposals and extensions; require
+proposals and extensions; reject every actual GroupContext extension container
+except RequiredCapabilities and AppDataDictionary (a leaf capability does not
+authorize extra live context state); require
 Current profile; constrain QUIC policy to receive-required, receive|send allowed,
 frame4096, replayTTL0, padding0; and reuse native V2 media validation with no V1
 policy. Rejection is nonterminal rollback: unchanged Welcome can still pass the
@@ -35,7 +37,9 @@ Actual disposable tests verify both persisted private KP metadata sets, using
 the production owned constructor for the routing metadata control;
 native-valid optional-unknown dictionary and frame8192/fanout/replay/padding
 refusals with identical-Welcome
-native controls; required Proposal10 and an unknown extension in deliberately
+native controls; actual OpenMLS unrequired outer ExternalSenders context extension refused
+before intent with identical Welcome accepted by unchanged native/routing rules;
+required Proposal10 and an unknown extension in deliberately
 wider test engines; preexisting native unknown-component rejection; malformed
 V2 and V1/V2 mixed creation refusal. Unsupported component/media creation
 refusals do not claim that a valid Welcome reached the new policy seam. The
@@ -58,3 +62,8 @@ fresh/resume ownership, complete functional qualification before advertisement,
 actual intended group readback, and approved installed custody/deployment. This
 foundation alone satisfies none of those runtime admission gates. Old profiles
 and prepared/UNKNOWN records are never upgraded or adopted.
+
+These causal tests require Linux and the protected-owner-runtime feature. The
+recorded commands enable it explicitly; ordinary CI without that feature does
+not exercise this private protected-owner test module. Future generation
+composition must unify the separately fixed routing engine/constraint choices.

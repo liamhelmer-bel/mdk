@@ -14,7 +14,7 @@ use cgka_traits::{
     capabilities::{CapabilityRequirement, RequirementLevel},
     group::ProtocolProfile,
 };
-use openmls::prelude::MlsGroup;
+use openmls::prelude::{Extension, MlsGroup};
 
 /// A closed source template; its fields cannot be supplied by a caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +90,17 @@ impl Template {
         if crate::account_identity_proof::protocol_profile_of_group(group)?
             != ProtocolProfile::Current
         {
+            return Err(refused());
+        }
+        // Capabilities advertised by leaves do not authorize arbitrary live
+        // GroupContext state. This closed Current template needs only these
+        // two containers; QUIC policy remains dictionary component state.
+        if group.extensions().iter().any(|extension| {
+            !matches!(
+                extension,
+                Extension::RequiredCapabilities(_) | Extension::AppDataDictionary(_)
+            )
+        }) {
             return Err(refused());
         }
         let components = crate::app_components::required_app_components_of_group(group)?;
