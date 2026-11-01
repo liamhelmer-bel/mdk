@@ -14,9 +14,10 @@ use transport_nostr_peeler::NostrTransportEvent;
 use crate::generation::Generation;
 use crate::initializer::{Artifact, Ledger};
 
+#[derive(Clone)]
 pub(crate) struct JournaledRelay {
     ledger: Arc<Mutex<Ledger>>,
-    serial: AsyncMutex<()>,
+    serial: Arc<AsyncMutex<()>>,
     bytes: [Vec<u8>; 3],
     bindings: Vec<Artifact>,
     relay: Arc<dyn NostrRelayClient>,
@@ -48,7 +49,7 @@ impl JournaledRelay {
             .map_err(|_| hold())?;
         Ok(Self {
             ledger: Arc::new(Mutex::new(ledger)),
-            serial: AsyncMutex::new(()),
+            serial: Arc::new(AsyncMutex::new(())),
             bytes,
             bindings,
             relay,
@@ -104,56 +105,10 @@ impl JournaledRelay {
         .await
     }
 
-    // Relay receipts alone cannot assert native promotion. Reconcile only an
-    // independently opened current SQLCipher lifecycle matching the exact
-    // retained package/event. A crash after native promotion but before this
-    // append is recoverable by repeating this readback, without another send.
-    pub(crate) async fn published(
-        &self,
-        generation: &Generation,
-    ) -> Result<(), TransportAdapterError> {
-        let (database, keys, key, retained) =
-            generation.retained_native_inputs().map_err(|_| hold())?;
-        let bytes = self.bytes[2].clone();
-        let endpoints = self.bindings[2]
-            .targets
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect();
-        let prepared = tokio::task::spawn_blocking(move || {
-            let result = crate::preparation::promoted_from_retained(
-                &database, &key, &keys, bytes, endpoints,
-            );
-            drop(retained);
-            result
-        })
-        .await
-        .map_err(|_| hold())?
-        .map_err(|_| hold())?;
-        self.update(move |ledger| {
-            if ledger.publication_slot()? != prepared.publication.slot_id {
-                return Err(crate::initializer::Error::Hold);
-            }
-            ledger.published()
-        })
-        .await
-    }
-}
-
-#[async_trait]
-impl NostrRelayClient for JournaledRelay {
-    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
-        Err(TransportAdapterError::Closed)
-    }
-    async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
-        Err(TransportAdapterError::Closed)
-    }
-    async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
-        Err(TransportAdapterError::Closed)
-    }
-
-    async fn publish_event(
+    // Caller cancellation detaches this bounded task; it retains the serial
+    // guard until the actual begin/network/report sequence is durably complete.
+    // A retry cannot overtake an in-flight fsync or discard an observed receipt.
+    async fn publish_retained(
         &self,
         endpoints: &[TransportEndpoint],
         event: &NostrTransportEvent,
@@ -176,8 +131,8 @@ impl NostrRelayClient for JournaledRelay {
         let sequence = self
             .update(move |ledger| ledger.begin_attempt(index, &owned_binding))
             .await?;
-        // Cancellation of this future leaves a durable Begun marker. A timeout
-        // or error also remains possibly exposed; no replacement is prepared.
+        // The owned task survives caller cancellation. Its finite network timeout
+        // records Unknown before releasing serialization; never replace material.
         match tokio::time::timeout(
             self.timeout,
             // Capture an actual positive report below the overall threshold.
@@ -237,5 +192,72 @@ impl NostrRelayClient for JournaledRelay {
                 Err(hold())
             }
         }
+    }
+
+    // Relay receipts alone cannot assert native promotion. Reconcile only an
+    // independently opened current SQLCipher lifecycle matching the exact
+    // retained package/event. A crash after native promotion but before this
+    // append is recoverable by repeating this readback, without another send.
+    pub(crate) async fn published(
+        &self,
+        generation: &Generation,
+    ) -> Result<(), TransportAdapterError> {
+        let (database, keys, key, retained) =
+            generation.retained_native_inputs().map_err(|_| hold())?;
+        let bytes = self.bytes[2].clone();
+        let endpoints = self.bindings[2]
+            .targets
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let result = crate::preparation::promoted_from_retained(
+                &database, &key, &keys, bytes, endpoints,
+            );
+            drop(retained);
+            result
+        })
+        .await
+        .map_err(|_| hold())?
+        .map_err(|_| hold())?;
+        self.update(move |ledger| {
+            if ledger.publication_slot()? != prepared.publication.slot_id {
+                return Err(crate::initializer::Error::Hold);
+            }
+            ledger.published()
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl NostrRelayClient for JournaledRelay {
+    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+        Err(TransportAdapterError::Closed)
+    }
+    async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+        Err(TransportAdapterError::Closed)
+    }
+    async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+        Err(TransportAdapterError::Closed)
+    }
+
+    async fn publish_event(
+        &self,
+        endpoints: &[TransportEndpoint],
+        event: &NostrTransportEvent,
+        required_acks: usize,
+    ) -> Result<NostrPublishOutcome, TransportAdapterError> {
+        let owner = self.clone();
+        let endpoints = endpoints.to_vec();
+        let event = event.clone();
+        tokio::spawn(async move {
+            owner
+                .publish_retained(&endpoints, &event, required_acks)
+                .await
+        })
+        .await
+        .map_err(|_| hold())?
     }
 }

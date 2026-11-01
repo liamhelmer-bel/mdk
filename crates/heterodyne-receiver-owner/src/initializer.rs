@@ -249,9 +249,9 @@ impl Ledger {
         if bytes.len() > MAX_RECORD {
             return Err(Error::Hold);
         }
-        self.poisoned = true;
         descriptor(&self.file, &self.directory)?;
         self.file.seek(SeekFrom::End(0))?;
+        self.poisoned = true;
         self.file.write_all(&bytes)?;
         self.file.write_all(b"\n")?;
         self.file.sync_all()?;
@@ -417,7 +417,6 @@ fn transition(old: &Record, new: &Record) -> Result<(), Error> {
                 && acknowledgments(new)
                 && new.accepted == old.accepted
                 && new.attempt == old.attempt
-                && matches!(new.attempt, Some(Attempt::Reported { .. }))
         }
         (Phase::Published, Phase::ReceiverStarted) => {
             new.slot == old.slot
@@ -488,14 +487,34 @@ fn attempt_transition(old: &Record, new: &Record) -> bool {
     }
 }
 
+/// Match SDK URL identity before any exposure: reject aliases and malformed URLs.
+pub(crate) fn valid_targets(values: &[String]) -> bool {
+    if values.is_empty() || values.len() > 16 {
+        return false;
+    }
+    let mut parsed = Vec::with_capacity(values.len());
+    for value in values {
+        if value.len() > 2048 {
+            return false;
+        }
+        let Ok(url) = nostr::RelayUrl::parse(value) else {
+            return false;
+        };
+        if parsed.contains(&url) {
+            return false;
+        }
+        parsed.push(url);
+    }
+    true
+}
+
 fn artifacts(values: &[Artifact]) -> bool {
     values.len() == 3
         && values.iter().map(|a| a.kind).eq([10_002, 10_050, 30_443])
         && values.iter().all(|a| {
             hash(&a.event_id)
                 && hash(&a.sha256)
-                && !a.targets.is_empty()
-                && a.targets.len() <= 16
+                && valid_targets(&a.targets)
                 && a.required_acks > 0
                 && a.required_acks <= a.targets.len()
                 && a.targets
@@ -555,16 +574,49 @@ mod tests {
     }
 
     #[test]
+    fn sdk_equivalent_targets_and_invalid_urls_are_rejected() {
+        assert!(!valid_targets(&[
+            "wss://relay.invalid".into(),
+            "wss://relay.invalid/".into()
+        ]));
+        assert!(!valid_targets(&["not a relay".into()]));
+        assert!(valid_targets(&["wss://relay.invalid".into()]));
+    }
+
+    #[test]
+    fn durable_ack_union_allows_promotion_readback_after_unknown_or_begun_retry() {
+        for unknown in [false, true] {
+            let (_temp, file, dir) = fixture();
+            let mut ledger = Ledger::create(file, dir, &"aa".repeat(32), &"bb".repeat(32)).unwrap();
+            ledger.material("cc".repeat(32)).unwrap();
+            let artifacts = retained_artifacts();
+            ledger.prepared(artifacts.clone()).unwrap();
+            ledger.exposure_begun().unwrap();
+            for (i, a) in artifacts.iter().enumerate() {
+                let sequence = ledger.begin_attempt(i, a).unwrap();
+                ledger
+                    .report_attempt(sequence, a.targets.clone(), vec![])
+                    .unwrap();
+            }
+            let sequence = ledger.begin_attempt(2, &artifacts[2]).unwrap();
+            if unknown {
+                ledger.unknown_attempt(sequence, vec![]).unwrap();
+            }
+            ledger.published().unwrap();
+            assert_eq!(ledger.last.phase, Phase::Published);
+        }
+    }
+
+    #[test]
     fn maximum_closed_targets_and_escaped_reports_fit_every_record() {
         let (temp, file, dir) = fixture();
         let mut ledger = Ledger::create(file, dir, &"aa".repeat(32), &"bb".repeat(32)).unwrap();
         ledger.material("cc".repeat(32)).unwrap();
         let mut artifacts = retained_artifacts();
-        // Six-byte JSON escaping is the worst encoding expansion for the
-        // accepted string contract; there is no hidden smaller request limit.
+        // Exercise the maximum accepted URL length and target count.
         for artifact in &mut artifacts {
             artifact.targets = (0..16)
-                .map(|i| format!("{i:02}{}", "\u{0001}".repeat(2046)))
+                .map(|i| format!("wss://relay{i:02}.invalid/{}", "a".repeat(2026)))
                 .collect();
             artifact.required_acks = 16;
         }
