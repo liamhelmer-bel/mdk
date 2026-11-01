@@ -7,7 +7,8 @@ receipt. It does not add a fifth native ELF to the current release inventory.
 Root's current explicit deployment instruction is recorded by the deployment
 controller; parsed profile fields are not human consent or an admitted owner token.
 
-The retained root launcher supplies these original descriptors before exec:
+The source-fixed host parent supplies these original descriptors before exec;
+a standalone invocation without its private FD8/9 channel is unsupported:
 
 | FD | Exact input |
 | --- | --- |
@@ -16,6 +17,8 @@ The retained root launcher supplies these original descriptors before exec:
 | 5 | receiver899 fresh initializer phase ledger, 0600 |
 | 6 | root:root 0600 lifetime lease, same original OFD |
 | 7 | root:root 0400 expiry profile, readonly |
+| 8 | host-parent-created credentialled SOCK_SEQPACKET, private bootstrap peer |
+| 9 | sealed readonly 32-byte bootstrap nonce A |
 | 13 | root-created original Product card profile |
 | 14 | original complete Git archive |
 | 15 | original literal Git commit object |
@@ -118,20 +121,19 @@ stdout. It never copies, adopts, deletes or publishes a candidate.
    This creates a private mount namespace, mounts only installed fixed config
    over `/etc`, and invokes the actual complete published installation/platform
    verifier. It derives the closed profile schema, UID899/GID899, UID898/GID898,
-   installation reference, routing-only template and exact policy digest. It
+   installation reference, `admind-receiver-v1` template and exact policy digest. It
    reuses production deadline/relay/operator validation. Unknown request fields
    and caller overrides are refused. The output still needs root:root0400,
    single-link/O_RDONLY custody and the exact retained expiry descriptor.
-5. Launch `/opt/heterodyne-receiver/bin/heterodyne-receiver-bootstrap` with no
-   arguments and an empty environment, inheriting original descriptors:
-   FD3 profile; FD4 fresh UID899/GID8990700 generation parent; FD5 fresh
-   UID899/GID8990600 empty initialization ledger; FD6 root:root0600 lifetime lease;
-   FD7 actual root0400 expiry; FD13 producer profile; FD14 full Git archive;
-   FD15 raw commit; FD18 exact original canonical deployment packet. Open
-   profiles/evidence readonly and lease/ledger readwrite. These are original
-   OFDs retained by bootstrap throughout, not paths to be reopened between
-   children. Root's launch preparation must create fresh files/directories
-   exclusively; an existing generation/ledger is reconciliation, not restart.
+5. Launch the fixed source-qualified `/opt/heterodyne-receiver/bin/heterodyne-receiver-host-parent`
+   with no arguments, empty environment and original FD3..7/13..15/18 inputs from
+   the table. It verifies fixed launch/admission profiles, creates private FD8/9
+   and starts bootstrap itself. Direct bootstrap is an internal child interface,
+   not a supported manual bypass. Original lease/ledger OFDs remain retained
+   throughout; no reopen between children. Existing generation/ledger means
+   reconciliation, not restart. Owner-init's initializer/KP path can separately
+   be qualified under its own retained-FD supervisor; it does not itself authorize
+   host admission or synthesize a Consumed response.
 
 The assembly executable's libc/loader and root launcher remain part of the
 external root deployment receipt. Runtime index roles remain exactly four.
@@ -156,3 +158,10 @@ a dead receiver is observed as EOF. The one parent-owned watchdog kills/reaps
 the helper on failure. Both fresh and permanent results use the duplicate-key/
 float-refusing native-frame decoder; permanent success retains exact observed
 bytes in the exclusive final result file, without canonical reserialization.
+
+The host parent validates its combined bootstrap deadline before spawning the
+bootstrap, so unsupported deadlines cannot start a generation first. Termination
+requests SIGKILL and waits for actual owned process-group cessation before
+releasing the lifetime lease. An uninterruptible kernel wait can retain this
+lease indefinitely; resource watchdogs do not bound kernel cessation and there
+is no unsafe timeout that releases custody while a child may remain alive.

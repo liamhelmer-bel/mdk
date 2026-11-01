@@ -60,19 +60,7 @@ impl Peer {
         {
             return Err(hold());
         }
-        let capacity = crate::host_channel::MAX_NATIVE as libc::c_int;
-        if unsafe {
-            libc::setsockopt(
-                other.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&capacity as *const libc::c_int).cast(),
-                std::mem::size_of_val(&capacity) as u32,
-            )
-        } != 0
-        {
-            return Err(hold());
-        }
+        crate::host_channel::capacity(&other).map_err(|_| hold())?;
         let parent = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {

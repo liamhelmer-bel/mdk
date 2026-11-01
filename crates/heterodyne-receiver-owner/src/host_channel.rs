@@ -9,10 +9,8 @@ type Result<T> = std::result::Result<T, ()>;
 pub(crate) const MAX_NATIVE: usize = 256 * 1024;
 #[repr(align(16))]
 struct Control([u8; 128]);
-pub(crate) fn send(channel: &File, raw: &[u8], handle: Option<&File>) -> Result<()> {
-    if raw.is_empty() || raw.len() > MAX_NATIVE {
-        return Err(());
-    }
+/// Establish capacity before an unprivileged helper can consume a receipt.
+pub(crate) fn capacity(channel: &File) -> Result<()> {
     let capacity = MAX_NATIVE as libc::c_int;
     if unsafe {
         libc::setsockopt(
@@ -58,6 +56,13 @@ pub(crate) fn send(channel: &File, raw: &[u8], handle: Option<&File>) -> Result<
     {
         return Err(());
     }
+    Ok(())
+}
+pub(crate) fn send(channel: &File, raw: &[u8], handle: Option<&File>) -> Result<()> {
+    if raw.is_empty() || raw.len() > MAX_NATIVE {
+        return Err(());
+    }
+    capacity(channel)?;
     let mut control = Control([0; 128]);
     let mut iov = libc::iovec {
         iov_base: raw.as_ptr().cast_mut().cast(),
@@ -201,6 +206,41 @@ pub(crate) fn read_nonce(file: &File) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_is_established_before_unprivileged_handoff() {
+        let (sender, _receiver) = crate::owner_entry::channel().unwrap();
+        let small = 1024i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&small as *const i32).cast(),
+                    size_of::<i32>() as u32,
+                )
+            },
+            0
+        );
+        capacity(&sender).unwrap();
+        let mut actual = 0i32;
+        let mut size = size_of::<i32>() as u32;
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&mut actual as *mut i32).cast(),
+                    &mut size,
+                )
+            },
+            0
+        );
+        assert!(actual >= MAX_NATIVE as i32 + 32);
+        let invalid = File::open("/dev/null").unwrap();
+        assert!(capacity(&invalid).is_err());
+    }
     #[test]
     #[ignore = "actual root SCM credentials and sealed root memfd"]
     fn actual_root_records_are_bounded_and_nonce_sealed() {

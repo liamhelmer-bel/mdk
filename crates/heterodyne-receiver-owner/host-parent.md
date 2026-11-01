@@ -19,3 +19,29 @@ Remaining qualification includes the actual immutable new Product runtime invent
 The fixed owner assembly/generation/publication path selects `admind-receiver-v1` (policy SHA `94492af76abc1434da599c1a0a567623fe1a0b338dde9fa09c34174ede92e7c8`), composing the separately reviewed cb77 policy and cross-version receive controls. This does not qualify the whole installed process.
 
 The host parent uses a distinct read-only `HostVerified` result: complete installed inventory (including copied runtime-etc), exact recipe and actual host ELF/loader baseline are verified. It deliberately keeps actual host /etc for admission/effect helpers. The strict receiver `Verified` API still requires mounted /etc inode equality; bootstrap and receiver retain that check. There is no caller boolean to waive it and HostVerified cannot stand in for receiver Verified. This host runtime has ambient host NSS/DNS configuration, rather than claiming the receiver's fixed resolver configuration applies to host effects.
+
+### Current no-effect admission scope and nonce domains
+
+The current Product admission entry has zero effect methods and always returns
+`failed-no-effect`. Its fixed 600-second resource watchdog is qualified only for
+that no-effect entry. Automatic host effects remain unsupported/HOLD until a
+closed effect runner and its actual finite work budget are implemented and
+reviewed; the current duration does not qualify future effect interruption.
+An exit or killed child is never evidence that an effect did not occur.
+
+Metadata `nonce_hex` is fresh root admission nonce B, sealed in FD6 and required
+on the child's result. `receiver_nonce_hex` is original native receiver nonce A,
+extracted from the private verified Consumed capability. A and B must differ;
+the child independently matches raw Consumed A to the attested metadata A.
+The original raw Consumed bytes are never rewritten to B.
+
+The parent verifies complete indexed Product bytes. The specific semantic-factory
+source digest is carried to the fixed Python child, whose correlator compares it
+to the exact original packet field. The native parent validates its digest format
+but does not independently equate it to a local semantic source-file hash.
+Semantic-source admission remains the separately reviewed Product boundary;
+this source does not claim a second native semantic-source verifier.
+
+SIGKILL/process-group reaping retains the lease until actual cessation, including
+if waitpid blocks on uninterruptible kernel I/O. This residual is intentionally
+unbounded and fail-closed, not a claim of bounded operating-system cleanup.
