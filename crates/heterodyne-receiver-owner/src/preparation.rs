@@ -9,7 +9,6 @@ use cgka_engine::account_identity_proof::{
 };
 use cgka_engine::key_package::{KeyPackageMetadata, key_package_metadata};
 use cgka_session::{AccountDeviceSession, SessionConfig};
-use cgka_traits::app_components::{NOSTR_ROUTING_COMPONENT_ID, default_group_components};
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::ProtocolProfile;
 use cgka_traits::group_context::GroupContextSnapshot;
@@ -129,7 +128,10 @@ fn publication(
 ) -> Result<NostrKeyPackagePublication, KeyPackagePublishError> {
     let metadata = key_package_metadata(&value.key_package)
         .map_err(|_| KeyPackagePublishError::unexposed("invalid native package"))?;
-    if metadata.protocol_profile != ProtocolProfile::Current
+    if cgka_engine::protected_capability_policy::routing_only_v1()
+        .validate_metadata(&metadata)
+        .is_err()
+        || metadata.protocol_profile != ProtocolProfile::Current
         || metadata.credential_identity_hex != hex::encode(value.account_id.as_slice())
     {
         return Err(KeyPackagePublishError::unexposed(
@@ -392,7 +394,10 @@ pub(crate) async fn prepare(
             .map_err(|_| Error::Native)?;
     for package in &existing {
         let metadata = key_package_metadata(package).map_err(|_| Error::Native)?;
-        if metadata.protocol_profile != ProtocolProfile::Current
+        if cgka_engine::protected_capability_policy::routing_only_v1()
+            .validate_metadata(&metadata)
+            .is_err()
+            || metadata.protocol_profile != ProtocolProfile::Current
             || metadata.credential_identity_hex != keys.public_key().to_hex()
         {
             return Err(Error::Hold);
@@ -492,8 +497,7 @@ fn open_session(
     key: &SqlCipherKey,
     keys: &nostr::Keys,
 ) -> Result<AccountDeviceSession, Error> {
-    let mut components = default_group_components();
-    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    let selected = cgka_engine::protected_capability_policy::routing_only_v1();
     let config = SessionConfig::new(
         database,
         SqlCipherKey::new(key.as_secret_str()).map_err(|_| Error::Native)?,
@@ -501,7 +505,8 @@ fn open_session(
         Box::new(RefuseTransport),
     )
     .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
-    .supported_app_components(components);
+    .feature_registry(selected.registry())
+    .supported_app_components(selected.components());
     AccountDeviceSession::open(config).map_err(|_| Error::Native)
 }
 

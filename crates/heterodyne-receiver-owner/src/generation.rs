@@ -284,6 +284,17 @@ impl Generation {
         Ok((path, keys, sql, retained))
     }
 
+    /// Original OFDs for the owned initializer channel; no secret bytes leave.
+    pub(crate) fn handoff_descriptors(&self) -> Result<[File; 5], Error> {
+        Ok([
+            self.directory.try_clone()?,
+            self.key.try_clone()?,
+            self.seed.try_clone()?,
+            self.database.try_clone()?,
+            self.lease.try_clone()?,
+        ])
+    }
+
     pub(crate) fn native_inputs(
         &self,
     ) -> Result<(PathBuf, nostr::Keys, storage_sqlite::SqlCipherKey), Error> {
