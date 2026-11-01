@@ -519,6 +519,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::GroupAdminUpdated { .. } => "group_admin_updated",
         AgentControlResponse::GroupWelcomeStatus { .. } => "group_welcome_status",
         AgentControlResponse::GroupInfo { .. } => "group_info",
+        AgentControlResponse::GroupRoster { .. } => "group_roster",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
             "key_package_maintenance_status"

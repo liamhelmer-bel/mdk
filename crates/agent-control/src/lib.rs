@@ -131,6 +131,15 @@ impl<T> AgentControlEnvelope<T> {
     }
 }
 
+/// Native MLS member projection, excluding profile/display-name caches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentControlGroupRosterMember {
+    pub member_id_hex: String,
+    pub is_admin: bool,
+    pub is_self: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlRequest {
@@ -376,6 +385,11 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
     },
+    /// Read one native session snapshot; grants no membership or operator authority.
+    GroupRoster {
+        account_id_hex: String,
+        group_id_hex: String,
+    },
     MaintenanceStatus {
         account_id_hex: String,
         group_id_hex: String,
@@ -600,6 +614,22 @@ pub enum AgentControlResponse {
         is_direct: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
+    },
+    GroupRoster {
+        account_id_hex: String,
+        group_id_hex: String,
+        epoch: u64,
+        roster_revision: u64,
+        member_count: usize,
+        self_membership: String,
+        lifecycle_state: String,
+        unrecoverable: bool,
+        required_extensions: Vec<u16>,
+        required_proposals: Vec<u16>,
+        required_app_components: Vec<u16>,
+        nostr_group_id_hex: String,
+        relays: Vec<String>,
+        members: Vec<AgentControlGroupRosterMember>,
     },
     MaintenanceStatus {
         status: AgentControlMaintenanceStatus,

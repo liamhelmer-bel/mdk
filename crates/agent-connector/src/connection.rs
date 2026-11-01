@@ -185,6 +185,7 @@ impl AgentConnector {
             | AgentControlRequest::AccountProfileLookup { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
+            | AgentControlRequest::GroupRoster { .. }
             | AgentControlRequest::GroupWelcomeStatus { .. }
             | AgentControlRequest::MaintenanceStatus { .. }
             | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
@@ -354,6 +355,13 @@ impl AgentConnector {
                 group_id_hex,
             } => {
                 self.group_info_response(&account_id_hex, &group_id_hex)
+                    .await
+            }
+            AgentControlRequest::GroupRoster {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.group_roster_response(&account_id_hex, &group_id_hex)
                     .await
             }
             AgentControlRequest::MaintenanceStatus {

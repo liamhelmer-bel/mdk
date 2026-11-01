@@ -270,6 +270,10 @@ pub struct AppGroupMlsState {
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
+    #[serde(default)]
+    pub required_extensions: Vec<u16>,
+    #[serde(default)]
+    pub required_proposals: Vec<u16>,
     pub required_app_components: Vec<u16>,
     pub disbanding_enabled: bool,
     /// True while all ordinary outbound group work, including application
@@ -2864,6 +2868,8 @@ mod group_roster_api_tests {
             epoch: 7,
             member_count: 1,
             unrecoverable: false,
+            required_extensions: Vec::new(),
+            required_proposals: Vec::new(),
             required_app_components: Vec::new(),
             disbanding_enabled: false,
             disbanding: false,

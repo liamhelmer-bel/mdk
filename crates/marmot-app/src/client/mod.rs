@@ -1963,6 +1963,15 @@ impl AppClient {
                 group_record.self_membership = SelfMembership::Removed;
             }
         }
+        // Authority-bearing fields come from the same serialized native worker
+        // read, never from the stored display/group projection.
+        group_record.admin_policy.admins = self
+            .runtime
+            .admin_pubkeys(group_id)?
+            .iter()
+            .map(|id| hex::encode(id.as_slice()))
+            .collect();
+        group_record.nostr_routing = self.nostr_routing_for_group(group_id)?;
         let mls_state = self.group_mls_state_unchecked(group_id)?;
         Ok(crate::groups::AppGroupRosterSession {
             group_record,
@@ -2009,6 +2018,18 @@ impl AppClient {
             epoch: group.epoch.0,
             member_count: group.members.len(),
             unrecoverable: group.unrecoverable,
+            required_extensions: group
+                .required_capabilities
+                .extensions
+                .iter()
+                .copied()
+                .collect(),
+            required_proposals: group
+                .required_capabilities
+                .proposals
+                .iter()
+                .copied()
+                .collect(),
             required_app_components: group
                 .required_capabilities
                 .app_components

@@ -3508,6 +3508,78 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     ))
     .unwrap();
 
+    // The live read comes from the owning native session, including the full
+    // capability sets and native admin policy, rather than a count/UI cache.
+    let roster = connector
+        .group_roster_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupRoster {
+        account_id_hex,
+        group_id_hex,
+        epoch,
+        roster_revision,
+        member_count,
+        self_membership,
+        lifecycle_state,
+        unrecoverable,
+        required_extensions,
+        required_proposals,
+        required_app_components,
+        nostr_group_id_hex,
+        relays,
+        members,
+    } = &roster
+    else {
+        panic!("expected native roster")
+    };
+    assert_eq!(account_id_hex, &agent.account.account_id_hex);
+    assert_eq!(group_id_hex, &named_group_hex);
+    assert_eq!(*member_count, 2);
+    assert_eq!(self_membership, "member");
+    assert!(!unrecoverable);
+    assert_ne!(lifecycle_state, "disbanded");
+    assert!(!nostr_group_id_hex.is_empty());
+    assert!(!relays.is_empty());
+    let state = connector
+        .runtime
+        .group_mls_state(&agent.account.account_id_hex, &named_group)
+        .await
+        .unwrap();
+    assert_eq!(*epoch, state.epoch);
+    assert_eq!(*roster_revision, epoch.saturating_mul(3));
+    assert_eq!(required_extensions, &state.required_extensions);
+    assert_eq!(required_proposals, &state.required_proposals);
+    assert_eq!(required_app_components, &state.required_app_components);
+    assert_eq!(members.len(), 2);
+    let owner = members
+        .iter()
+        .find(|m| m.member_id_hex == agent.account.account_id_hex)
+        .unwrap();
+    assert!(owner.is_admin && owner.is_self);
+    let peer = members
+        .iter()
+        .find(|m| m.member_id_hex == human.account.account_id_hex)
+        .unwrap();
+    assert!(!peer.is_admin && !peer.is_self);
+    let frame = encode_frame(&roster).unwrap();
+    assert_eq!(
+        decode_frame::<AgentControlResponse>(&frame).unwrap(),
+        roster
+    );
+    assert!(
+        connector
+            .group_roster_response(&"00".repeat(32), &named_group_hex)
+            .await
+            .is_err()
+    );
+    assert!(
+        connector
+            .group_roster_response(&agent.account.account_id_hex, &other_group_hex)
+            .await
+            .is_err()
+    );
+
     let named = connector
         .group_info_response(&agent.account.account_id_hex, &named_group_hex)
         .await
