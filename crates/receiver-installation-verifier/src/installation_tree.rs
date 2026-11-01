@@ -601,7 +601,20 @@ impl Index {
     /// recipe must additionally resolve this graph and pin loader/dlopen/config
     /// resources; an observed graph alone is never a complete runtime contract.
     pub fn inspect_elf_objects(&self, root: &File) -> Result<Vec<ElfObject>> {
-        self.compare_candidate(root)?;
+        self.inspect_elf_objects_checked(root, None)
+    }
+    /// Inspect a published tree, retaining and checking its exact reserved index
+    /// both before and after reading the executable graph.
+    pub fn inspect_published_elf_objects(&self, root: &File) -> Result<Vec<ElfObject>> {
+        let index_bytes = read_index(root)?;
+        self.inspect_elf_objects_checked(root, Some(&index_bytes))
+    }
+    fn inspect_elf_objects_checked(
+        &self,
+        root: &File,
+        index: Option<&[u8]>,
+    ) -> Result<Vec<ElfObject>> {
+        self.compare_elf_tree(root, index)?;
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut result = Vec::new();
         let mut receiver = false;
@@ -658,8 +671,14 @@ impl Index {
         if !receiver || !python {
             return Err(Error::Path);
         }
-        self.compare_candidate(root)?;
+        self.compare_elf_tree(root, index)?;
         Ok(result)
+    }
+    fn compare_elf_tree(&self, root: &File, index: Option<&[u8]>) -> Result<()> {
+        match index {
+            Some(bytes) => self.compare_published(root, bytes),
+            None => self.compare_candidate(root),
+        }
     }
 }
 

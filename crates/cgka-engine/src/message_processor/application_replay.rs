@@ -216,6 +216,10 @@ impl<S: StorageProvider> Engine<S> {
         let profile = ReplayProfilePolicy {
             reject_legacy_group_additions: self.new_protocol_profile
                 == cgka_traits::group::ProtocolProfile::Current,
+            receiver_template: self
+                .receiver_merge_capture
+                .as_ref()
+                .and_then(|capture| capture.template),
         };
         for (index, message) in messages.into_iter().enumerate() {
             if index != 0 && execution.exhausted() {

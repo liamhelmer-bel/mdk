@@ -298,7 +298,7 @@ impl Index {
             let mode = array[2].as_u64().ok_or(Error::Encoding)?;
             let size = array[3].as_u64().ok_or(Error::Encoding)?;
             match kind {
-                "directory" if mode == 0o755 && size == 0 && array[4].is_null() => {
+                "directory" if matches!(mode, 0o755 | 0o555) && size == 0 && array[4].is_null() => {
                     directories.insert(path);
                 }
                 "file"
@@ -406,6 +406,20 @@ pub mod index_tests {
         serde_json::json!({"schema":"receiver-installation.v1","release_identity":"fixture-only","recipe_id":"fixture","platform_id":"fixture","source_sha256":"a".repeat(64),"lock_sha256":"b".repeat(64),"artifact_sha256":["c".repeat(64)],"roles":{"receiver":"receiver","python":"python/bin/python","product_source":"product","purelib":"purelib","python_prefix":"python"},"search":{"path":[],"prefix":"","base_prefix":"","exec_prefix":"","cache_prefix":null},"external":[],"tree_sha256":digest(&canonical(&entries).unwrap()),"entries":entries})
     }
     #[test]
+    fn installation_directories_accept_exact_readonly_or_writable_owner_modes() {
+        for mode in [0o555, 0o755, 0o777, 0o775, 0o700, 0o444] {
+            let mut value = fixture();
+            value["entries"][0][2] = serde_json::json!(mode);
+            value["tree_sha256"] =
+                serde_json::json!(digest(&canonical(&value["entries"]).unwrap()));
+            assert_eq!(
+                Index::decode(&canonical(&value).unwrap()).is_ok(),
+                matches!(mode, 0o555 | 0o755),
+                "mode {mode:o}"
+            );
+        }
+    }
+    #[test]
     fn installation_search_directories_are_closed_and_relative() {
         for (field, value) in [
             ("prefix", serde_json::json!("/tmp/foreign")),
@@ -467,6 +481,20 @@ pub mod index_tests {
         assert_eq!(objects.len(), 3);
         assert!(objects.iter().any(|o| o.path == "purelib/unimported.so"
             && o.dependencies.needed.iter().any(|s| s == "libc.so.6")));
+        let index_bytes = canonical(&serde_json::to_value(&index).unwrap()).unwrap();
+        let index_path = temp.path().join("installation-index.json");
+        fs::write(&index_path, &index_bytes).unwrap();
+        fs::set_permissions(&index_path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(index.inspect_elf_objects(&root).is_err()); // candidate stays closed
+        let published = index.inspect_published_elf_objects(&root).unwrap();
+        assert_eq!(published.len(), objects.len());
+        let mut corrupt = index_bytes.clone();
+        corrupt.push(b' ');
+        fs::set_permissions(&index_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&index_path, corrupt).unwrap();
+        fs::set_permissions(&index_path, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(index.inspect_published_elf_objects(&root).is_err());
+        fs::remove_file(index_path).unwrap();
         let mut changed = native;
         changed[18] = 0;
         changed[19] = 0;

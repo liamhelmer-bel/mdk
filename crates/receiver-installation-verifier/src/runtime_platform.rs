@@ -212,7 +212,7 @@ pub fn qualify(index: &Index, root: &File, external: &[ExternalObject]) -> Resul
     for deps in objects.values() {
         dependency_set(deps, &objects, &cache)?;
     }
-    for object in index.inspect_elf_objects(root)? {
+    for object in index.inspect_published_elf_objects(root)? {
         dependency_set(&object.dependencies, &objects, &cache)?;
     }
     Ok(())

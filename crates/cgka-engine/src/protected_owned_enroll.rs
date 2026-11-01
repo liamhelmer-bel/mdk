@@ -431,9 +431,11 @@ async fn run(
         let ReceiverJournal::Ordered(journal) = &receiver.journal else { return Err(ReceiverHold::Journal); };
         let enrolled = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
         let header = journal.source_at(1).map_err(|_| ReceiverHold::Journal)?;
+        let transport_group = enrolled_transport_group(&receiver.engine, &receiver.group)?;
         let output = serde_json::to_vec(&serde_json::json!({
             "schema":"heterodyne-owned-fresh-enrollment.v3", "nonce_hex":hex::encode(nonce),
             "startup_profile_sha256":profile_sha,"enrollment_sha256":enrolled.canonical_sha256().map_err(|_| ReceiverHold::Malformed)?,"enrollment":enrolled,
+            "transport_group":transport_group,
             "header_record":header.body,"header_sha256":journal.header_digest().map_err(|_| ReceiverHold::Journal)?,"checkpoint":journal.checkpoint(),
         })).map_err(|_| ReceiverHold::Malformed)?;
         write_frame(&mut peer,&output)?;
@@ -468,6 +470,26 @@ async fn run(
         return Err(ReceiverHold::Engine);
     }
     result
+}
+
+// The fresh profile pins the native MLS identity. The routing identity is read
+// from its authenticated context only after real join; never infer it by length
+// or substitute a root-profile/index mapping for native state.
+fn enrolled_transport_group(
+    engine: &crate::Engine<SqliteAccountStorage>,
+    native: &cgka_traits::GroupId,
+) -> Result<[u8; 32], ReceiverHold> {
+    let group = engine
+        .take_mls_group(native)
+        .map_err(|_| ReceiverHold::Engine)?
+        .ok_or(ReceiverHold::ChangedState)?;
+    if group.group_id().as_slice() != native.as_slice() {
+        return Err(ReceiverHold::ChangedState);
+    }
+    crate::app_components::nostr_routing_of_group(&group)
+        .map_err(|_| ReceiverHold::ChangedState)?
+        .map(|routing| routing.nostr_group_id)
+        .ok_or(ReceiverHold::ChangedState)
 }
 
 // Duplicates share the original locked open-file descriptions. Keep them outside
@@ -905,6 +927,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let receiver = enroll_joined(engine, &p, &binding.source_sha256, files, evidence).unwrap();
+        assert_eq!(
+            enrolled_transport_group(&receiver.engine, &group).unwrap(),
+            [7; 32]
+        );
+        assert!(
+            enrolled_transport_group(&receiver.engine, &cgka_traits::GroupId::new(vec![0xfe; 16]))
+                .is_err()
+        );
         binding.check().unwrap();
         let ReceiverJournal::Ordered(journal) = &receiver.journal else {
             panic!("ordered")
