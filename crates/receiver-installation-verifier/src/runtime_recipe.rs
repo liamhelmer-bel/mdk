@@ -29,7 +29,9 @@ pub fn qualify_index(index: &Value) -> Result<(), &'static str> {
     let mut files = std::collections::BTreeMap::new();
     for entry in entries {
         let path = entry[0].as_str().ok_or("invalid runtime path")?;
-        let domain = path == "bin"
+        let domain = path == "runtime-etc"
+            || path.starts_with("runtime-etc/")
+            || path == "bin"
             || path == "bin/protected-receiver"
             || path == "bin/protected-receiver-enroll"
             || path == "bin/heterodyne-receiver-initialize"
