@@ -31,6 +31,7 @@ pub fn qualify_index(index: &Value) -> Result<(), &'static str> {
         let path = entry[0].as_str().ok_or("invalid runtime path")?;
         let domain = path == "bin"
             || path == "bin/protected-receiver"
+            || path == "bin/protected-receiver-enroll"
             || path == "bin/heterodyne-receiver-initialize"
             || path == "bin/heterodyne-receiver-owner-init"
             || path == "python"
@@ -73,6 +74,7 @@ pub fn qualify_index(index: &Value) -> Result<(), &'static str> {
     }
     for path in [
         "bin/protected-receiver",
+        "bin/protected-receiver-enroll",
         "bin/heterodyne-receiver-initialize",
         "bin/heterodyne-receiver-owner-init",
         "python/bin/python3.12",
@@ -110,6 +112,7 @@ pub fn qualify_index(index: &Value) -> Result<(), &'static str> {
                     row[0].as_str(),
                     Some(
                         "bin/protected-receiver"
+                            | "bin/protected-receiver-enroll"
                             | "bin/heterodyne-receiver-initialize"
                             | "bin/heterodyne-receiver-owner-init"
                     )
@@ -132,6 +135,7 @@ mod tests {
         entries.push(json!(["bin", "directory", 493, 0, null]));
         for name in [
             "protected-receiver",
+            "protected-receiver-enroll",
             "heterodyne-receiver-initialize",
             "heterodyne-receiver-owner-init",
         ] {
