@@ -13,6 +13,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--product', type=Path, required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--group-hex', required=True)
+parser.add_argument('--pad-original', action='store_true')
 args = parser.parse_args()
 if not 16 <= len(bytes.fromhex(args.group_hex)) <= 64:
     raise ValueError("Product group must be16–64bytes, independently of Nostr routing")
@@ -44,6 +45,18 @@ with tempfile.TemporaryDirectory(prefix='whole-packet-') as directory, pytest.Mo
     values = next(pub)
     inp = process.inputs.__wrapped__(values, Path(directory))
     inputs = next(inp)
+    if args.pad_original:
+        original = inputs[0]
+        if len(original) > 32768:
+            raise ValueError("fixture already exceeds original packet bound")
+        original += b' ' * (32768 - len(original))
+        assert decode_packet(original, (process.TARGET,)) == p
+        profile = msgspec.structs.replace(inputs[2],
+            operation_original_sha256=hashlib.sha256(original).hexdigest())
+        inputs[6].chmod(0o600)
+        inputs[6].write_bytes(encode_record(profile))
+        inputs[6].chmod(0o400)
+        inputs = (original, inputs[1], profile, *inputs[3:])
     try:
         result = process.child(inputs)
         if result.returncode != 0:
@@ -57,6 +70,9 @@ with tempfile.TemporaryDirectory(prefix='whole-packet-') as directory, pytest.Mo
             'output':json.loads(result.stdout)}
         args.output.write_text(json.dumps(payload, indent=2)+'\n')
         args.output.chmod(0o600)
+        if args.pad_original:
+            args.output.with_suffix('.producer.json').write_bytes(encode_record(inputs[2]))
+            args.output.with_suffix('.packet.json').write_bytes(inputs[0])
         print(json.dumps({'output':str(args.output),'sha256':hashlib.sha256(args.output.read_bytes()).hexdigest(),
             'original_sha256':hashlib.sha256(output.operation_original).hexdigest(),
             'packet_sha256':output.packet_sha256,'expires_at_unix_ns':p.outage.deadline_ns}))

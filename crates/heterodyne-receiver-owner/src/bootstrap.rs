@@ -190,6 +190,8 @@ pub(crate) fn entry() -> Result<()> {
         .collect::<Result<Vec<_>>>()?
         .try_into()
         .map_err(|_| ())?;
+    let host_channel = inherited(8)?;
+    let host_nonce = crate::host_channel::read_nonce(&inherited(9)?)?;
     let [producer, archive, commit, packet] = [13, 14, 15, 18]
         .map(inherited)
         .into_iter()
@@ -334,7 +336,7 @@ pub(crate) fn entry() -> Result<()> {
     let process = json!({"schema":"heterodyne-protected-receiver-process.v3","receiver_uid":899,"consumer_uid":898,"enrollment":enrollment,"endpoints":p.inbox_endpoints,"transport_group":transport_group,"python":verified.python(),"product_source":verified.product_source(),"purelib":verified.purelib(),"installation":p.installation,"wait_seconds":p.wait_seconds});
     let process_profile = record(&state, "05-process-profile.json", &process)?;
     let exe = crate::owner_entry::selected(&verified, "protected-receiver")?;
-    let peer = Peer::start().map_err(|_| ())?;
+    let peer = Peer::with_nonce(host_nonce).map_err(|_| ())?;
     let nonce = peer.nonce;
     record(
         &state,
@@ -371,7 +373,9 @@ pub(crate) fn entry() -> Result<()> {
     create(&state, "06-process-observed.json", 0, 0o400, &response)?;
     let _process_cessation = positive(child, crate::supervision::CESSATION)?;
     retain_process_result(&state, &response, &nonce)?;
-    // Actual result is retained verbatim; exit is cessation, never consent.
+    // Only after actual permanent receiver/peer cessation. The host parent also
+    // waits for this bootstrap to cease before private admission construction.
+    crate::host_channel::send(&host_channel, &response, Some(&process_profile))?;
     Ok(())
 }
 

@@ -11,6 +11,16 @@ const PRODUCT_HEAD: &str = "faec83f17b92d3251e3118942c982661b085be59";
 #[tokio::test]
 #[ignore = "qualification requires pinned Product checkout and Python test dependencies; no live relay"]
 async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_frame() {
+    whole_product_exchange(false).await;
+}
+
+#[tokio::test]
+#[ignore = "disposable maximum-original native MLS qualification"]
+async fn current_maximum_original_real_mls_consumed_frame() {
+    whole_product_exchange(true).await;
+}
+
+async fn whole_product_exchange(maximum_original: bool) {
     if !crate::protected_recovery::root_expiry_fixture_available() {
         return;
     }
@@ -43,8 +53,12 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
     let fixture = root.path().join("current-whole-packet.json");
     let generator = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/support/current_whole_packet.py");
-    let generated = Command::new(&python)
-        .arg(&generator)
+    let mut generate = Command::new(&python);
+    generate.arg(&generator);
+    if maximum_original {
+        generate.arg("--pad-original");
+    }
+    let generated = generate
         .arg("--product")
         .arg(&product)
         .arg("--output")
@@ -59,6 +73,21 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         String::from_utf8_lossy(&generated.stderr)
     );
     let fixture_bytes = std::fs::read(&fixture).unwrap();
+    if maximum_original {
+        let output = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED").unwrap();
+        std::fs::write(
+            std::path::Path::new(&output).with_extension("product.json"),
+            &fixture_bytes,
+        )
+        .unwrap();
+        for suffix in ["producer.json", "packet.json"] {
+            std::fs::copy(
+                fixture.with_extension(suffix),
+                std::path::Path::new(&output).with_extension(suffix),
+            )
+            .unwrap();
+        }
+    }
     let payload: serde_json::Value = serde_json::from_slice(&fixture_bytes).unwrap();
     assert_eq!(payload["product_head"], PRODUCT_HEAD);
     assert!(
@@ -132,7 +161,23 @@ async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_f
         digest(&ask.original_request),
         payload["output"]["request_sha256"]
     );
-    qualify_owned_exchange(factory, operator, root, relay, ask).await;
+    if maximum_original {
+        assert_eq!(ask.operation.len(), 32768);
+    }
+    let consumed = qualify_owned_exchange(factory, operator, root, relay, ask).await;
+    if maximum_original {
+        let frame = serde_json::to_vec(&consumed).unwrap();
+        assert!(frame.len() > 65536);
+        assert!(frame.len() <= 262144);
+        let output = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED")
+            .expect("explicit disposable native output path");
+        let exact = std::fs::read(output).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&exact).unwrap(),
+            consumed
+        );
+        eprintln!("actual maximum-original Consumed: {} bytes", frame.len());
+    }
 }
 
 async fn qualify_owned_exchange(
@@ -243,6 +288,27 @@ async fn qualify_owned_exchange(
         assert_eq!(relay.wires.lock().unwrap().len(), 1);
     });
     let nonce = [0x39; 32];
+    // Fixture process pins are selected BEFORE the real exchange, from the
+    // actual retained journal enrollment. They are not installed owner custody.
+    let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &factory.receiver.journal
+    else {
+        panic!("ordered native journal required")
+    };
+    let enrollment = journal.enrollment().unwrap();
+    let enrollment_sha = digest(&serde_json::to_vec(&enrollment).unwrap());
+    let process = serde_json::to_vec(&serde_json::json!({
+        "schema":"heterodyne-protected-receiver-process.v3", "enrollment":enrollment,
+        "receiver_uid":899,"consumer_uid":898,"endpoints":["wss://semantic.invalid"],
+        "wait_seconds":15,
+    }))
+    .unwrap();
+    if let Some(output) = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED") {
+        std::fs::write(
+            std::path::Path::new(&output).with_extension("process.json"),
+            &process,
+        )
+        .unwrap();
+    }
     exchange(
         &mut factory,
         &adapter,
@@ -252,16 +318,13 @@ async fn qualify_owned_exchange(
             ask,
             transport_group: transport_group.to_vec(),
             wait_seconds: 15,
-            profile_sha: "01".repeat(32),
-            enrollment_sha: "02".repeat(32),
-            journal_sha: "03".repeat(32),
-            installation_index_sha256: "04".repeat(32),
-            installation_source_sha256: "05".repeat(32),
-            capability_template: crate::protected_capability_policy::routing_only_v1()
-                .id()
-                .into(),
-            capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
-                .policy_sha256(),
+            profile_sha: digest(&process),
+            enrollment_sha,
+            journal_sha: enrollment.source_profile_sha256,
+            installation_index_sha256: enrollment.installation_index_sha256,
+            installation_source_sha256: enrollment.installation_source_sha256,
+            capability_template: enrollment.capability_template,
+            capability_policy_sha256: enrollment.capability_policy_sha256,
             installation: None,
             nonce,
         },
@@ -277,6 +340,9 @@ async fn qualify_owned_exchange(
     consumer.read_exact(&mut prefix).unwrap();
     let mut frame = vec![0; u32::from_be_bytes(prefix) as usize];
     consumer.read_exact(&mut frame).unwrap();
+    if let Some(output) = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED") {
+        std::fs::write(output, &frame).unwrap();
+    }
     let result: serde_json::Value = serde_json::from_slice(&frame).unwrap();
     assert_eq!(result["schema"], "heterodyne-owned-consumed.v3");
     assert_eq!(result["nonce_hex"], hex::encode(nonce));

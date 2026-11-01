@@ -44,3 +44,10 @@ pub fn protected_assembly_entry() -> bool {
 mod native_frame;
 
 mod supervision;
+
+mod host_channel;
+mod host_child;
+mod host_inputs;
+mod host_parent;
+/// Fixed live host parent. No result-file or caller capability constructor.
+pub fn protected_host_parent_entry()->bool { host_parent::entry().is_ok() }

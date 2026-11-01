@@ -54,7 +54,7 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 pub(crate) fn read(raw: &[u8]) -> Result<Value, ()> {
-    if raw.is_empty() || raw.len() > 65536 {
+    if raw.is_empty() || raw.len() > crate::host_channel::MAX_NATIVE {
         return Err(());
     }
     serde_json::from_slice::<Unique>(raw)
@@ -64,6 +64,18 @@ pub(crate) fn read(raw: &[u8]) -> Result<Value, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn consumed_frame_exact_engine_bound_is_finite() {
+        let raw = serde_json::to_vec(
+            &serde_json::json!({"text":"x".repeat(crate::host_channel::MAX_NATIVE-11)}),
+        )
+        .unwrap();
+        assert_eq!(raw.len(), crate::host_channel::MAX_NATIVE);
+        assert!(read(&raw).is_ok());
+        let mut over = raw;
+        over.push(b' ');
+        assert!(read(&over).is_err());
+    }
     #[test]
     fn actual_serde_struct_order_and_escape_abi_is_not_canonical_installation_json() {
         #[derive(serde::Serialize)]

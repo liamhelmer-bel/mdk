@@ -26,6 +26,11 @@ pub(crate) struct Peer {
 }
 impl Peer {
     pub(crate) fn start() -> Result<Self> {
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce).map_err(|_| hold())?;
+        Self::with_nonce(nonce)
+    }
+    pub(crate) fn with_nonce(nonce: [u8; 32]) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0 {
             return Err(hold());
         }
@@ -55,8 +60,19 @@ impl Peer {
         {
             return Err(hold());
         }
-        let mut nonce = [0; 32];
-        getrandom::fill(&mut nonce).map_err(|_| hold())?;
+        let capacity = crate::host_channel::MAX_NATIVE as libc::c_int;
+        if unsafe {
+            libc::setsockopt(
+                other.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&capacity as *const libc::c_int).cast(),
+                std::mem::size_of_val(&capacity) as u32,
+            )
+        } != 0
+        {
+            return Err(hold());
+        }
         let parent = unsafe { libc::getpid() };
         let pid = unsafe { libc::fork() };
         if pid < 0 {
@@ -163,7 +179,7 @@ impl Peer {
         // After child inheritance, retaining this endpoint masks dead-child EOF.
         drop(self.stream.take());
         self.ready(timeout)?;
-        let mut raw = vec![0; 65536];
+        let mut raw = vec![0; crate::host_channel::MAX_NATIVE];
         let n = unsafe {
             libc::recv(
                 self.channel.as_raw_fd(),
@@ -238,7 +254,7 @@ fn helper(nonce: &[u8; 32]) -> Result<()> {
     let mut len = [0; 4];
     local.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
-    if len == 0 || len > 65536 {
+    if len == 0 || len > crate::host_channel::MAX_NATIVE {
         return Err(hold());
     }
     let mut raw = vec![0; len];
@@ -280,9 +296,10 @@ mod tests {
         let mut nonce = [0; 32];
         stream.read_exact(&mut nonce).unwrap();
         assert_eq!(nonce, peer.nonce);
-        let raw = b"{\"actual\":\"result\"}";
+        let mut raw = b"{\"actual\":\"result\"}".to_vec();
+        raw.resize(crate::host_channel::MAX_NATIVE, b' ');
         stream.write_all(&(raw.len() as u32).to_be_bytes()).unwrap();
-        stream.write_all(raw).unwrap();
+        stream.write_all(&raw).unwrap();
         assert_eq!(peer.result(Duration::from_secs(5)).unwrap(), raw);
     }
     #[test]
@@ -294,7 +311,9 @@ mod tests {
         ));
         let mut nonce = [0; 32];
         stream.read_exact(&mut nonce).unwrap();
-        stream.write_all(&65537u32.to_be_bytes()).unwrap();
+        stream
+            .write_all(&((crate::host_channel::MAX_NATIVE + 1) as u32).to_be_bytes())
+            .unwrap();
         assert!(peer.result(Duration::from_secs(2)).is_err());
     }
     #[test]
