@@ -6,3 +6,4 @@
 mod generation;
 mod initializer;
 mod preparation;
+mod publication;

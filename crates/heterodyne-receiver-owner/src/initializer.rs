@@ -1,7 +1,7 @@
 //! Durable initialization phases. No receive runtime or network entry exists here.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_RECORD: usize = 65_536;
-const MAX_RECORDS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -43,6 +42,26 @@ pub(crate) struct Artifact {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum Attempt {
+    Begun {
+        artifact: usize,
+        sequence: usize,
+    },
+    Reported {
+        artifact: usize,
+        sequence: usize,
+        accepted: Vec<String>,
+        failed: Vec<String>,
+    },
+    Unknown {
+        artifact: usize,
+        sequence: usize,
+        failed: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Record {
     schema: String,
@@ -55,6 +74,7 @@ pub(crate) struct Record {
     slot: Option<String>,
     artifacts: Vec<Artifact>,
     accepted: Vec<Vec<String>>,
+    attempt: Option<Attempt>,
 }
 
 /// A retained descriptor, never a caller-supplied report or authority token.
@@ -105,6 +125,13 @@ fn descriptor(file: &File, directory: &File) -> Result<(), Error> {
 }
 
 impl Ledger {
+    pub(crate) fn publication_bindings(&self) -> Result<Vec<Artifact>, Error> {
+        if self.poisoned || self.last.phase != Phase::ExposureBegun {
+            return Err(Error::Hold);
+        }
+        descriptor(&self.file, &self.directory)?;
+        Ok(self.last.artifacts.clone())
+    }
     pub(crate) fn create(
         mut file: File,
         directory: File,
@@ -126,6 +153,7 @@ impl Ledger {
             slot: None,
             artifacts: vec![],
             accepted: vec![],
+            attempt: None,
         };
         let bytes = serde_json::to_vec(&first)?;
         file.seek(SeekFrom::Start(0))?;
@@ -150,35 +178,34 @@ impl Ledger {
     ) -> Result<Self, Error> {
         descriptor(&file, &directory)?;
         file.try_lock().map_err(|_| Error::Hold)?;
-        if file.metadata()?.len() > (MAX_RECORD * MAX_RECORDS) as u64 {
-            return Err(Error::Hold);
-        }
         file.seek(SeekFrom::Start(0))?;
-        let mut bytes = vec![];
-        Read::by_ref(&mut file)
-            .take((MAX_RECORD * MAX_RECORDS + 1) as u64)
-            .read_to_end(&mut bytes)?;
-        if bytes.is_empty()
-            || bytes.len() > MAX_RECORD * MAX_RECORDS
-            || bytes.last() != Some(&b'\n')
-        {
-            return Err(Error::Hold);
-        }
+        // History is unbounded; bound each frame without buffering the entire
+        // lifetime journal. Never compact away an ambiguous network attempt.
+        let mut reader = BufReader::new(&mut file);
         let mut previous: Option<Record> = None;
         let mut previous_hash = "0".repeat(64);
-        for line in bytes[..bytes.len() - 1].split(|b| *b == b'\n') {
-            if line.len() > MAX_RECORD {
+        loop {
+            let mut line = Vec::new();
+            let count = Read::by_ref(&mut reader)
+                .take((MAX_RECORD + 2) as u64)
+                .read_until(b'\n', &mut line)?;
+            if count == 0 {
+                break;
+            }
+            if count > MAX_RECORD + 1 || line.pop() != Some(b'\n') {
                 return Err(Error::Hold);
             }
-            let record: Record = serde_json::from_slice(line)?;
+            let record: Record = serde_json::from_slice(&line)?;
             if record.schema != "heterodyne-receiver-initialization.v1"
                 || record.request_sha256 != request
                 || record.generation != generation
                 || !hash(request)
                 || !hash(generation)
                 || record.previous_sha256 != previous_hash
-                || record.sequence != previous.as_ref().map_or(1, |r| r.sequence + 1)
-                || record.sequence > MAX_RECORDS
+                || Some(record.sequence)
+                    != previous
+                        .as_ref()
+                        .map_or(Some(1), |r| r.sequence.checked_add(1))
             {
                 return Err(Error::Hold);
             }
@@ -188,10 +215,11 @@ impl Ledger {
                 || record.slot.is_some()
                 || !record.artifacts.is_empty()
                 || !record.accepted.is_empty()
+                || record.attempt.is_some()
             {
                 return Err(Error::Hold);
             }
-            previous_hash = digest(line);
+            previous_hash = digest(&line);
             previous = Some(record);
         }
         Ok(Self {
@@ -204,10 +232,10 @@ impl Ledger {
     }
 
     fn append(&mut self, mut next: Record) -> Result<(), Error> {
-        if self.poisoned || self.last.sequence >= MAX_RECORDS {
+        if self.poisoned {
             return Err(Error::Hold);
         }
-        next.sequence = self.last.sequence + 1;
+        next.sequence = self.last.sequence.checked_add(1).ok_or(Error::Hold)?;
         next.previous_sha256 = self.last_sha256.clone();
         transition(&self.last, &next)?;
         let bytes = serde_json::to_vec(&next)?;
@@ -244,21 +272,93 @@ impl Ledger {
 
     /// Must complete before any of the exact retained artifacts is sent.
     pub(crate) fn exposure_begun(&mut self) -> Result<(), Error> {
+        self.advance(Phase::ExposureBegun)
+    }
+
+    /// The marker includes the immutable artifact binding before every attempt.
+    /// An unresolved earlier attempt remains in history when an explicitly
+    /// admitted owner retries the same bytes; no automatic retry loop exists.
+    pub(crate) fn begin_attempt(
+        &mut self,
+        artifact: usize,
+        binding: &Artifact,
+    ) -> Result<usize, Error> {
+        if self.last.artifacts.get(artifact) != Some(binding) {
+            return Err(Error::Hold);
+        }
+        let sequence = self.last.sequence.checked_add(1).ok_or(Error::Hold)?;
         let mut next = self.last.clone();
-        next.phase = Phase::ExposureBegun;
+        next.attempt = Some(Attempt::Begun { artifact, sequence });
+        self.append(next)?;
+        Ok(sequence)
+    }
+
+    pub(crate) fn report_attempt(
+        &mut self,
+        sequence: usize,
+        accepted: Vec<String>,
+        failed: Vec<String>,
+    ) -> Result<(), Error> {
+        let Some(Attempt::Begun {
+            artifact,
+            sequence: original,
+        }) = self.last.attempt
+        else {
+            return Err(Error::Hold);
+        };
+        if sequence != original {
+            return Err(Error::Hold);
+        }
+        let mut next = self.last.clone();
+        for endpoint in &accepted {
+            if !next.accepted[artifact].contains(endpoint) {
+                next.accepted[artifact].push(endpoint.clone());
+            }
+        }
+        next.attempt = Some(Attempt::Reported {
+            artifact,
+            sequence,
+            accepted,
+            failed,
+        });
         self.append(next)
     }
 
-    pub(crate) fn published(&mut self, accepted: Vec<Vec<String>>) -> Result<(), Error> {
+    pub(crate) fn unknown_attempt(
+        &mut self,
+        sequence: usize,
+        failed: Vec<String>,
+    ) -> Result<(), Error> {
+        let Some(Attempt::Begun {
+            artifact,
+            sequence: original,
+        }) = self.last.attempt
+        else {
+            return Err(Error::Hold);
+        };
+        if sequence != original {
+            return Err(Error::Hold);
+        }
         let mut next = self.last.clone();
-        next.phase = Phase::Published;
-        next.accepted = accepted;
+        next.attempt = Some(Attempt::Unknown {
+            artifact,
+            sequence,
+            failed,
+        });
         self.append(next)
+    }
+
+    pub(crate) fn published(&mut self) -> Result<(), Error> {
+        self.advance(Phase::Published)
     }
 
     pub(crate) fn receiver_started(&mut self) -> Result<(), Error> {
+        self.advance(Phase::ReceiverStarted)
+    }
+
+    fn advance(&mut self, phase: Phase) -> Result<(), Error> {
         let mut next = self.last.clone();
-        next.phase = Phase::ReceiverStarted;
+        next.phase = phase;
         self.append(next)
     }
 }
@@ -275,24 +375,98 @@ fn transition(old: &Record, new: &Record) -> Result<(), Error> {
             new.slot.as_deref().is_some_and(hash)
                 && new.artifacts.is_empty()
                 && new.accepted.is_empty()
+                && new.attempt.is_none()
         }
         (Phase::Material, Phase::Prepared) => {
             new.slot == old.slot
                 && artifacts(&new.artifacts)
                 && new.accepted == vec![Vec::<String>::new(); 3]
+                && new.attempt.is_none()
         }
         (Phase::Prepared, Phase::ExposureBegun) => {
-            new.slot == old.slot && new.artifacts == old.artifacts && new.accepted == old.accepted
+            new.slot == old.slot
+                && new.artifacts == old.artifacts
+                && new.accepted == old.accepted
+                && new.attempt.is_none()
+        }
+        (Phase::ExposureBegun, Phase::ExposureBegun) => {
+            new.slot == old.slot && new.artifacts == old.artifacts && attempt_transition(old, new)
         }
         (Phase::ExposureBegun, Phase::Published) => {
-            new.slot == old.slot && new.artifacts == old.artifacts && acknowledgments(new)
+            new.slot == old.slot
+                && new.artifacts == old.artifacts
+                && acknowledgments(new)
+                && new.accepted == old.accepted
+                && new.attempt == old.attempt
+                && matches!(new.attempt, Some(Attempt::Reported { .. }))
         }
         (Phase::Published, Phase::ReceiverStarted) => {
-            new.slot == old.slot && new.artifacts == old.artifacts && new.accepted == old.accepted
+            new.slot == old.slot
+                && new.artifacts == old.artifacts
+                && new.accepted == old.accepted
+                && new.attempt == old.attempt
         }
         _ => false,
     };
     if good { Ok(()) } else { Err(Error::Hold) }
+}
+
+fn attempt_transition(old: &Record, new: &Record) -> bool {
+    match &new.attempt {
+        Some(Attempt::Begun { artifact, sequence }) => {
+            *artifact < old.artifacts.len()
+                && *sequence == new.sequence
+                && new.accepted == old.accepted
+        }
+        Some(Attempt::Unknown {
+            artifact,
+            sequence,
+            failed,
+        }) => {
+            old.attempt
+                == Some(Attempt::Begun {
+                    artifact: *artifact,
+                    sequence: *sequence,
+                })
+                && new.accepted == old.accepted
+                && failed.iter().enumerate().all(|(i, v)| {
+                    old.artifacts[*artifact].targets.contains(v) && !failed[..i].contains(v)
+                })
+        }
+        Some(Attempt::Reported {
+            artifact,
+            sequence,
+            accepted,
+            failed,
+        }) => {
+            if old.attempt
+                != Some(Attempt::Begun {
+                    artifact: *artifact,
+                    sequence: *sequence,
+                })
+            {
+                return false;
+            }
+            let targets = &old.artifacts[*artifact].targets;
+            let valid = |values: &[String]| {
+                values
+                    .iter()
+                    .enumerate()
+                    .all(|(i, v)| targets.contains(v) && !values[..i].contains(v))
+            };
+            if !valid(accepted) || !valid(failed) || failed.iter().any(|v| accepted.contains(v)) {
+                return false;
+            }
+            let mut expected = old.accepted.clone();
+            for endpoint in accepted {
+                if !expected[*artifact].contains(endpoint) {
+                    expected[*artifact].push(endpoint.clone());
+                }
+            }
+            new.accepted == expected
+        }
+        None => false,
+    }
 }
 
 fn artifacts(values: &[Artifact]) -> bool {
@@ -369,11 +543,7 @@ mod tests {
         let mut ledger = Ledger::create(file, dir, &request, &generation).unwrap();
         ledger.material("cc".repeat(32)).unwrap();
         ledger.prepared(retained_artifacts()).unwrap();
-        assert!(
-            ledger
-                .published(vec![vec!["wss://relay.invalid".into()]; 3])
-                .is_err()
-        );
+        assert!(ledger.published().is_err());
         ledger.exposure_begun().unwrap();
         drop(ledger);
         let reopen = || {
@@ -391,18 +561,102 @@ mod tests {
         let mut ledger = reopen().unwrap();
         assert_eq!(ledger.last.phase, Phase::ExposureBegun);
         assert!(ledger.prepared(retained_artifacts()).is_err());
-        assert!(
+        assert!(ledger.published().is_err());
+        for (index, artifact) in retained_artifacts().iter().enumerate() {
+            let sequence = ledger.begin_attempt(index, artifact).unwrap();
+            assert!(
+                ledger
+                    .report_attempt(sequence + 1, artifact.targets.clone(), vec![])
+                    .is_err()
+            );
             ledger
-                .published(vec![vec!["wss://wrong.invalid".into()]; 3])
-                .is_err()
-        );
-        ledger
-            .published(vec![vec!["wss://relay.invalid".into()]; 3])
-            .unwrap();
+                .report_attempt(sequence, artifact.targets.clone(), vec![])
+                .unwrap();
+        }
+        ledger.published().unwrap();
         ledger.receiver_started().unwrap();
         assert!(ledger.receiver_started().is_err());
         drop(ledger);
         assert_eq!(reopen().unwrap().last.phase, Phase::ReceiverStarted);
+    }
+
+    #[test]
+    fn partial_reports_unknown_and_unbounded_history_preserve_original_attempts() {
+        let (temp, file, dir) = fixture();
+        let request = "aa".repeat(32);
+        let generation = "bb".repeat(32);
+        let mut ledger = Ledger::create(file, dir, &request, &generation).unwrap();
+        ledger.material("cc".repeat(32)).unwrap();
+        let mut bindings = retained_artifacts();
+        bindings[0].targets.push("wss://second.invalid".into());
+        bindings[0].required_acks = 2;
+        ledger.prepared(bindings.clone()).unwrap();
+        ledger.exposure_begun().unwrap();
+        let original = ledger.begin_attempt(0, &bindings[0]).unwrap();
+        ledger
+            .report_attempt(
+                original,
+                vec![bindings[0].targets[0].clone()],
+                vec![bindings[0].targets[1].clone()],
+            )
+            .unwrap();
+        assert!(ledger.published().is_err());
+        let changed = Artifact {
+            sha256: "ee".repeat(32),
+            ..bindings[0].clone()
+        };
+        assert!(ledger.begin_attempt(0, &changed).is_err());
+        for _ in 0..80 {
+            let sequence = ledger.begin_attempt(0, &bindings[0]).unwrap();
+            ledger.unknown_attempt(sequence, vec![]).unwrap();
+        }
+        // A crash after the marker but before any report also remains exposed.
+        let unfinished = ledger.begin_attempt(0, &bindings[0]).unwrap();
+        drop(ledger);
+        let mut ledger = Ledger::reopen(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp.path().join("initialization.jsonl"))
+                .unwrap(),
+            File::open(temp.path()).unwrap(),
+            &request,
+            &generation,
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.last.attempt,
+            Some(Attempt::Begun {
+                artifact: 0,
+                sequence: unfinished
+            })
+        );
+        assert_eq!(
+            ledger.last.accepted[0],
+            vec![bindings[0].targets[0].clone()]
+        );
+        assert!(ledger.published().is_err());
+        assert!(ledger.report_attempt(original, vec![], vec![]).is_err());
+        let retry = ledger.begin_attempt(0, &bindings[0]).unwrap();
+        assert!(
+            ledger
+                .report_attempt(retry, vec!["wss://foreign.invalid".into()], vec![])
+                .is_err()
+        );
+        ledger
+            .report_attempt(retry, bindings[0].targets.clone(), vec![])
+            .unwrap();
+        for (index, binding) in bindings.iter().enumerate().skip(1) {
+            let sequence = ledger.begin_attempt(index, binding).unwrap();
+            ledger
+                .report_attempt(sequence, binding.targets.clone(), vec![])
+                .unwrap();
+        }
+        ledger.published().unwrap();
+        let contents = std::fs::read_to_string(temp.path().join("initialization.jsonl")).unwrap();
+        assert!(contents.lines().count() > 160);
+        assert!(contents.contains("wss://second.invalid"));
+        assert!(contents.contains("\"state\":\"unknown\""));
     }
 
     #[test]

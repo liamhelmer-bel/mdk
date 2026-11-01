@@ -652,12 +652,13 @@ mod tests {
             .publish_prepared_key_package(&value, &artifact)
             .await
             .unwrap();
-        let events = peer.events.lock().unwrap();
-        assert_eq!(events.len(), 5);
-        for event in events.iter() {
-            assert_eq!(serde_json::to_vec(event).unwrap(), artifact.bytes);
+        {
+            let events = peer.events.lock().unwrap();
+            assert_eq!(events.len(), 5);
+            for event in events.iter() {
+                assert_eq!(serde_json::to_vec(event).unwrap(), artifact.bytes);
+            }
         }
-        drop(events);
         let mut changed = artifact.clone();
         changed.bytes.push(b' ');
         assert!(
@@ -670,58 +671,176 @@ mod tests {
         assert_eq!(peer.events.lock().unwrap().len(), 5);
     }
 
+    struct JournaledFixture {
+        root: tempfile::TempDir,
+        _generation: crate::generation::Generation,
+        database: std::path::PathBuf,
+        keys: nostr::Keys,
+        key: SqlCipherKey,
+        prepared: Prepared,
+        setup: [SignedPublicationArtifact; 2],
+        relay: Arc<crate::publication::JournaledRelay>,
+    }
+
+    impl JournaledFixture {
+        async fn create(
+            endpoints: Vec<TransportEndpoint>,
+            peer: Arc<dyn transport_nostr_adapter::NostrRelayClient>,
+            minimum: usize,
+            timeout: std::time::Duration,
+        ) -> Self {
+            use sha2::Digest;
+            use std::fs::{File, OpenOptions, Permissions};
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), Permissions::from_mode(0o700)).unwrap();
+            let parent = File::open(root.path()).unwrap();
+            let generation_id = "b7".repeat(32);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.path().join("initialization.jsonl"))
+                .unwrap();
+            let mut ledger = crate::initializer::Ledger::create(
+                file,
+                parent.try_clone().unwrap(),
+                &"f3".repeat(32),
+                &generation_id,
+            )
+            .unwrap();
+            ledger.material("d4".repeat(32)).unwrap();
+            let generation =
+                crate::generation::Generation::create(&parent, &generation_id).unwrap();
+            let (database, keys, key) = generation.native_inputs().unwrap();
+            let prepared = prepare(
+                &database,
+                &key,
+                keys.clone(),
+                &"d4".repeat(32),
+                endpoints.clone(),
+            )
+            .await
+            .unwrap();
+            let setup = relay_lists(
+                &keys,
+                prepared.artifact.created_at,
+                endpoints.clone(),
+                endpoints.clone(),
+            )
+            .unwrap();
+            let artifacts = [&setup[0], &setup[1], &prepared.artifact];
+            let bindings = artifacts
+                .iter()
+                .zip([10002, 10050, 30443])
+                .map(|(a, kind)| crate::initializer::Artifact {
+                    kind,
+                    event_id: hex::encode(a.id.as_slice()),
+                    sha256: hex::encode(sha2::Sha256::digest(&a.bytes)),
+                    targets: endpoints.iter().map(|e| e.0.clone()).collect(),
+                    required_acks: minimum,
+                })
+                .collect::<Vec<_>>();
+            let retained = generation
+                .retain_publications(artifacts, &bindings)
+                .unwrap();
+            ledger.prepared(bindings).unwrap();
+            ledger.exposure_begun().unwrap();
+            let relay = Arc::new(
+                crate::publication::JournaledRelay::new(
+                    ledger,
+                    &generation,
+                    &retained,
+                    peer,
+                    timeout,
+                )
+                .unwrap(),
+            );
+            Self {
+                root,
+                _generation: generation,
+                database,
+                keys,
+                key,
+                prepared,
+                setup,
+                relay,
+            }
+        }
+
+        fn records(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.root.path().join("initialization.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+    }
+
     #[tokio::test]
     async fn actual_sdk_loopback_publishes_exact_setup_cohort() {
         use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
         let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
         let endpoint = TransportEndpoint(relay.url().await.to_string());
-        let temp = tempfile::tempdir().unwrap();
-        let database = temp.path().join("account.sqlite3");
-        let key = SqlCipherKey::new("disposable-loopback-sdk-only").unwrap();
-        let keys = nostr::Keys::generate();
-        let prepared = prepare(
-            &database,
-            &key,
-            keys.clone(),
-            &"d4".repeat(32),
-            vec![endpoint.clone()],
-        )
-        .await
-        .unwrap();
-        let setup = relay_lists(
-            &keys,
-            prepared.artifact.created_at,
-            vec![endpoint.clone()],
-            vec![endpoint.clone()],
-        )
-        .unwrap();
-        let expected = [
-            setup[0].clone(),
-            setup[1].clone(),
-            prepared.artifact.clone(),
-        ];
-        // No SDK signer is installed: all published events must already carry
-        // the exact retained native account's real signature.
+        // No SDK signer: the journal verifies actual retained signed bytes.
         let sdk = Arc::new(NostrSdkRelayClient::new(
             nostr_sdk::Client::builder().build(),
         ));
-        for artifact in &setup {
-            let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes).unwrap();
-            let outcome = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+        let fixture = JournaledFixture::create(
+            vec![endpoint.clone()],
+            sdk.clone(),
+            1,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let expected = [
+            fixture.setup[0].clone(),
+            fixture.setup[1].clone(),
+            fixture.prepared.artifact.clone(),
+        ];
+        assert!(fixture.relay.published().is_err());
+        for artifact in &fixture.setup {
+            let event = serde_json::from_slice(&artifact.bytes).unwrap();
+            let outcome = fixture
+                .relay
+                .publish_event(std::slice::from_ref(&endpoint), &event, 1)
+                .await
+                .unwrap();
             assert_eq!(outcome.accepted.len(), 1);
         }
-        let publisher =
-            ExactPublisher::new(prepared, sdk.clone(), 1, std::time::Duration::from_secs(5))
-                .unwrap();
-        publish_pending(&database, &key, &keys, publisher)
+        let publisher = ExactPublisher::new(
+            fixture.prepared,
+            fixture.relay.clone(),
+            1,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        publish_pending(&fixture.database, &fixture.key, &fixture.keys, publisher)
             .await
             .unwrap();
+        fixture.relay.published().unwrap();
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(fixture.root.path().join("initialization.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+        assert_eq!(records.last().unwrap()["phase"], "published");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["attempt"]["state"] == "begun")
+                .count(),
+            3
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["attempt"]["state"] == "reported")
+                .count(),
+            4
+        );
         let observer = nostr_sdk::Client::builder().build();
         observer.add_relay(endpoint.as_str()).await.unwrap();
         observer.connect().await;
@@ -743,7 +862,7 @@ mod tests {
                 .find(|e| e.id.to_bytes().as_slice() == artifact.id.as_slice())
                 .unwrap();
             event.verify().unwrap();
-            assert_eq!(event.pubkey, keys.public_key());
+            assert_eq!(event.pubkey, fixture.keys.public_key());
             assert_eq!(
                 serde_json::to_vec(&NostrTransportEvent::from_nostr_event(event).unwrap()).unwrap(),
                 artifact.bytes
@@ -751,6 +870,124 @@ mod tests {
         }
         observer.shutdown().await;
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn journaled_partial_timeout_cancellation_and_same_bytes_retry() {
+        use std::sync::atomic::Ordering;
+        use transport_nostr_adapter::NostrRelayClient;
+        let peer = Arc::new(PublicationPeer::default());
+        let endpoints = vec![
+            TransportEndpoint::from("wss://one.invalid"),
+            TransportEndpoint::from("wss://two.invalid"),
+        ];
+        let fixture = JournaledFixture::create(
+            endpoints.clone(),
+            peer.clone(),
+            2,
+            std::time::Duration::from_millis(30),
+        )
+        .await;
+        let event: NostrTransportEvent = serde_json::from_slice(&fixture.setup[0].bytes).unwrap();
+        peer.mode.store(1, Ordering::SeqCst);
+        assert_eq!(
+            fixture
+                .relay
+                .publish_event(&endpoints, &event, 2)
+                .await
+                .unwrap()
+                .accepted
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture.records().last().unwrap()["accepted"][0]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        peer.mode.store(2, Ordering::SeqCst);
+        assert!(
+            fixture
+                .relay
+                .publish_event(&endpoints, &event, 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.records().last().unwrap()["attempt"]["state"],
+            "unknown"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                fixture.relay.publish_event(&endpoints, &event, 2)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fixture.records().last().unwrap()["attempt"]["state"],
+            "begun"
+        );
+        assert!(fixture.relay.published().is_err());
+        peer.mode.store(3, Ordering::SeqCst);
+        assert!(
+            fixture
+                .relay
+                .publish_event(&endpoints, &event, 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fixture.records().last().unwrap()["attempt"]["state"],
+            "unknown"
+        );
+        let attempts = peer.events.lock().unwrap().len();
+        let mut changed = event.clone();
+        changed.content.push('x');
+        assert!(
+            fixture
+                .relay
+                .publish_event(&endpoints, &changed, 2)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .relay
+                .publish_event(&endpoints, &event, 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            fixture
+                .relay
+                .publish_event(&endpoints[..1], &event, 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.events.lock().unwrap().len(), attempts);
+        peer.mode.store(0, Ordering::SeqCst);
+        for artifact in [
+            &fixture.setup[0],
+            &fixture.setup[1],
+            &fixture.prepared.artifact,
+        ] {
+            let event = serde_json::from_slice(&artifact.bytes).unwrap();
+            fixture
+                .relay
+                .publish_event(&endpoints, &event, 2)
+                .await
+                .unwrap();
+        }
+        fixture.relay.published().unwrap();
+        assert_eq!(fixture.records().last().unwrap()["phase"], "published");
+        let events = peer.events.lock().unwrap();
+        for actual in events.iter().take(attempts + 1) {
+            assert_eq!(serde_json::to_vec(actual).unwrap(), fixture.setup[0].bytes);
+        }
     }
 
     #[tokio::test]
