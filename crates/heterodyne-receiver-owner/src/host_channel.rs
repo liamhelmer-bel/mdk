@@ -26,6 +26,38 @@ pub(crate) fn send(channel: &File, raw: &[u8], handle: Option<&File>) -> Result<
     {
         return Err(());
     }
+    let mut actual: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>() as libc::socklen_t;
+    let read_capacity = |actual: &mut libc::c_int, size: &mut libc::socklen_t| unsafe {
+        libc::getsockopt(
+            channel.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (actual as *mut libc::c_int).cast(),
+            size,
+        )
+    };
+    if read_capacity(&mut actual, &mut size) != 0 {
+        return Err(());
+    }
+    // Linux accounts seqpacket framing against the doubled send buffer. A
+    // restrictive host sysctl must either be overridden by this root sender or
+    // refuse before sending; setting SO_SNDBUF alone does not establish capacity.
+    if actual < capacity + 32
+        && (unsafe {
+            libc::setsockopt(
+                channel.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUFFORCE,
+                (&capacity as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+            || read_capacity(&mut actual, &mut size) != 0
+            || actual < capacity + 32)
+    {
+        return Err(());
+    }
     let mut control = Control([0; 128]);
     let mut iov = libc::iovec {
         iov_base: raw.as_ptr().cast_mut().cast(),
@@ -72,6 +104,9 @@ pub(crate) fn receive(
     msg.msg_control = control.0.as_mut_ptr().cast();
     msg.msg_controllen = control.0.len();
     let n = unsafe { libc::recvmsg(channel.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    if n < 0 {
+        return Err(());
+    }
     let mut files = Vec::new();
     let mut credentials = None;
     let mut valid = true;

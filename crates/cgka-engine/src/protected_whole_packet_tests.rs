@@ -164,7 +164,8 @@ async fn whole_product_exchange(maximum_original: bool) {
     if maximum_original {
         assert_eq!(ask.operation.len(), 32768);
     }
-    let consumed = qualify_owned_exchange(factory, operator, root, relay, ask).await;
+    let consumed =
+        qualify_owned_exchange(factory, operator, root, relay, ask, maximum_original).await;
     if maximum_original {
         let frame = serde_json::to_vec(&consumed).unwrap();
         assert!(frame.len() > 65536);
@@ -186,6 +187,7 @@ async fn qualify_owned_exchange(
     root: tempfile::TempDir,
     relay: Arc<super::super::tests::Relay>,
     ask: OriginalAsk,
+    capture: bool,
 ) -> serde_json::Value {
     let transport_group = [7; 32];
     let expected = serde_json::to_value(&ask).unwrap();
@@ -302,7 +304,9 @@ async fn qualify_owned_exchange(
         "wait_seconds":15,
     }))
     .unwrap();
-    if let Some(output) = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED") {
+    if capture {
+        let output = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED")
+            .expect("explicit maximum fixture capture path");
         std::fs::write(
             std::path::Path::new(&output).with_extension("process.json"),
             &process,
@@ -340,7 +344,9 @@ async fn qualify_owned_exchange(
     consumer.read_exact(&mut prefix).unwrap();
     let mut frame = vec![0; u32::from_be_bytes(prefix) as usize];
     consumer.read_exact(&mut frame).unwrap();
-    if let Some(output) = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED") {
+    if capture {
+        let output = std::env::var_os("HETERODYNE_QUALIFICATION_CONSUMED")
+            .expect("explicit maximum fixture capture path");
         std::fs::write(output, &frame).unwrap();
     }
     let result: serde_json::Value = serde_json::from_slice(&frame).unwrap();
@@ -673,7 +679,7 @@ async fn unchanged_installed_producer_real_tls_then_real_mls_exchange() {
         .produce(inputs, &original, &binding)
         .expect("unchanged producer actual TLS/Git/render");
     assert_eq!(ask.expected_group, factory.receiver.group);
-    let frame = qualify_owned_exchange(factory, operator, root, relay, ask).await;
+    let frame = qualify_owned_exchange(factory, operator, root, relay, ask, false).await;
     std::fs::write(
         "/run/heterodyne-deploy-publication/qualification-output.json",
         serde_json::to_vec(&serde_json::json!({

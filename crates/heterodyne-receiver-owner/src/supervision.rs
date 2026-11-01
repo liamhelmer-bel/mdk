@@ -34,6 +34,15 @@ pub(crate) fn receiver(network_seconds: u64) -> Result<Duration, ()> {
     // Explicit finite resource watchdog, not a claim of an OS I/O upper bound.
     Ok(PREFLIGHT + Duration::from_secs(network_seconds) + CESSATION)
 }
+pub(crate) fn bootstrap(deadline_ms: u64, network_seconds: u64) -> Result<Duration, ()> {
+    // Bootstrap performs initialization, fresh join and permanent consumption
+    // serially. Allow its own initial/final verification and every child exit;
+    // no shorter outer watchdog may consume an otherwise valid inner budget.
+    Ok(initialization(deadline_ms, true)?
+        + receiver(network_seconds)? * 2
+        + PREFLIGHT * 2
+        + CESSATION * 4)
+}
 pub(crate) fn ready(file: &File, timeout: Duration) -> Result<(), ()> {
     if timeout.is_zero() || timeout > Duration::from_secs(86400) {
         return Err(());
@@ -85,6 +94,12 @@ mod tests {
         assert!(initialization_at(700001, 100000, false).is_err());
         assert!(receiver(300).unwrap() > Duration::from_secs(300));
         assert!(receiver(0).is_err());
+        let now = crate::initializer_entry::now().unwrap();
+        let outer = bootstrap(now + 600000, 300).unwrap();
+        let all_inner = initialization_at(now + 600000, now, true).unwrap()
+            + receiver(300).unwrap() * 2
+            + CESSATION * 2;
+        assert!(outer > all_inner + PREFLIGHT);
     }
     #[test]
     fn actual_delayed_preflight_exceeds_old_network_timer_and_still_hands_off() {

@@ -46,7 +46,16 @@ impl HostChild {
         inputs: &[(i32, &File)],
         lease: File,
     ) -> Result<Self> {
-        if unsafe { libc::geteuid() } != 0 || inputs.iter().any(|(n, _)| !(3..=18).contains(n)) {
+        if unsafe { libc::geteuid() } != 0
+            || unsafe { libc::getgid() } != 0
+            || unsafe { libc::getegid() } != 0
+            || inputs.iter().any(|(n, _)| !(3..=18).contains(n))
+        {
+            return Err(());
+        }
+        // Reparent trusted descendants here so group cleanup can wait for their
+        // actual exit before releasing the inherited lifetime OFD.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(());
         }
         let mut destinations = std::collections::BTreeSet::new();
@@ -86,8 +95,22 @@ impl HostChild {
                     || libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0
                     || libc::setrlimit(libc::RLIMIT_CORE, &core) != 0
                     || libc::dup3(exe.as_raw_fd(), 63, libc::O_CLOEXEC) < 0
+                    || libc::chdir(c"/".as_ptr()) != 0
                 {
                     libc::_exit(125);
+                }
+                libc::umask(0o077);
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+                if null < 0 {
+                    libc::_exit(125);
+                }
+                for fd in 0..=2 {
+                    if libc::dup2(null, fd) < 0 {
+                        libc::_exit(125);
+                    }
+                }
+                if null > 2 {
+                    libc::close(null);
                 }
                 for (n, file) in &copies {
                     if libc::dup2(file.as_raw_fd(), *n) < 0 {
@@ -106,12 +129,19 @@ impl HostChild {
                 libc::_exit(125);
             }
         }
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
-        if fd < 0 {
+        if unsafe { libc::setpgid(pid, pid) } != 0 && unsafe { libc::getpgid(pid) } != pid {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
+            return Err(());
+        }
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            let _ = stop_group(pid);
             return Err(());
         }
         Ok(Self {
@@ -126,23 +156,44 @@ impl HostChild {
     }
     pub(crate) fn normal_exit(mut self, timeout: Duration) -> Result<()> {
         crate::supervision::ready(&self.pidfd, timeout)?;
-        let mut status = 0;
-        loop {
-            let n = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-            if n == self.pid {
-                self.reaped = true;
-                break;
-            }
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                return Err(());
-            }
-        }
+        let status = self.cease()?;
         if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
             return Err(());
         }
         Ok(())
     }
+    fn cease(&mut self) -> Result<i32> {
+        let status = stop_group(self.pid)?;
+        self.reaped = true;
+        Ok(status)
+    }
 }
+fn stop_group(pid: i32) -> Result<i32> {
+    // The leader is still unreaped, reserving its PID/process-group identity.
+    // Kill and reap its entire retained group even after normal leader exit.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let mut leader = None;
+    loop {
+        let mut status = 0;
+        let n = unsafe { libc::waitpid(-pid, &mut status, 0) };
+        if n == pid {
+            leader = Some(status);
+        }
+        if n > 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return leader.ok_or(());
+        }
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(());
+        }
+    }
+}
+
 impl Drop for HostChild {
     fn drop(&mut self) {
         if !self.reaped {
@@ -154,16 +205,8 @@ impl Drop for HostChild {
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
                 );
-                libc::kill(-self.pid, libc::SIGKILL);
             }
-            loop {
-                let n = unsafe { libc::waitpid(self.pid, std::ptr::null_mut(), 0) };
-                if n == self.pid
-                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
-                {
-                    break;
-                }
-            }
+            let _ = self.cease();
         }
     }
 }
@@ -235,5 +278,41 @@ mod tests {
         let invalid = File::open("/dev/null").unwrap();
         let child = HostChild::bootstrap(&invalid, &[], owned).unwrap();
         assert!(child.normal_exit(Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    #[ignore = "actual root trusted child descendants and inherited OFD cessation"]
+    fn actual_root_normal_and_failed_leader_exit_reap_lease_holding_descendants() {
+        for exit in [0, 1] {
+            let (_path, owned, observer) = lease();
+            let (mut incoming, outgoing) = crate::owner_entry::channel().unwrap();
+            let executable = File::open("/usr/bin/python3.12").unwrap();
+            let code = format!(
+                "import os,time\nassert os.getcwd()=='/' and os.umask(0o077)==0o077\npid=os.fork()\nif pid==0:\n time.sleep(60)\nelse:\n os.write(3,str(pid).encode()); os._exit({exit})"
+            );
+            let child = HostChild::admission(
+                &executable,
+                "python3.12",
+                &code,
+                &[(3, &outgoing), (5, &owned)],
+                owned.try_clone().unwrap(),
+            )
+            .unwrap();
+            drop(owned);
+            drop(outgoing);
+            let mut message = [0u8; 32];
+            let count = incoming.read(&mut message).unwrap();
+            let descendant: i32 = std::str::from_utf8(&message[..count])
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(observer.try_lock().is_err());
+            assert_eq!(
+                child.normal_exit(Duration::from_secs(10)).is_ok(),
+                exit == 0
+            );
+            assert_eq!(unsafe { libc::kill(descendant, 0) }, -1);
+            observer.try_lock().unwrap();
+        }
     }
 }

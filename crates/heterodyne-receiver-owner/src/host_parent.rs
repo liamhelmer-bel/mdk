@@ -15,7 +15,7 @@ struct OwnedConsumedDeployment {
     raw: Vec<u8>,
     process: File,
     process_sha: String,
-    nonce: [u8; 32],
+    bootstrap_nonce: [u8; 32],
 }
 fn equal(v: &Value, key: &str, expected: &str) -> Result<()> {
     if v.get(key).and_then(Value::as_str) != Some(expected) {
@@ -116,7 +116,10 @@ impl OwnedConsumedDeployment {
         profile: &pins::ParentProfile,
         packet: &[u8],
     ) -> Result<Self> {
-        crate::supervision::ready(incoming, Duration::from_secs(2400))?;
+        crate::supervision::ready(
+            incoming,
+            crate::supervision::bootstrap(p.deadline_unix_ms, p.wait_seconds)?,
+        )?;
         let (raw, process) = channel::receive(incoming, child.pid(), channel::MAX_NATIVE, true)?;
         let process = process.ok_or(())?;
         let bytes = input::protected_bytes(&process)?;
@@ -126,7 +129,7 @@ impl OwnedConsumedDeployment {
             raw,
             process,
             process_sha: pins::sha(&bytes),
-            nonce,
+            bootstrap_nonce: nonce,
         })
     }
     fn admission(
@@ -134,15 +137,20 @@ impl OwnedConsumedDeployment {
         verified: &receiver_installation_verifier::reference::HostVerified,
         admission: &File,
         profile: &pins::ParentProfile,
-        nonce_file: &File,
         lease: &File,
         artifacts: &[(i32, &File)],
     ) -> Result<()> {
         verified.check().map_err(|_| ())?;
+        // This root-child freshness domain is never disclosed to the receiver.
+        let (nonce, nonce_file) = channel::nonce()?;
+        if nonce == self.bootstrap_nonce {
+            return Err(());
+        }
         let python = verified.python();
-        let expected = verified
-            .closure()
-            .map_err(|_| ())?
+        let closure = verified.closure().map_err(|_| ())?;
+        let expected = closure
+            .iter()
+            .cloned()
             .into_iter()
             .find(|(p, _)| p == &python)
             .ok_or(())?
@@ -160,7 +168,7 @@ impl OwnedConsumedDeployment {
             "import sys; sys.path={paths}; from heterodyne.actions.deployment_admission_entry import _entry; sys.exit(_entry())"
         );
         // No nonexistent future module or mutable checkout may be substituted.
-        if !verified.closure().map_err(|_| ())?.iter().any(|(p, _)| {
+        if !closure.iter().any(|(p, _)| {
             p == &verified
                 .product_source()
                 .join("heterodyne/actions/deployment_admission_entry.py")
@@ -174,7 +182,7 @@ impl OwnedConsumedDeployment {
             (3, admission),
             (4, &outgoing),
             (5, lease),
-            (6, nonce_file),
+            (6, &nonce_file),
             (7, &self.process),
         ];
         inputs.extend_from_slice(artifacts);
@@ -187,7 +195,7 @@ impl OwnedConsumedDeployment {
         )?;
         drop(inputs);
         drop(outgoing);
-        let metadata=receiver_installation_verifier::installation::canonical(&json!({"schema":"heterodyne-owned-deployment-admission.v1","nonce_hex":hex::encode(self.nonce),"process_profile_sha256":self.process_sha,"packet_sha256":profile.packet_sha256,"producer_profile_sha256":profile.producer_profile_sha256})).map_err(|_|())?;
+        let metadata=receiver_installation_verifier::installation::canonical(&json!({"schema":"heterodyne-owned-deployment-admission.v1","nonce_hex":hex::encode(nonce),"process_profile_sha256":self.process_sha,"packet_sha256":profile.packet_sha256,"producer_profile_sha256":profile.producer_profile_sha256})).map_err(|_|())?;
         if metadata.len() > 4096 {
             return Err(());
         }
@@ -196,7 +204,7 @@ impl OwnedConsumedDeployment {
         crate::supervision::ready(&incoming, Duration::from_secs(600))?;
         let (result, _) = channel::receive(&incoming, child.pid(), 4096, false)?;
         child.normal_exit(crate::supervision::CESSATION)?;
-        admission_complete(&result, &self.nonce)
+        admission_complete(&result, &nonce)
     }
 }
 fn admission_complete(raw: &[u8], nonce: &[u8; 32]) -> Result<()> {
@@ -221,6 +229,8 @@ fn admission_complete(raw: &[u8], nonce: &[u8; 32]) -> Result<()> {
 pub(crate) fn entry() -> Result<()> {
     if unsafe { libc::getuid() } != 0
         || unsafe { libc::geteuid() } != 0
+        || unsafe { libc::getgid() } != 0
+        || unsafe { libc::getegid() } != 0
         || std::env::args_os().count() != 1
         || std::env::vars_os().next().is_some()
     {
@@ -272,7 +282,6 @@ pub(crate) fn entry() -> Result<()> {
         &verified,
         &admission,
         &profile,
-        &nonce_file,
         lease,
         &[
             (13, &originals[5]),
@@ -286,6 +295,26 @@ pub(crate) fn entry() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "actual sealed root nonce domains"]
+    fn receiver_nonce_does_not_approve_the_root_admission_domain() {
+        let (bootstrap_nonce, _) = channel::nonce().unwrap();
+        let (admission_nonce, admission_file) = channel::nonce().unwrap();
+        assert_ne!(bootstrap_nonce, admission_nonce);
+        assert_eq!(
+            channel::read_nonce(&admission_file).unwrap(),
+            admission_nonce
+        );
+        let response = |nonce| {
+            serde_json::to_vec(&json!({
+                "schema":"heterodyne-owned-deployment-admission-result.v1",
+                "nonce_hex":hex::encode(nonce),"status":"complete"
+            }))
+            .unwrap()
+        };
+        assert!(admission_complete(&response(bootstrap_nonce), &admission_nonce).is_err());
+        assert!(admission_complete(&response(admission_nonce), &admission_nonce).is_ok());
+    }
     #[test]
     fn only_exact_bound_complete_is_positive() {
         let nonce = [7; 32];
