@@ -5,6 +5,7 @@ members = [
     "crates/traits",
     "crates/cgka-engine",
     "crates/cgka-session",
+    "crates/heterodyne-receiver-owner",
     "crates/storage-sqlite",
     "crates/cgka-conformance-simulator",
     "crates/convergence-campaign-runner",

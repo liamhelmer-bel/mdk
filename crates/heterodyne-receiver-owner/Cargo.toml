@@ -1,0 +1,30 @@
+[package]
+name = "heterodyne-receiver-owner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+cgka-engine.workspace = true
+cgka-session.workspace = true
+cgka-traits.workspace = true
+fs-private.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+libc.workspace = true
+marmot-account.workspace = true
+nostr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+transport-nostr-adapter.workspace = true
+transport-nostr-peeler.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
