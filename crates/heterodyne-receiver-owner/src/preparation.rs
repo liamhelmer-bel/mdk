@@ -214,6 +214,95 @@ pub(crate) struct Prepared {
     pub(crate) metadata: KeyPackageMetadata,
 }
 
+/// Exact-artifact network adapter, constructed only after durable exposure has
+/// been recorded by the owning initialization operation. It owns no signer and
+/// cannot create a replacement package or event.
+pub(crate) struct ExactPublisher {
+    prepared: Prepared,
+    relay: transport_nostr_adapter::NostrKeyPackagePublisher,
+    minimum: usize,
+    timeout: std::time::Duration,
+}
+
+impl ExactPublisher {
+    pub(crate) fn new(
+        prepared: Prepared,
+        relay: Arc<dyn transport_nostr_adapter::NostrRelayClient>,
+        minimum: usize,
+        timeout: std::time::Duration,
+    ) -> Result<Self, Error> {
+        if minimum == 0
+            || minimum > prepared.publication.endpoints.len()
+            || timeout.is_zero()
+            || timeout > std::time::Duration::from_secs(30)
+        {
+            return Err(Error::Hold);
+        }
+        Ok(Self {
+            prepared,
+            relay: transport_nostr_adapter::NostrKeyPackagePublisher::new(relay)
+                .required_acks(minimum),
+            minimum,
+            timeout,
+        })
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for ExactPublisher {
+    async fn prepare_key_package(
+        &self,
+        _: KeyPackagePublication,
+    ) -> Result<SignedPublicationArtifact, KeyPackagePublishError> {
+        Err(KeyPackagePublishError::unexposed(
+            "exact publisher cannot prepare or rotate",
+        ))
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        value: &KeyPackagePublication,
+        artifact: &SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        // Every error in this publish entry remains possibly exposed. A caller
+        // must never interpret adapter validation failure as safe regeneration.
+        let exposed =
+            || KeyPackagePublishError::exposed("exact publication incomplete; preserve generation");
+        if value != &self.prepared.publication || artifact != &self.prepared.artifact {
+            return Err(exposed());
+        }
+        let event: NostrTransportEvent =
+            serde_json::from_slice(&artifact.bytes).map_err(|_| exposed())?;
+        let signed = nostr::Event::from_json(&artifact.bytes).map_err(|_| exposed())?;
+        signed.verify().map_err(|_| exposed())?;
+        let dto = publication(value).map_err(|_| exposed())?;
+        let outcome = tokio::time::timeout(
+            self.timeout,
+            self.relay.publish_prepared_key_package(&dto, &event),
+        )
+        .await
+        .map_err(|_| exposed())?
+        .map_err(|_| exposed())?;
+        if outcome.message_id.as_ref() != Some(&artifact.id) {
+            return Err(exposed());
+        }
+        let accepted: Vec<_> = outcome.accepted.into_iter().map(|r| r.endpoint).collect();
+        let failed: Vec<_> = outcome.failed.into_iter().map(|r| r.endpoint).collect();
+        if accepted.len() < self.minimum
+            || accepted
+                .iter()
+                .enumerate()
+                .any(|(i, e)| !value.endpoints.contains(e) || accepted[..i].contains(e))
+            || failed.iter().enumerate().any(|(i, e)| {
+                !value.endpoints.contains(e) || accepted.contains(e) || failed[..i].contains(e)
+            })
+        {
+            return Err(exposed());
+        }
+        Ok(KeyPackagePublishReceipt { accepted, failed })
+    }
+}
+
 /// Called only while the generation is unexposed. The caller must retain these
 /// exact bytes durably with the KeyPackage artifact before exposure-begun. A
 /// resume reads retained artifacts; it never calls this signer after exposure.
@@ -326,18 +415,7 @@ pub(crate) async fn prepare(
         return Err(Error::Hold);
     }
     storage.close().map_err(|_| Error::Native)?;
-    let identity = keys.public_key().to_bytes().to_vec();
-    let mut components = default_group_components();
-    components.insert(NOSTR_ROUTING_COMPONENT_ID);
-    let config = SessionConfig::new(
-        database,
-        SqlCipherKey::new(key.as_secret_str()).map_err(|_| Error::Native)?,
-        identity,
-        Box::new(RefuseTransport),
-    )
-    .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
-    .supported_app_components(components);
-    let session = AccountDeviceSession::open(config).map_err(|_| Error::Native)?;
+    let session = open_session(database, key, &keys)?;
     // Never initialize a second lifecycle or rotate a promoted/exposed package.
     match session.key_package_lifecycle().map_err(|_| Error::Native)? {
         None => session
@@ -406,10 +484,274 @@ pub(crate) async fn prepare(
     })
 }
 
+fn open_session(
+    database: &Path,
+    key: &SqlCipherKey,
+    keys: &nostr::Keys,
+) -> Result<AccountDeviceSession, Error> {
+    let mut components = default_group_components();
+    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    let config = SessionConfig::new(
+        database,
+        SqlCipherKey::new(key.as_secret_str()).map_err(|_| Error::Native)?,
+        keys.public_key().to_bytes().to_vec(),
+        Box::new(RefuseTransport),
+    )
+    .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
+    .supported_app_components(components);
+    AccountDeviceSession::open(config).map_err(|_| Error::Native)
+}
+
+/// The operation must retain its generation lease and durable exposure marker.
+/// Reuse native promotion only while the exact original pending artifact exists.
+/// A promoted package is refused here: retry then uses the exact adapter directly.
+pub(crate) async fn publish_pending(
+    database: &Path,
+    key: &SqlCipherKey,
+    keys: &nostr::Keys,
+    publisher: ExactPublisher,
+) -> Result<cgka_traits::KeyPackage, Error> {
+    let prepared = &publisher.prepared;
+    let storage = SqliteAccountStorage::open_encrypted(database, key).map_err(|_| Error::Native)?;
+    let state = storage
+        .key_package_lifecycle()
+        .map_err(|_| Error::Native)?
+        .ok_or(Error::Hold)?;
+    let pending = state.pending_replacement.ok_or(Error::Hold)?;
+    let owned =
+        cgka_engine::key_package::durably_owned_key_packages(&storage, ProtocolProfile::Current)
+            .map_err(|_| Error::Native)?;
+    if state.current_key_package.is_some()
+        || state.stable_slot_id != prepared.publication.slot_id
+        || keys.public_key().to_bytes().as_slice() != prepared.publication.account_id.as_slice()
+        || pending.signed_event.as_ref() != Some(&prepared.artifact)
+        || pending.key_package != prepared.publication.key_package
+        || pending.authored_created_at != prepared.publication.created_at
+        || pending
+            .targets
+            .iter()
+            .map(|t| &t.endpoint)
+            .ne(prepared.publication.endpoints.iter())
+        || owned.len() != 1
+        || owned[0] != prepared.publication.key_package
+        || !storage.list_groups().map_err(|_| Error::Native)?.is_empty()
+        || !storage
+            .list_pending_application_events()
+            .map_err(|_| Error::Native)?
+            .is_empty()
+    {
+        return Err(Error::Hold);
+    }
+    storage.close().map_err(|_| Error::Native)?;
+    let session = open_session(database, key, keys)?;
+    let mut runtime = AccountDeviceRuntime::new(
+        session,
+        RefuseTransport,
+        StaticTransportRouting::new(prepared.publication.endpoints.clone()),
+        publisher,
+    );
+    runtime
+        .publish_fresh_key_package()
+        .await
+        .map_err(|_| Error::Hold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cgka_engine::key_package::durably_owned_key_packages;
+
+    #[derive(Default)]
+    struct PublicationPeer {
+        mode: std::sync::atomic::AtomicU8,
+        events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    }
+
+    #[async_trait]
+    impl transport_nostr_adapter::NostrRelayClient for PublicationPeer {
+        async fn subscribe(
+            &self,
+            _: transport_nostr_adapter::NostrSubscription,
+        ) -> Result<(), TransportAdapterError> {
+            panic!("initializer must never subscribe")
+        }
+        async fn unsubscribe(
+            &self,
+            _: transport_nostr_adapter::NostrSubscription,
+        ) -> Result<(), TransportAdapterError> {
+            panic!("initializer must never activate subscriptions")
+        }
+        async fn unsubscribe_account(&self, _: &MemberId) -> Result<(), TransportAdapterError> {
+            panic!("initializer must never activate accounts")
+        }
+        async fn publish_event(
+            &self,
+            endpoints: &[TransportEndpoint],
+            event: &NostrTransportEvent,
+            _: usize,
+        ) -> Result<transport_nostr_adapter::NostrPublishOutcome, TransportAdapterError> {
+            self.events.lock().unwrap().push(event.clone());
+            let accepted = match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => endpoints.to_vec(),
+                1 => endpoints[..1].to_vec(),
+                2 => return std::future::pending().await,
+                _ => vec![TransportEndpoint::from("wss://unexpected.invalid")],
+            };
+            Ok(transport_nostr_adapter::NostrPublishOutcome::accepted(
+                accepted,
+            ))
+        }
+    }
+
+    /// Native SQLCipher/preparation/signatures and the real publication adapter;
+    /// the in-process peer is injected, not installed relay qualification.
+    #[tokio::test]
+    async fn exact_publisher_keeps_identical_bytes_across_partial_and_timeout() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let key = SqlCipherKey::new("disposable-publication-test-only").unwrap();
+        let prepared = prepare(
+            &temp.path().join("account.sqlite3"),
+            &key,
+            nostr::Keys::generate(),
+            &"a1".repeat(32),
+            vec![
+                TransportEndpoint::from("wss://one.invalid"),
+                TransportEndpoint::from("wss://two.invalid"),
+            ],
+        )
+        .await
+        .unwrap();
+        let value = prepared.publication.clone();
+        let artifact = prepared.artifact.clone();
+        let peer = Arc::new(PublicationPeer::default());
+        let publisher = ExactPublisher::new(
+            prepared,
+            peer.clone(),
+            2,
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(publisher.legacy_slot_id(&value.account_id).unwrap(), None);
+        assert!(publisher.prepare_key_package(value.clone()).await.is_err());
+        let receipt = publisher
+            .publish_prepared_key_package(&value, &artifact)
+            .await
+            .unwrap();
+        assert_eq!(receipt.accepted, value.endpoints);
+        for mode in [1, 2, 3] {
+            peer.mode.store(mode, Ordering::SeqCst);
+            let error = publisher
+                .publish_prepared_key_package(&value, &artifact)
+                .await
+                .unwrap_err();
+            assert!(error.externally_exposed);
+        }
+        peer.mode.store(0, Ordering::SeqCst);
+        publisher
+            .publish_prepared_key_package(&value, &artifact)
+            .await
+            .unwrap();
+        let events = peer.events.lock().unwrap();
+        assert_eq!(events.len(), 5);
+        for event in events.iter() {
+            assert_eq!(serde_json::to_vec(event).unwrap(), artifact.bytes);
+        }
+        drop(events);
+        let mut changed = artifact.clone();
+        changed.bytes.push(b' ');
+        assert!(
+            publisher
+                .publish_prepared_key_package(&value, &changed)
+                .await
+                .unwrap_err()
+                .externally_exposed
+        );
+        assert_eq!(peer.events.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn native_promotion_requires_threshold_and_refuses_promoted_reentry() {
+        use std::sync::atomic::Ordering;
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("account.sqlite3");
+        let key = SqlCipherKey::new("disposable-native-promotion-test-only").unwrap();
+        let keys = nostr::Keys::generate();
+        let slot = "b2".repeat(32);
+        let endpoints = vec![
+            TransportEndpoint::from("wss://one.invalid"),
+            TransportEndpoint::from("wss://two.invalid"),
+        ];
+        let peer = Arc::new(PublicationPeer::default());
+        let prepared = prepare(&database, &key, keys.clone(), &slot, endpoints.clone())
+            .await
+            .unwrap();
+        let original = prepared.artifact.clone();
+        peer.mode.store(1, Ordering::SeqCst);
+        let publisher =
+            ExactPublisher::new(prepared, peer.clone(), 2, std::time::Duration::from_secs(1))
+                .unwrap();
+        assert!(
+            publish_pending(&database, &key, &keys, publisher)
+                .await
+                .is_err()
+        );
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let state = storage.key_package_lifecycle().unwrap().unwrap();
+        assert!(state.current_key_package.is_none());
+        assert_eq!(
+            state.pending_replacement.unwrap().signed_event.unwrap(),
+            original
+        );
+        storage.close().unwrap();
+        let prepared = prepare(&database, &key, keys.clone(), &slot, endpoints.clone())
+            .await
+            .unwrap();
+        assert_eq!(prepared.artifact, original);
+        let retained_for_direct_retry =
+            prepare(&database, &key, keys.clone(), &slot, endpoints.clone())
+                .await
+                .unwrap();
+        peer.mode.store(0, Ordering::SeqCst);
+        let publisher =
+            ExactPublisher::new(prepared, peer.clone(), 2, std::time::Duration::from_secs(1))
+                .unwrap();
+        let package = publish_pending(&database, &key, &keys, publisher)
+            .await
+            .unwrap();
+        let storage = SqliteAccountStorage::open_encrypted(&database, &key).unwrap();
+        let state = storage.key_package_lifecycle().unwrap().unwrap();
+        assert!(state.pending_replacement.is_none());
+        assert_eq!(
+            durably_owned_key_packages(&storage, ProtocolProfile::Current).unwrap(),
+            vec![package]
+        );
+        assert!(state.current_key_package.is_some());
+        storage.close().unwrap();
+        let value = retained_for_direct_retry.publication.clone();
+        let publisher = ExactPublisher::new(
+            retained_for_direct_retry,
+            peer.clone(),
+            2,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        publisher
+            .publish_prepared_key_package(&value, &original)
+            .await
+            .unwrap();
+        assert!(
+            publish_pending(&database, &key, &keys, publisher)
+                .await
+                .is_err()
+        );
+        assert_eq!(peer.events.lock().unwrap().len(), 3);
+        assert!(
+            prepare(&database, &key, keys, &slot, endpoints)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn real_private_package_and_signed_bytes_survive_exact_local_resume() {

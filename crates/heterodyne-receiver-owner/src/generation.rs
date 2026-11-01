@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
+const MAX_PUBLICATIONS: u64 = 1_048_576;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("fresh material I/O; retain partial generation for reconciliation")]
@@ -80,6 +82,98 @@ fn secret(parent: &File, name: &str, bytes: &[u8; 32]) -> Result<File, Error> {
 }
 
 impl Generation {
+    /// Persist all three exact signed events before the ledger can record
+    /// exposure. O_EXCL preserves a partial write for reconciliation; it never
+    /// turns a failed save into permission to sign replacement events.
+    pub(crate) fn retain_publications(
+        &self,
+        artifacts: [&cgka_traits::SignedPublicationArtifact; 3],
+        bindings: &[crate::initializer::Artifact],
+    ) -> Result<File, Error> {
+        directory(&self.directory)?;
+        let bytes: Vec<&[u8]> = artifacts.iter().map(|a| a.bytes.as_slice()).collect();
+        let encoded = serde_json::to_vec(&bytes).map_err(|_| Error::Hold)?;
+        if encoded.len() as u64 > MAX_PUBLICATIONS {
+            return Err(Error::Hold);
+        }
+        self.verify_publications(&bytes, bindings)?;
+        let mut output = open_at(
+            &self.directory,
+            "publications.json",
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            0o400,
+        )?;
+        output.write_all(&encoded)?;
+        output.sync_all()?;
+        self.directory.sync_all()?;
+        let retained = open_at(&self.directory, "publications.json", libc::O_RDONLY, 0)?;
+        let a = output.metadata()?;
+        let b = retained.metadata()?;
+        if (a.dev(), a.ino()) != (b.dev(), b.ino()) {
+            return Err(Error::Hold);
+        }
+        self.read_publications(&retained, bindings)?;
+        Ok(retained)
+    }
+
+    /// Read the retained bytes against the original durable ledger bindings.
+    /// This readback supplies no authority to publish or replay an operation.
+    pub(crate) fn read_publications(
+        &self,
+        file: &File,
+        bindings: &[crate::initializer::Artifact],
+    ) -> Result<[Vec<u8>; 3], Error> {
+        directory(&self.directory)?;
+        let m = file.metadata()?;
+        // SAFETY: fcntl only inspects the retained descriptor's open flags.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if !m.is_file()
+            || m.uid() != unsafe { libc::geteuid() }
+            || m.mode() & 0o7777 != 0o400
+            || m.nlink() != 1
+            || m.dev() != self.directory.metadata()?.dev()
+            || m.len() == 0
+            || m.len() > MAX_PUBLICATIONS
+            || flags < 0
+            || flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & libc::O_PATH != 0
+        {
+            return Err(Error::Hold);
+        }
+        let mut bytes = vec![0; m.len() as usize];
+        std::os::unix::fs::FileExt::read_exact_at(file, &mut bytes, 0)?;
+        let artifacts: [Vec<u8>; 3] = serde_json::from_slice(&bytes).map_err(|_| Error::Hold)?;
+        self.verify_publications(&artifacts.each_ref().map(Vec::as_slice), bindings)?;
+        Ok(artifacts)
+    }
+
+    fn verify_publications(
+        &self,
+        artifacts: &[&[u8]],
+        bindings: &[crate::initializer::Artifact],
+    ) -> Result<(), Error> {
+        use nostr::JsonUtil;
+        use sha2::Digest;
+        if artifacts.len() != 3 || bindings.len() != 3 {
+            return Err(Error::Hold);
+        }
+        let (_, keys, _) = self.native_inputs()?;
+        for ((bytes, binding), kind) in artifacts.iter().zip(bindings).zip([10002, 10050, 30443]) {
+            if binding.kind != kind || hex::encode(sha2::Sha256::digest(bytes)) != binding.sha256 {
+                return Err(Error::Hold);
+            }
+            let signed = nostr::Event::from_json(*bytes).map_err(|_| Error::Hold)?;
+            signed.verify().map_err(|_| Error::Hold)?;
+            if signed.kind.as_u16() != kind
+                || signed.id.to_hex() != binding.event_id
+                || signed.pubkey != keys.public_key()
+            {
+                return Err(Error::Hold);
+            }
+        }
+        Ok(())
+    }
+
     /// The caller must durably record the request/generation/slot intent first.
     /// Any error leaves every already-created object intact; never call this as
     /// a retry of a partially created generation.
@@ -249,7 +343,26 @@ mod tests {
                 required_acks: 1,
             });
         }
-        ledger.prepared(artifact_bindings).unwrap();
+        let exact = [&relays[0], &relays[1], &prepared.artifact];
+        let retained = material
+            .retain_publications(exact, &artifact_bindings)
+            .unwrap();
+        let readback = material
+            .read_publications(&retained, &artifact_bindings)
+            .unwrap();
+        for (actual, original) in readback.iter().zip(exact) {
+            assert_eq!(actual, &original.bytes);
+        }
+        // A retry cannot overwrite a durable artifact with a newly signed one.
+        assert!(
+            material
+                .retain_publications(exact, &artifact_bindings)
+                .is_err()
+        );
+        let mut changed = artifact_bindings.clone();
+        changed[2].sha256 = "00".repeat(32);
+        assert!(material.read_publications(&retained, &changed).is_err());
+        ledger.prepared(artifact_bindings.clone()).unwrap();
         ledger.exposure_begun().unwrap();
         drop(ledger);
         let ledger_file = open_at(&parent, "initialization.jsonl", libc::O_RDWR, 0).unwrap();
@@ -261,6 +374,29 @@ mod tests {
         )
         .unwrap();
         assert!(ledger.material(slot).is_err());
+        // Exposure/restart does not require re-signing any event, including
+        // relay lists that the native package lifecycle does not retain.
+        assert_eq!(
+            material
+                .read_publications(&retained, &artifact_bindings)
+                .unwrap(),
+            readback
+        );
+        retained
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let mut corrupt =
+            open_at(&material.directory, "publications.json", libc::O_WRONLY, 0).unwrap();
+        corrupt.write_all(b"!").unwrap();
+        corrupt.sync_all().unwrap();
+        retained
+            .set_permissions(std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        assert!(
+            material
+                .read_publications(&retained, &artifact_bindings)
+                .is_err()
+        );
         assert!(Generation::create(&parent, &generation).is_err());
         let (same_path, same_keys, same_sql) = material.native_inputs().unwrap();
         assert_eq!(same_path, path);
