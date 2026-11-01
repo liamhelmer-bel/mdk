@@ -29,7 +29,7 @@ type Result<T> = std::result::Result<T, Hold>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Enrollment {
+struct LegacyEnrollment {
     pub(super) account: String,
     pub(super) group: String,
     pub(super) operators: Vec<String>,
@@ -37,6 +37,65 @@ pub(super) struct Enrollment {
     pub(super) storage_generation: String,
     pub(super) initial_native_state_sha256: String,
     pub(super) welcome_provenance_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Enrollment {
+    pub(super) schema: String,
+    pub(super) account: String,
+    pub(super) group: String,
+    pub(super) operators: Vec<String>,
+    pub(super) source_profile_sha256: String,
+    pub(super) storage_generation: String,
+    pub(super) initial_native_state_sha256: String,
+    pub(super) welcome_provenance_sha256: String,
+    pub(super) expiry_profile_sha256: String,
+    pub(super) installation_index_sha256: String,
+    pub(super) installation_source_sha256: String,
+    pub(super) capability_template: String,
+    pub(super) capability_policy_sha256: String,
+}
+
+impl Enrollment {
+    pub(super) const SCHEMA: &str = "heterodyne-receiver-enrollment.v3";
+    pub(super) fn check(&self) -> Result<()> {
+        if self.schema != Self::SCHEMA
+            || self.operators.is_empty()
+            || self.operators.len() > 64
+            || self.operators.contains(&self.account)
+            || self.operators.windows(2).any(|p| p[0] >= p[1])
+            || ![
+                &self.account,
+                &self.source_profile_sha256,
+                &self.storage_generation,
+                &self.initial_native_state_sha256,
+                &self.welcome_provenance_sha256,
+                &self.expiry_profile_sha256,
+                &self.installation_index_sha256,
+                &self.installation_source_sha256,
+                &self.capability_policy_sha256,
+            ]
+            .iter()
+            .all(|v| is_hash(v))
+            || crate::protected_capability_policy::Template::from_policy(
+                &self.capability_template,
+                &self.capability_policy_sha256,
+            )
+            .is_err()
+            || !valid_group(&self.group)
+            || !self.operators.iter().all(|v| is_hash(v))
+        {
+            return Err(Hold::Changed);
+        }
+        Ok(())
+    }
+    pub(super) fn canonical_sha256(&self) -> Result<String> {
+        self.check()?;
+        Ok(hex::encode(Sha256::digest(
+            serde_json::to_vec(self).map_err(|_| Hold::Encoding)?,
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +127,10 @@ enum TransitionKind {
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum Body {
     Header {
+        enrollment: LegacyEnrollment,
+        generation: String,
+    },
+    HeaderV3 {
         enrollment: Enrollment,
         generation: String,
     },
@@ -254,6 +317,13 @@ impl SourceCursor {
         {
             return Err(Hold::Changed);
         }
+        match &record.body {
+            Body::Header { .. } => return Err(Hold::Changed),
+            Body::HeaderV3 { enrollment, .. } if record.sequence == 1 => enrollment.check()?,
+            Body::HeaderV3 { .. } => return Err(Hold::Changed),
+            _ if record.sequence == 1 => return Err(Hold::Changed),
+            _ => (),
+        }
         self.sequence = record.sequence;
         self.digest = record.sha256;
         let body = match record.body {
@@ -282,25 +352,8 @@ impl Journal {
         Ok(files)
     }
 
-    pub(super) fn enroll(files: OwnedFiles, mut enrollment: Enrollment) -> Result<Self> {
-        enrollment.operators.sort();
-        if enrollment.operators.is_empty()
-            || enrollment.operators.len() > 64
-            || enrollment.operators.windows(2).any(|p| p[0] == p[1])
-            || ![
-                &enrollment.account,
-                &enrollment.source_profile_sha256,
-                &enrollment.storage_generation,
-                &enrollment.initial_native_state_sha256,
-                &enrollment.welcome_provenance_sha256,
-            ]
-            .iter()
-            .all(|s| is_hash(s))
-            || !valid_group(&enrollment.group)
-            || !enrollment.operators.iter().all(|s| is_hash(s))
-        {
-            return Err(Hold::Changed);
-        }
+    pub(super) fn enroll(files: OwnedFiles, enrollment: Enrollment) -> Result<Self> {
+        enrollment.check()?;
         let files = checked_files(files)?;
         if io(files.journal.metadata())?.len() != 0 || io(files.anchor.metadata())?.len() != 0 {
             return Err(Hold::Changed);
@@ -316,7 +369,7 @@ impl Journal {
             last_time: 0,
             latched: false,
         };
-        journal.write(Body::Header {
+        journal.write(Body::HeaderV3 {
             enrollment,
             generation: hex::encode(generation),
         })?;
@@ -341,8 +394,7 @@ impl Journal {
         let mut previous_anchor = String::new();
         let mut header_digest = String::new();
         let mut last_time = 0;
-        let mut expected = expected.clone();
-        expected.operators.sort();
+        expected.check()?;
         while let Some(record) = next::<Record>(&mut reader)? {
             let anchor = next::<Anchor>(&mut anchors)?.ok_or(Hold::Changed)?;
             if record.sequence != sequence + 1
@@ -358,14 +410,14 @@ impl Journal {
             }
             if sequence == 0 {
                 match &record.body {
-                    Body::Header {
+                    Body::HeaderV3 {
                         enrollment,
                         generation,
-                    } if enrollment == &expected && is_hash(generation) => {}
+                    } if enrollment == expected && is_hash(generation) => {}
                     _ => return Err(Hold::Changed),
                 }
                 header_digest = record.sha256.clone();
-            } else if matches!(record.body, Body::Header { .. }) {
+            } else if matches!(record.body, Body::HeaderV3 { .. } | Body::Header { .. }) {
                 return Err(Hold::Changed);
             }
             let use_key = match &record.body {
@@ -496,7 +548,7 @@ impl Journal {
         io((&self.files.journal).seek(SeekFrom::Start(0)))?;
         let header =
             next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
-        let Body::Header { enrollment, .. } = header.body else {
+        let Body::HeaderV3 { enrollment, .. } = header.body else {
             return Err(Hold::Changed);
         };
         if enrollment.welcome_provenance_sha256 != evidence.digest().map_err(|_| Hold::Changed)? {
@@ -544,7 +596,13 @@ impl Journal {
     }
     pub(super) fn enrollment(&self) -> Result<Enrollment> {
         let record = self.source_at(1)?;
-        serde_json::from_value(record.body["enrollment"].clone()).map_err(|_| Hold::Encoding)
+        if record.sequence != 1 || record.body["kind"] != "header-v3" {
+            return Err(Hold::Changed);
+        }
+        let enrollment: Enrollment = serde_json::from_value(record.body["enrollment"].clone())
+            .map_err(|_| Hold::Encoding)?;
+        enrollment.check()?;
+        Ok(enrollment)
     }
     pub(super) fn header_hash(&self) -> &str {
         &self.header_digest
@@ -579,14 +637,12 @@ impl Journal {
         }
         Ok(time)
     }
-    pub(super) fn profile_hash(&self) -> Result<String> {
-        io((&self.files.journal).seek(SeekFrom::Start(0)))?;
-        let header =
-            next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
-        let Body::Header { enrollment, .. } = header.body else {
-            return Err(Hold::Changed);
-        };
-        Ok(enrollment.source_profile_sha256)
+    pub(super) fn fresh_source_profile_hash(&self) -> Result<String> {
+        Ok(self.enrollment()?.source_profile_sha256)
+    }
+
+    pub(super) fn expiry_profile_hash(&self) -> Result<String> {
+        Ok(self.enrollment()?.expiry_profile_sha256)
     }
 
     pub(super) fn length(&self) -> Result<u64> {
@@ -610,7 +666,7 @@ impl Journal {
             next::<Record>(&mut BufReader::new(&self.files.journal))?.ok_or(Hold::Changed)?;
         let mut operators = operators.to_vec();
         operators.sort();
-        Ok(matches!(record.body, Body::Header { enrollment, .. }
+        Ok(matches!(record.body, Body::HeaderV3 { enrollment, .. }
             if enrollment.account == account && enrollment.group == group
                 && enrollment.operators == operators && enrollment.initial_native_state_sha256 == native))
     }
@@ -813,8 +869,20 @@ impl Journal {
     }
 
     fn validate_body(&self, body: &Body) -> Result<()> {
+        if self.sequence == 0 && !matches!(body, Body::HeaderV3 { .. }) {
+            return Err(Hold::Changed);
+        }
         match body {
-            Body::Header { .. } if self.sequence != 0 => Err(Hold::Changed),
+            Body::Header { .. } => Err(Hold::Changed),
+            Body::HeaderV3 {
+                enrollment,
+                generation,
+            } => {
+                if self.sequence != 0 || !is_hash(generation) {
+                    return Err(Hold::Changed);
+                }
+                enrollment.check()
+            }
             Body::Transition { payload_hex, .. }
                 if payload_hex.len() > 8 * 1024 * 1024
                     || !payload_hex
@@ -895,3 +963,64 @@ fn valid_ask(id: &str) -> bool {
 #[cfg(test)]
 #[path = "protected_recovery_tests.rs"]
 pub(super) mod tests;
+
+/// Run only the root-owned positive fixture in a disposable user namespace when
+/// ordinary CI invokes this test as an unprivileged user. The child still uses
+/// the exact production uid0 check; no auth branch is compiled out for tests.
+#[cfg(test)]
+pub(crate) fn root_expiry_fixture_available() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        return true;
+    }
+    let thread = std::thread::current();
+    let name = thread.name().expect("named libtest fixture");
+    let output = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            name,
+            "--nocapture",
+            "--test-threads=1",
+            "--format=json",
+            "-Z",
+            "unstable-options",
+        ])
+        .env("RUSTC_BOOTSTRAP", "1")
+        .output()
+        .expect("Linux protected-owner tests require unprivileged user namespaces and unshare");
+    assert!(
+        output.status.success() && single_root_fixture_passed(&output.stdout, name),
+        "disposable uid0 fixture must execute exactly one matching test: {name}\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[cfg(test)]
+fn single_root_fixture_passed(stdout: &[u8], name: &str) -> bool {
+    let events: Vec<serde_json::Value> = String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let executed = events
+        .iter()
+        .filter(|event| event["type"] == "test" && event["event"] == "ok" && event["name"] == name)
+        .count();
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "suite" && event["event"] == "started")
+        .collect();
+    let suites: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] == "suite" && event["event"] == "ok")
+        .collect();
+    executed == 1
+        && starts.len() == 1
+        && starts[0]["test_count"] == 1
+        && suites.len() == 1
+        && suites[0]["passed"] == 1
+        && suites[0]["failed"] == 0
+        && suites[0]["ignored"] == 0
+}

@@ -47,6 +47,7 @@ pub(super) struct JoinConstraint {
     pub(super) group: GroupId,
     pub(super) operators: Vec<MemberId>,
     pub(super) key_package_ref: Vec<u8>,
+    pub(super) template: crate::protected_capability_policy::Template,
 }
 impl Capture {
     /// Called inside the rollbackable native join transaction, after all native
@@ -56,6 +57,7 @@ impl Capture {
         group: &GroupId,
         welcomer: &MemberId,
         key_package_ref: &[u8],
+        staged_group: &openmls::prelude::MlsGroup,
     ) -> Result<(), EngineError> {
         if self.constraint.as_ref().is_some_and(|expected| {
             &expected.group != group
@@ -66,6 +68,12 @@ impl Capture {
             // An enrollment policy refusal is not an invalid native Welcome:
             // do not terminally deduplicate valid invitation bytes.
             return Err(EngineError::Other("enrollment invitation mismatch".into()));
+        }
+        if let Some(expected) = &self.constraint
+            && let Err(error) = expected.template.validate_group(staged_group)
+        {
+            self.policy_rejected = true;
+            return Err(error);
         }
         // Set before the first write. Any partial write/fsync/commit failure is
         // UNKNOWN, even when the native transaction subsequently rolls back.

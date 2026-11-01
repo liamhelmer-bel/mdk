@@ -118,7 +118,9 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         };
         self.expiry_profile = Some(expiry::Profile::open(
             file,
-            &journal.profile_hash().map_err(|_| ReceiverHold::Journal)?,
+            &journal
+                .expiry_profile_hash()
+                .map_err(|_| ReceiverHold::Journal)?,
         )?);
         Ok(self)
     }
@@ -664,3 +666,7 @@ mod owned_producer;
 #[cfg(all(target_os = "linux", feature = "protected-owner-runtime"))]
 #[path = "protected_owned_runtime.rs"]
 pub(crate) mod owned_runtime;
+
+#[cfg(target_os = "linux")]
+#[path = "protected_anchor_custody.rs"]
+mod anchor_custody;

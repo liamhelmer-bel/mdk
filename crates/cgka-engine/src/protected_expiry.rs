@@ -2,17 +2,10 @@
 //! enrolled profile descriptor. This parser does not replace Product validation
 //! or qualify the missing installed producer/custody opener.
 use super::{ReceiverHold, digest};
-use serde::Deserialize;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
 };
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Policy {
-    schema: String,
-    max_approval_lifetime_ms: u64,
-}
 pub(super) struct Profile {
     file: File,
     sha256: String,
@@ -20,19 +13,12 @@ pub(super) struct Profile {
 }
 impl Profile {
     pub(super) fn open(file: File, expected: &str) -> Result<Self, ReceiverHold> {
-        let bytes = read(&file)?;
-        let policy: Policy =
-            serde_json::from_slice(&bytes).map_err(|_| ReceiverHold::Configuration)?;
-        if policy.schema != "heterodyne-receiver-expiry.v1"
-            || policy.max_approval_lifetime_ms == 0
-            || digest(&bytes) != expected
-        {
-            return Err(ReceiverHold::Configuration);
-        }
+        let lifetime = crate::protected_expiry_policy::verify_descriptor(&file, expected)
+            .map_err(|_| ReceiverHold::Configuration)?;
         Ok(Self {
             file,
             sha256: expected.into(),
-            lifetime: policy.max_approval_lifetime_ms,
+            lifetime,
         })
     }
     pub(super) fn check(&self) -> Result<(), ReceiverHold> {
@@ -80,9 +66,16 @@ impl Profile {
     }
 }
 fn read(file: &File) -> Result<Vec<u8>, ReceiverHold> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
     let before = file.metadata().map_err(|_| ReceiverHold::Journal)?;
-    if !before.is_file() || before.mode() & 0o277 != 0 || before.nlink() != 1 || before.len() > 4096
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if !before.is_file()
+        || before.uid() != 0
+        || before.mode() & 0o7777 != 0o400
+        || flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || before.nlink() != 1
+        || before.len() > 4096
     {
         return Err(ReceiverHold::Configuration);
     }
@@ -106,4 +99,59 @@ fn read(file: &File) -> Result<Vec<u8>, ReceiverHold> {
         return Err(ReceiverHold::ChangedState);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs::OpenOptions, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn policy_owner_must_be_actual_root_not_current_user() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner-policy");
+        let bytes = br#"{"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":100}"#;
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let result = Profile::open(File::open(path).unwrap(), &digest(bytes));
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(ReceiverHold::Configuration)));
+        }
+    }
+    #[test]
+    fn actual_expiry_descriptor_requires_root_readonly_exact_mode_and_retained_bytes() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("expiry");
+        let bytes = br#"{"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":100}"#;
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let expected = digest(bytes);
+        // This positive requires real UID 0 (qualified in a disposable user namespace).
+        let profile = Profile::open(File::open(&path).unwrap(), &expected).unwrap();
+        assert!(profile.check().is_ok());
+        assert!(Profile::open(File::open(&path).unwrap(), &"55".repeat(32)).is_err());
+        let writable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(matches!(
+            Profile::open(writable, &expected),
+            Err(ReceiverHold::Configuration)
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(profile.check(), Err(ReceiverHold::Configuration)));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::hard_link(&path, root.path().join("alias")).unwrap();
+        assert!(matches!(profile.check(), Err(ReceiverHold::Configuration)));
+        std::fs::remove_file(root.path().join("alias")).unwrap();
+        std::fs::write(&path, b"changed retained policy").unwrap();
+        assert!(matches!(profile.check(), Err(ReceiverHold::ChangedState)));
+    }
 }

@@ -216,6 +216,15 @@ async fn native_welcome_is_acked_only_after_original_join_is_in_anchored_chain()
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v3".into(),
+        expiry_profile_sha256: "66".repeat(32),
+        installation_index_sha256: "aa".repeat(32),
+        installation_source_sha256: "bb".repeat(32),
+        capability_template: crate::protected_capability_policy::routing_only_v1()
+            .id()
+            .into(),
+        capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+            .policy_sha256(),
         account: hex::encode(recipient.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: vec![hex::encode(inviter.as_slice())],
@@ -274,6 +283,15 @@ async fn wrong_join_provenance_pin_preserves_actual_native_pending_welcome() {
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v3".into(),
+        expiry_profile_sha256: "66".repeat(32),
+        installation_index_sha256: "aa".repeat(32),
+        installation_source_sha256: "bb".repeat(32),
+        capability_template: crate::protected_capability_policy::routing_only_v1()
+            .id()
+            .into(),
+        capability_policy_sha256: crate::protected_capability_policy::routing_only_v1()
+            .policy_sha256(),
         account: hex::encode(recipient.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: vec![hex::encode(inviter.as_slice())],
@@ -345,6 +363,7 @@ async fn enrolled_group_operator_and_keypackage_are_checked_before_durable_inten
             directory: original.directory.try_clone().unwrap(),
         };
         let expected = || JoinConstraint {
+            template: crate::protected_capability_policy::routing_only_v1(),
             group: group.clone(),
             operators: vec![operator.clone()],
             key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
@@ -407,6 +426,7 @@ async fn intent_io_failure_rolls_back_native_join_but_preserves_unknown() {
             wire.clone(),
             read_only,
             JoinConstraint {
+                template: crate::protected_capability_policy::routing_only_v1(),
                 group,
                 operators: vec![operator],
                 key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
@@ -471,6 +491,7 @@ async fn forged_nip59_giftwrap_does_not_spend_real_welcome_attempt() {
         directory: original.directory.try_clone().unwrap(),
     };
     let expected = || JoinConstraint {
+        template: crate::protected_capability_policy::routing_only_v1(),
         group: group.clone(),
         operators: vec![operator.clone()],
         key_package_ref: hex::decode(key_package_ref(&raw)).unwrap(),
