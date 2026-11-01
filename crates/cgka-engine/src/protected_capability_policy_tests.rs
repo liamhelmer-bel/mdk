@@ -93,6 +93,11 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
         };
         let mut recipient = client(bounded_app_receiver_v1());
         let mut native_control = client(bounded_app_receiver_v1());
+        let mut replay_control = client(bounded_app_receiver_v1());
+        let mut replay_kp = replay_control.fresh_key_package().await.unwrap();
+        replay_kp.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: cgka_traits::types::MessageId::new(vec![6; 32]),
+        });
         let mut control_kp = native_control.fresh_key_package().await.unwrap();
         control_kp.source = Some(cgka_traits::engine::KeyPackageSource {
             event_id: cgka_traits::types::MessageId::new(vec![5; 32]),
@@ -120,7 +125,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 CreateGroupRequest {
                     name: "bounded handling fixture".into(),
                     description: String::new(),
-                    members: vec![kp, control_kp],
+                    members: vec![kp, control_kp, replay_kp],
                     required_features: vec![],
                     initial_admins: vec![],
                     app_components: vec![
@@ -162,7 +167,9 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
         };
         let position=welcomes.iter().position(|w|matches!(&w.envelope,cgka_traits::TransportEnvelope::Welcome{recipient:r} if r==&recipient.self_id())).unwrap();
         let wire = welcomes.remove(position);
-        let control_wire = welcomes.remove(0);
+        let position = welcomes.iter().position(|w| matches!(&w.envelope, cgka_traits::TransportEnvelope::Welcome { recipient:r } if r == &native_control.self_id())).unwrap();
+        let control_wire = welcomes.remove(position);
+        let replay_wire = welcomes.remove(0);
         let root = tempfile::tempdir().unwrap();
         let original = OpenOptions::new()
             .create_new(true)
@@ -209,6 +216,24 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
                 .await
                 .unwrap();
             native_control.drain_events();
+            let replay_intent = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(root.path().join("replay-intent"))
+                .unwrap();
+            replay_control
+                .receiver_join_owned(
+                    replay_wire,
+                    JoinIntent {
+                        file: replay_intent,
+                        directory: File::open(root.path()).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            replay_control.drain_events();
             assert!(result.is_some());
             assert_eq!(
                 recipient.storage.list_groups().unwrap(),
@@ -317,11 +342,33 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             // Independently joined native control accepts the exact commit;
             // the protected receiver never retries its refused original.
             assert!(matches!(
-                native_control.ingest(commit).await.unwrap(),
+                native_control.ingest(commit.clone()).await.unwrap(),
                 cgka_traits::ingest::IngestOutcome::Buffered { .. }
             ));
-            // The ordinary engine uses its deterministic convergence tick;
-            // unlike the protected direct-update path it may adopt new policy.
+            // Replay the actual buffered commit under the enrolled policy.
+            // Refusal must roll back native group state and the durable row;
+            // an independently joined ordinary engine is the positive control.
+            assert!(matches!(
+                replay_control.ingest(commit).await.unwrap(),
+                cgka_traits::ingest::IngestOutcome::Buffered { .. }
+            ));
+            let control_before = replay_control.storage.get_group(&group).unwrap().epoch;
+            let mut replay_capture = crate::protected_merge::Capture::for_group(group.clone());
+            replay_capture.template = Some(bounded_app_receiver_v1());
+            replay_control.receiver_merge_capture = Some(replay_capture);
+            let _refused = replay_control
+                .advance_convergence_inputs_until_settled(&group, u64::MAX)
+                .await;
+            assert_eq!(
+                replay_control.storage.get_group(&group).unwrap().epoch,
+                control_before
+            );
+            replay_control
+                .with_mls_group(&group, |native| {
+                    bounded_app_receiver_v1().validate_group(native)
+                })
+                .unwrap();
+            // The ordinary engine may adopt the exact same native-valid policy.
             assert!(
                 native_control
                     .advance_convergence_inputs_until_settled(&group, u64::MAX)

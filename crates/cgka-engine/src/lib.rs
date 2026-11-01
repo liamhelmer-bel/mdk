@@ -67,7 +67,7 @@ pub mod openmls_projection;
 pub mod own_commit_intent;
 pub mod pending_commit_guard;
 pub mod protected_capability_policy;
-#[cfg(target_os="linux")]
+#[cfg(target_os = "linux")]
 pub mod protected_expiry_policy;
 #[allow(dead_code)]
 mod protected_receiver;

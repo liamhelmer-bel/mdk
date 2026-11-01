@@ -253,6 +253,7 @@ enum CandidatePathProbeResult {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReplayProfilePolicy {
     pub(crate) reject_legacy_group_additions: bool,
+    pub(crate) receiver_template: Option<crate::protected_capability_policy::Template>,
 }
 
 #[derive(Clone, Debug)]
@@ -4169,6 +4170,15 @@ fn process_openmls_messages_inner<S: StorageProvider>(
                     .map_err(|e| {
                         OpenMlsProjectionError::Replay(format!("merge_staged_commit: {e:?}"))
                     })?;
+                if let Some(template) = profile_policy.receiver_template {
+                    template.validate_group(&mls_group).map_err(|error| {
+                        OpenMlsProjectionError::InvalidCommit {
+                            message_id: message_id.clone(),
+                            reason: format!("protected receiver replayed state: {error}"),
+                            rejection_category: None,
+                        }
+                    })?;
+                }
                 epoch_authenticators.insert(
                     mls_group.epoch().as_u64(),
                     own_commit_post_merge_epoch_authenticator(&mls_group),

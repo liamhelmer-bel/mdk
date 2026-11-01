@@ -2637,6 +2637,10 @@ impl<S: StorageProvider> Engine<S> {
             crate::openmls_projection::ReplayProfilePolicy {
                 reject_legacy_group_additions: self.new_protocol_profile
                     == cgka_traits::group::ProtocolProfile::Current,
+                receiver_template: self
+                    .receiver_merge_capture
+                    .as_ref()
+                    .and_then(|capture| capture.template),
             },
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
         )
@@ -2680,6 +2684,10 @@ impl<S: StorageProvider> Engine<S> {
             crate::openmls_projection::ReplayProfilePolicy {
                 reject_legacy_group_additions: self.new_protocol_profile
                     == cgka_traits::group::ProtocolProfile::Current,
+                receiver_template: self
+                    .receiver_merge_capture
+                    .as_ref()
+                    .and_then(|capture| capture.template),
             },
             MAX_CANDIDATE_BRANCH_PEEL_CONTEXTS,
             &mut continuation,

@@ -46,6 +46,13 @@ fn inherited(fd: i32) -> Result<File, ReceiverHold> {
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
+fn claim_inherited_files() -> Result<[File; 15], ReceiverHold> {
+    (4..=18)
+        .map(inherited)
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| ReceiverHold::Configuration)
+}
 fn read(file: &File, limit: u64) -> Result<Vec<u8>, ReceiverHold> {
     owned_producer::read_retained(file, limit)
 }
@@ -113,8 +120,18 @@ pub(crate) fn entry() -> bool {
             .enrollment
             .check()
             .map_err(|_| ReceiverHold::Configuration)?;
+        if crate::protected_capability_policy::Template::from_policy(
+            &profile.enrollment.capability_template,
+            &profile.enrollment.capability_policy_sha256,
+        )
+        .map_err(|_| ReceiverHold::Configuration)?
+            != crate::protected_capability_policy::routing_only_v1()
+        {
+            return Err(ReceiverHold::Configuration);
+        }
         // Claim every inherited slot before Tokio can allocate epoll/eventfd into
         // a missing descriptor number. No runtime owns any of these slots yet.
+        let files = claim_inherited_files()?;
         let installation = profile
             .installation
             .verify()
@@ -131,11 +148,6 @@ pub(crate) fn entry() -> bool {
         {
             return Err(ReceiverHold::ChangedState);
         }
-        let files: [File; 15] = (4..=18)
-            .map(inherited)
-            .collect::<Result<Vec<_>, _>>()?
-            .try_into()
-            .map_err(|_| ReceiverHold::Configuration)?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -706,6 +718,45 @@ mod tests {
         assert!(write_frame(&mut receiver, &bytes).is_err());
         // Lost-return/write does not undo the durable native one-use consumption.
         assert!(factory.asks["ask3"].consumed);
+    }
+    #[test]
+    fn startup_claim_refuses_missing_slot_before_file_open_can_reuse_it() {
+        const CHILD: &str = "HETERODYNE_TEST_MISSING_STARTUP_FD";
+        if std::env::var_os(CHILD).is_some() {
+            // A fresh test subprocess owns these disposable descriptors only.
+            let source = File::open("/dev/null").unwrap();
+            let high = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
+            assert!(high >= 64);
+            drop(source);
+            for fd in 4..18 {
+                assert_eq!(unsafe { libc::dup2(high, fd) }, fd);
+            }
+            unsafe {
+                libc::close(18);
+            }
+            assert!(claim_inherited_files().is_err());
+            // Failed claiming dropped its partial ownership. A later open
+            // reuses a low slot, but cannot retrospectively make claim succeed.
+            let later = File::open("/dev/null").unwrap();
+            assert!(later.as_raw_fd() < 18);
+            assert_eq!(unsafe { libc::fcntl(18, libc::F_GETFD) }, -1);
+            drop(later);
+            for fd in 4..=18 {
+                assert_eq!(unsafe { libc::dup2(high, fd) }, fd);
+            }
+            let files = claim_inherited_files().unwrap();
+            assert_eq!(files.last().unwrap().as_raw_fd(), 18);
+            drop(files);
+            unsafe {
+                libc::close(high);
+            }
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "protected_receiver::semantic::owned_runtime::tests::startup_claim_refuses_missing_slot_before_file_open_can_reuse_it", "--nocapture"])
+            .env(CHILD, "1")
+            .status().unwrap();
+        assert!(status.success());
     }
     #[test]
     fn actual_kernel_peer_identity_and_socket_kind_are_required() {
