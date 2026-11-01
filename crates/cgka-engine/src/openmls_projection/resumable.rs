@@ -370,6 +370,10 @@ pub(crate) struct CanonicalReplay {
 
 #[cfg(test)]
 impl CanonicalReplay {
+    #[cfg(test)]
+    pub(super) fn retained_profile_for_test(&self) -> ReplayProfilePolicy {
+        self.profile_policy
+    }
     pub(super) fn completed_probes(&self) -> u64 {
         self.budget.consumed
     }
@@ -427,8 +431,7 @@ pub(crate) fn canonicalize_stored_slice<S: StorageProvider>(
         w.source == source
             && w.pass_generation == pass_generation
             && w.policy == policy
-            && w.profile_policy.reject_legacy_group_additions
-                == options.replay_profile.reject_legacy_group_additions
+            && w.profile_policy == options.replay_profile
             && w.admit_app_witnesses == options.admit_app_witnesses
             && w.budget_override == options.replay_probe_budget_override
     }) {
@@ -592,6 +595,13 @@ pub(crate) struct PeelReplay {
     budget: ReplayBudget,
 }
 
+#[cfg(test)]
+impl PeelReplay {
+    pub(super) fn retained_profile_for_test(&self) -> ReplayProfilePolicy {
+        self.profile_policy
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn candidate_peel_slice<S: StorageProvider>(
     storage: &S,
@@ -639,8 +649,7 @@ pub(crate) fn candidate_peel_slice<S: StorageProvider>(
         w.source == source
             && w.max_rewind == max_rewind
             && w.max_contexts == max_contexts
-            && w.profile_policy.reject_legacy_group_additions
-                == profile_policy.reject_legacy_group_additions
+            && w.profile_policy == profile_policy
     }) {
         Some(work) => work,
         None => PeelReplay {

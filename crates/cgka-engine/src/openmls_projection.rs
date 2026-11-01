@@ -250,10 +250,25 @@ enum CandidatePathProbeResult {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ReplayProfilePolicy {
     pub(crate) reject_legacy_group_additions: bool,
     pub(crate) receiver_template: Option<crate::protected_capability_policy::Template>,
+}
+
+impl ReplayProfilePolicy {
+    pub(crate) fn for_group(
+        reject_legacy_group_additions: bool,
+        capture: Option<&crate::protected_merge::Capture>,
+        group: &GroupId,
+    ) -> Self {
+        Self {
+            reject_legacy_group_additions,
+            receiver_template: capture
+                .filter(|capture| capture.requested_group.as_ref() == Some(group))
+                .and_then(|capture| capture.template),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

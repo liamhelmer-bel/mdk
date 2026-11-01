@@ -213,14 +213,11 @@ impl<S: StorageProvider> Engine<S> {
         let policy = self
             .convergence_policy_for_group(group_id)
             .map_err(replay_error)?;
-        let profile = ReplayProfilePolicy {
-            reject_legacy_group_additions: self.new_protocol_profile
-                == cgka_traits::group::ProtocolProfile::Current,
-            receiver_template: self
-                .receiver_merge_capture
-                .as_ref()
-                .and_then(|capture| capture.template),
-        };
+        let profile = ReplayProfilePolicy::for_group(
+            self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current,
+            self.receiver_merge_capture.as_ref(),
+            group_id,
+        );
         for (index, message) in messages.into_iter().enumerate() {
             if index != 0 && execution.exhausted() {
                 break;

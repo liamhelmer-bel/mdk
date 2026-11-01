@@ -617,6 +617,194 @@ fn reconstruction_state(epoch: u64) -> super::CanonicalizationState {
 }
 
 #[tokio::test]
+async fn retained_replay_restarts_when_receiver_template_changes() {
+    let (_root, storage, group_id, messages) =
+        encrypted_replay_graph_fixture_with_apps(10, 4, 3, true).await;
+    let mut observer = EngineBuilder::new(storage.clone())
+        .identity(member_id(b"transaction-observer").as_slice().to_vec())
+        .account_identity_proof_signer(Arc::new(SeedProofSigner(signing_key(
+            b"transaction-observer",
+        ))))
+        .peeler(Box::new(PassthroughPeeler))
+        .build()
+        .unwrap();
+    observer.hydrate_all_stored_groups().unwrap();
+    let SendResult::GroupEvolution { pending, .. } = observer
+        .send(SendIntent::SelfUpdate {
+            group_id: group_id.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("own checkpoint update")
+    };
+    observer.confirm_published(pending).await.unwrap();
+    for message in &messages {
+        admit_rival(
+            &storage,
+            &group_id,
+            message,
+            super::project_mls_message(&message.payload)
+                .unwrap()
+                .source_epoch
+                .unwrap(),
+        );
+    }
+    let before = replay_state(&storage, &group_id);
+    let tip = storage.get_group(&group_id).unwrap().epoch.0;
+    let guarded = ReplayProfilePolicy {
+        receiver_template: Some(crate::protected_capability_policy::bounded_app_receiver_v1()),
+        ..Default::default()
+    };
+    let expected = super::canonicalize_stored_openmls_messages_with_profile_policy(
+        &storage,
+        &group_id,
+        reconstruction_state(tip),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+        super::StoredCanonicalizationOptions {
+            replay_profile: guarded,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut slot = None;
+    let first = super::canonicalize_stored_slice(
+        &storage,
+        &group_id,
+        reconstruction_state(tip),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+        Default::default(),
+        1,
+        &mut slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(
+        first.is_none() && slot.is_some(),
+        "retain actual unguarded continuation"
+    );
+    let pending = super::canonicalize_stored_slice(
+        &storage,
+        &group_id,
+        reconstruction_state(tip),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+        super::StoredCanonicalizationOptions {
+            replay_profile: guarded,
+            ..Default::default()
+        },
+        1,
+        &mut slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(pending.is_none());
+    assert_eq!(slot.as_ref().unwrap().retained_profile_for_test(), guarded);
+    let resumed = super::canonicalize_stored_slice(
+        &storage,
+        &group_id,
+        reconstruction_state(tip),
+        vec![],
+        super::CanonicalizationPolicy::default(),
+        100_000,
+        super::StoredCanonicalizationOptions {
+            replay_profile: guarded,
+            ..Default::default()
+        },
+        1,
+        &mut slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            usize::MAX,
+        ),
+    )
+    .unwrap()
+    .expect("complete guarded reconstruction");
+    assert!(
+        resumed == expected,
+        "old unguarded work must not survive policy change"
+    );
+    assert!(slot.is_none());
+    assert!(replay_state(&storage, &group_id) == before);
+
+    let mut peel_slot = None;
+    let first = super::candidate_peel_slice(
+        &storage,
+        &group_id,
+        0,
+        64,
+        Default::default(),
+        8,
+        &mut peel_slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(
+        first.is_none() && peel_slot.is_some(),
+        "retain actual unguarded peel"
+    );
+    let pending = super::candidate_peel_slice(
+        &storage,
+        &group_id,
+        0,
+        64,
+        guarded,
+        8,
+        &mut peel_slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            1,
+        ),
+    )
+    .unwrap();
+    assert!(pending.is_none());
+    assert_eq!(
+        peel_slot.as_ref().unwrap().retained_profile_for_test(),
+        guarded
+    );
+    let expected = candidate_branch_peel(&storage, &group_id, 0, 64, guarded, 8).unwrap();
+    let resumed = super::candidate_peel_slice(
+        &storage,
+        &group_id,
+        0,
+        64,
+        guarded,
+        8,
+        &mut peel_slot,
+        &mut super::ReplaySlice::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            usize::MAX,
+        ),
+    )
+    .unwrap()
+    .expect("complete guarded peel");
+    assert_eq!(resumed.replay_probe_count, expected.replay_probe_count);
+    assert_eq!(resumed.contexts.len(), expected.contexts.len());
+    for (actual, expected) in resumed.contexts.iter().zip(&expected.contexts) {
+        assert!(
+            actual.branch_id == expected.branch_id
+                && actual.tip_epoch == expected.tip_epoch
+                && actual.context == expected.context
+        );
+    }
+    assert!(replay_state(&storage, &group_id) == before);
+}
+
+#[tokio::test]
 async fn resumable_selection_and_peeling_restore_historical_state_and_match_complete_results() {
     use cgka_traits::storage::OutboundIntentStorage;
     let (_root, storage, group_id, messages) =

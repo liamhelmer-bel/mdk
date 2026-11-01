@@ -1311,14 +1311,11 @@ impl<S: StorageProvider> Engine<S> {
                 error_kind: None,
             },
         );
-        let replay_profile_policy = ReplayProfilePolicy {
-            reject_legacy_group_additions: self.new_protocol_profile
-                == cgka_traits::group::ProtocolProfile::Current,
-            receiver_template: self
-                .receiver_merge_capture
-                .as_ref()
-                .and_then(|capture| capture.template),
-        };
+        let replay_profile_policy = ReplayProfilePolicy::for_group(
+            self.new_protocol_profile == cgka_traits::group::ProtocolProfile::Current,
+            self.receiver_merge_capture.as_ref(),
+            group_id,
+        );
         let admitted_message_ids: Vec<MessageId> = pass
             .members
             .iter()

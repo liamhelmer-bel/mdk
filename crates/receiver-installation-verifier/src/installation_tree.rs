@@ -158,7 +158,8 @@ impl Walk {
         if before.mode & libc::S_IFMT != libc::S_IFDIR
             || before.uid != 0
             || before.gid != 0
-            || before.mode & 0o7777 != 0o755
+            || !matches!(before.mode & 0o7777, 0o555 | 0o755)
+            || (prefix.is_empty() && before.mode & 0o7777 != 0o755)
             || mount_id(directory)? != self.mount
         {
             return Err(Error::Path);
@@ -577,9 +578,12 @@ impl Index {
         }
         // Every directory is synced after its children, including empty ones.
         for entry in self.entries.iter().rev().filter(|e| e[1] == "directory") {
-            open_relative(destination, entry[0].as_str().ok_or(Error::Encoding)?)?
-                .sync_all()
-                .map_err(|_| Error::Path)?;
+            let directory = open_relative(destination, entry[0].as_str().ok_or(Error::Encoding)?)?;
+            let mode = entry[2].as_u64().ok_or(Error::Encoding)? as libc::mode_t;
+            if unsafe { libc::fchmod(directory.as_raw_fd(), mode) } != 0 {
+                return Err(Error::Path);
+            }
+            directory.sync_all().map_err(|_| Error::Path)?;
         }
         if unsafe { libc::fchmod(destination.as_raw_fd(), 0o755) } != 0 {
             return Err(Error::Path);
