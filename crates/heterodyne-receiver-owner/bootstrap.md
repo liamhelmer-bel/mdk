@@ -103,7 +103,7 @@ stdout. It never copies, adopts, deletes or publishes a candidate.
    complete ELF graph. Index generation alone does not qualify the OS baseline.
 3. Under root's exclusive install procedure, copy that exact candidate to
    `/opt/heterodyne-receiver/releases/<index-sha256>` and the index to its
-   `installation-index.json`, root:root0400, single link. Do not alter the tree
+   `installation-index.json`, root:root0444, single link. Do not alter the tree
    after generating the index. Preserve original candidate/index evidence.
 4. Supply canonical request JSON with exactly these operational selections:
    `request_sha256`, `storage_generation`, `group` (actual native MLS hex), sorted
