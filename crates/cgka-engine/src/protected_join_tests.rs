@@ -216,6 +216,8 @@ async fn native_welcome_is_acked_only_after_original_join_is_in_anchored_chain()
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: "66".repeat(32),
         account: hex::encode(recipient.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: vec![hex::encode(inviter.as_slice())],
@@ -274,6 +276,8 @@ async fn wrong_join_provenance_pin_preserves_actual_native_pending_welcome() {
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: "66".repeat(32),
         account: hex::encode(recipient.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: vec![hex::encode(inviter.as_slice())],

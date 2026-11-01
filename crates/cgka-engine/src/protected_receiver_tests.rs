@@ -865,6 +865,8 @@ pub(super) fn ordered_fixture_profile(
         .with_mls_group(group, crate::protected_merge::Projection::read)
         .unwrap();
     let enrollment = Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: profile,
         account: hex::encode(engine.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: operators
@@ -873,7 +875,7 @@ pub(super) fn ordered_fixture_profile(
             .collect(),
         // Synthetic installation and welcome pins: these tests qualify actual
         // native/journal mechanics, not a production enrollment or custody.
-        source_profile_sha256: profile,
+        source_profile_sha256: "55".repeat(32),
         storage_generation: "66".repeat(32),
         initial_native_state_sha256: hex::encode(Sha256::digest(
             serde_json::to_vec(&projection).unwrap(),

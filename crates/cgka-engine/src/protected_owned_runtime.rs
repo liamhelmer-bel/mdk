@@ -100,7 +100,7 @@ pub(crate) fn entry() -> bool {
         }
         let raw = read(&profile_file, 65536)?;
         let profile: Profile = serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
-        if profile.schema != "heterodyne-protected-receiver-process.v1"
+        if profile.schema != "heterodyne-protected-receiver-process.v2"
             || profile.receiver_uid != unsafe { libc::geteuid() }
             || profile.consumer_uid == 0
             || profile.consumer_uid == profile.receiver_uid
@@ -109,6 +109,10 @@ pub(crate) fn entry() -> bool {
         {
             return Err(ReceiverHold::Configuration);
         }
+        profile
+            .enrollment
+            .check()
+            .map_err(|_| ReceiverHold::Configuration)?;
         // Claim every inherited slot before Tokio can allocate epoll/eventfd into
         // a missing descriptor number. No runtime owns any of these slots yet.
         let files: [File; 15] = (4..=18)
@@ -126,8 +130,10 @@ pub(crate) fn entry() -> bool {
     result.is_ok()
 }
 async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result<(), ReceiverHold> {
-    let enrollment_sha =
-        digest(&serde_json::to_vec(&profile.enrollment).map_err(|_| ReceiverHold::Malformed)?);
+    let enrollment_sha = profile
+        .enrollment
+        .canonical_sha256()
+        .map_err(|_| ReceiverHold::Configuration)?;
     let closure_sha = digest(
         &serde_json::to_vec(&profile.producer_closure).map_err(|_| ReceiverHold::Malformed)?,
     );
@@ -185,7 +191,9 @@ async fn run(profile: Profile, profile_sha: String, files: [File; 15]) -> Result
         &profile.enrollment,
     )
     .map_err(|_| ReceiverHold::Journal)?;
-    let journal_sha = journal.profile_hash().map_err(|_| ReceiverHold::Journal)?;
+    let journal_sha = journal
+        .fresh_source_profile_hash()
+        .map_err(|_| ReceiverHold::Journal)?;
     // Fixed basename under the retained protected directory, never a packet path.
     let db_path = PathBuf::from(format!(
         "/proc/self/fd/{}/account.sqlite3",

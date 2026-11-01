@@ -51,7 +51,7 @@ impl NostrRelayClient for Relay {
         Ok(NostrPublishOutcome::accepted(endpoints.to_vec()))
     }
 }
-fn client(seed: &[u8]) -> Engine<SqliteAccountStorage> {
+pub(super) fn client(seed: &[u8]) -> Engine<SqliteAccountStorage> {
     let (engine, _) = build_client(seed);
     // Reuse actual Engine identity/signature fixture, but real kind-445/NIP59 peeler.
     let storage = engine.storage.clone();
@@ -1017,10 +1017,12 @@ async fn fresh_recovery_factory() -> (
     )
     .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: digest(&profile),
         account: hex::encode(controller.self_id().as_slice()),
         group: hex::encode(group.as_slice()),
         operators: vec![hex::encode(operator.self_id().as_slice())],
-        source_profile_sha256: digest(&profile),
+        source_profile_sha256: "55".repeat(32),
         storage_generation: "66".repeat(32),
         initial_native_state_sha256: digest(&serde_json::to_vec(&join.joined).unwrap()),
         welcome_provenance_sha256: join.digest().unwrap(),

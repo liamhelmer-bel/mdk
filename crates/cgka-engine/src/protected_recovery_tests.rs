@@ -26,9 +26,11 @@ fn files(root: &Path) -> OwnedFiles {
 }
 fn enrollment() -> Enrollment {
     Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: "66".repeat(32),
         account: "11".repeat(32),
         group: "22".repeat(32),
-        operators: vec!["44".repeat(32), "33".repeat(32)],
+        operators: vec!["33".repeat(32), "44".repeat(32)],
         source_profile_sha256: "55".repeat(32),
         storage_generation: "66".repeat(32),
         initial_native_state_sha256: "77".repeat(32),
@@ -120,8 +122,10 @@ fn duplicate_operator_rejected_and_order_is_canonical_but_changed_profile_holds(
     drop(journal);
     let mut reversed = enrollment();
     reversed.operators.reverse();
-    let journal = Journal::reopen(files(root.path()), &reversed).unwrap();
-    drop(journal);
+    assert!(matches!(
+        Journal::reopen(files(root.path()), &reversed),
+        Err(Hold::Changed)
+    ));
     reversed.source_profile_sha256 = "ff".repeat(32);
     assert!(matches!(
         Journal::reopen(files(root.path()), &reversed),
@@ -433,4 +437,106 @@ fn consumed_export_key_is_native_anchored_generation_bound_and_survives_reopen()
     assert!(b.write(Body::Consumed { key: current }).is_err());
     b.latched = true;
     assert!(b.consumed_key("ask3", &"aa".repeat(32)).is_err());
+}
+
+#[test]
+fn v2_enrollment_canonical_digest_and_distinct_profile_pins_are_exact() {
+    let enrolled = enrollment();
+    let bytes = serde_json::to_vec(&enrolled).unwrap();
+    assert!(
+        std::str::from_utf8(&bytes)
+            .unwrap()
+            .starts_with("{\"schema\":\"heterodyne-receiver-enrollment.v2\",\"account\":")
+    );
+    assert_eq!(
+        enrolled.canonical_sha256().unwrap(),
+        hex::encode(Sha256::digest(&bytes))
+    );
+    let mut object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let reparsed: Enrollment = serde_json::from_value(object.clone()).unwrap();
+    assert_eq!(
+        enrolled.canonical_sha256().unwrap(),
+        reparsed.canonical_sha256().unwrap()
+    );
+    object["schema"] = serde_json::json!("heterodyne-receiver-enrollment.v1");
+    assert!(
+        serde_json::from_value::<Enrollment>(object)
+            .unwrap()
+            .canonical_sha256()
+            .is_err()
+    );
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = Journal::enroll(files(root.path()), enrolled.clone()).unwrap();
+    assert_eq!(
+        journal.fresh_source_profile_hash().unwrap(),
+        enrolled.source_profile_sha256
+    );
+    assert_eq!(
+        journal.expiry_profile_hash().unwrap(),
+        enrolled.expiry_profile_sha256
+    );
+    let bytes = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    assert!(matches!(
+        journal.write(Body::HeaderV2 {
+            enrollment: enrolled,
+            generation: "aa".repeat(32)
+        }),
+        Err(Hold::Changed)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn well_formed_v1_header_is_refused_without_migrating_either_retained_file() {
+    let root = tempfile::tempdir().unwrap();
+    let mut files = files(root.path());
+    let e = enrollment();
+    let legacy = LegacyEnrollment {
+        account: e.account.clone(),
+        group: e.group.clone(),
+        operators: e.operators.clone(),
+        source_profile_sha256: e.source_profile_sha256.clone(),
+        storage_generation: e.storage_generation.clone(),
+        initial_native_state_sha256: e.initial_native_state_sha256.clone(),
+        welcome_provenance_sha256: e.welcome_provenance_sha256.clone(),
+    };
+    let mut record = Record {
+        sequence: 1,
+        previous_sha256: String::new(),
+        local_unix_ms: now().unwrap(),
+        body: Body::Header {
+            enrollment: legacy,
+            generation: "aa".repeat(32),
+        },
+        sha256: String::new(),
+    };
+    record.sha256 = record_digest(&record).unwrap();
+    let mut anchor = Anchor {
+        sequence: 1,
+        journal_sha256: record.sha256.clone(),
+        previous_anchor_sha256: String::new(),
+        use_key: None,
+        sha256: String::new(),
+    };
+    anchor.sha256 = anchor_digest(&anchor).unwrap();
+    append(&mut files.journal, &record).unwrap();
+    append(&mut files.anchor, &anchor).unwrap();
+    drop(files);
+    let before_journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let before_anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    assert!(matches!(
+        Journal::reopen(self::files(root.path()), &e),
+        Err(Hold::Changed)
+    ));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        before_journal
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+        before_anchor
+    );
 }

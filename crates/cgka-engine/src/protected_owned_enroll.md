@@ -15,20 +15,27 @@ directory; 8 storage lease; 9 fresh empty anchor; 10 anchor directory; 11
 exclusive fresh empty join intent; 12 intent directory; 13 existing protected
 account directory; 14 connected authenticated Unix consumer; 15 private
 ephemeral cache directory on a different filesystem from every durable journal,
-anchor, intent and account file/directory. Keys are
+anchor, intent and account file/directory; 16 root-owned read-only mode0400
+expiry policy. Keys are
 exact32bytes in read-only mode0400 files. The account database must already
 exist mode0600 with receiver owner under its mode0700 directory, contain native
 KeyPackage provisioning, and have no groups or pending application events. This
 entry does not provision an account, publish KeyPackages, create an invite or
 enroll historical joins.
 
-Schema `heterodyne-protected-receiver-fresh.v1` has only `receiver_uid`,
+Schema `heterodyne-protected-receiver-fresh.v2` has only `receiver_uid`,
 `consumer_uid`, `account`, `group`, `operators`, `storage_generation`,
-`key_package_ref`, `endpoints`, `wait_seconds` and `schema`.
+`key_package_ref`, `endpoints`, `wait_seconds`, `expiry_profile_sha256` and `schema`.
 Account/generation/operator hashes and group encoding reuse existing native
 validation; duplicates/self operators refuse. Consumer UID must be nonzero and
 distinct from the receiver UID. Exact original profile bytes determine
-source_profile_sha256. The root publisher must retain those bytes and enforce
+source_profile_sha256. The separate expiry_profile_sha256 pins exact
+`heterodyne-receiver-expiry.v1` policy bytes from FD16; it never replaces fresh
+provenance. Both retained descriptors are checked before Tokio and immediately
+before each native Welcome attempt. Their bytes are checked again only after
+successful native join has completed durable enrollment: a mismatch emits HOLD
+while preserving that account/header. No new policy guard may interrupt the
+native-commit to durable-header sequence. The root publisher must retain those bytes and enforce
 actual policy/enrollment custody. No publisher is installed.
 
 All slots are owned before Tokio allocates descriptors. The storage lease is
@@ -78,8 +85,8 @@ look empty.
 
 The consumer sends32 fresh nonce bytes on the kernel-checked Unix stream. After
 positive native enrollment, the response is the same bounded u32-BE framed
-compact JSON with schema `heterodyne-owned-fresh-enrollment.v1`, nonce_hex,
-startup_profile_sha256, actual derived enrollment, actual header_record,
+compact JSON with schema `heterodyne-owned-fresh-enrollment.v2`, nonce_hex,
+startup_profile_sha256, canonical enrollment_sha256, actual derived enrollment, actual header_record,
 header_sha256 and actual journal checkpoint. It is an enrollment correlation
 response, not approval or deployment permission. Errors during the actual
 Welcome exchange attempt a distinct `heterodyne-owned-fresh-enrollment-hold.v1`
@@ -128,3 +135,38 @@ not an installed SDK/Unix/SQLCipher end-to-end enrollment qualification. Native
 backend failures during rollbackable foreign-Welcome processing still HOLD;
 they are never relabeled as positively rejected input. The cache isolation is
 not a space reservation, and out-of-space or durability faults still HOLD.
+
+
+## Version 2 expiry and compatibility
+
+The first journal body is exclusively `header-v2`, containing closed
+`heterodyne-receiver-enrollment.v2`. Its canonical compact UTF-8 JSON field order
+is schema, account, group, operators, source_profile_sha256, storage_generation,
+initial_native_state_sha256, welcome_provenance_sha256, expiry_profile_sha256.
+Operators are sorted unique lowercase keys; reopening refuses noncanonical input.
+The canonical enrollment digest is ordinary SHA256 over this serialization, not
+the journal's domain-separated record digest. Normal process startup is
+`heterodyne-protected-receiver-process.v2`, retaining its existing FD3–18 layout;
+FD11 supplies the same exact expiry policy. Fresh-source and expiry accessors are
+separate. A fresh profile is not available during normal reopening and therefore
+its original-byte digest cannot be independently rehashed there; the protected
+publisher/consumer retains that original provenance association.
+
+The shared expiry reader requires actual UID0 ownership, exact mode0400,
+O_RDONLY, one regular-file link, at most4096bytes, and stable device/inode/size/
+mtime/ctime over the full read. A changed policy is never adopted in-place.
+Expiry remains the minimum of the actual operation outage deadline and the
+original retained ask time plus enrolled lifetime; receipt/restart time cannot
+extend it. Old fresh/process v1 inputs, legacy headers, mixed records and late
+headers refuse. Existing prepared or UNKNOWN bytes are never migrated, rewritten
+or promoted to a new enrollment.
+
+The causal v2 tests run in a disposable Linux user namespace (`unshare --user
+--map-root-user`) so the same production UID0 descriptor checks apply. They
+exercise actual native routed Welcome→durable v2 enrollment→reopen→finite ask→
+real operator MLS reply→one-use consumption, and changes before native intent
+versus after native commit. Relay publication acknowledgment and protected
+custody remain fixture-selected; this is not a no-argument installed-entry,
+whole Product producer, host enrollment or deployment qualification. Separate
+root-publisher, anchor custody, account initializer and finite bootstrap slices
+remain independent prerequisites; this patch does not install them.

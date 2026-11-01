@@ -4,7 +4,7 @@ use crate::protected_join::{JoinConstraint, JoinEvidence, JoinIntent};
 use crate::protected_receiver::ReceiverJournal;
 use cgka_traits::TransportEnvelope;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FreshProfile {
     schema: String,
@@ -19,12 +19,13 @@ struct FreshProfile {
     key_package_ref: String,
     endpoints: Vec<TransportEndpoint>,
     wait_seconds: u32,
+    expiry_profile_sha256: String,
 }
 
 impl FreshProfile {
     fn check(&self) -> Result<(), ReceiverHold> {
         use cgka_traits::reporting::event_id_is_valid;
-        if self.schema != "heterodyne-protected-receiver-fresh.v1"
+        if self.schema != "heterodyne-protected-receiver-fresh.v2"
             || self.receiver_uid != unsafe { libc::geteuid() }
             || self.consumer_uid == 0
             || self.consumer_uid == self.receiver_uid
@@ -33,6 +34,7 @@ impl FreshProfile {
             || self.endpoints.is_empty()
             || !crate::protected_recovery::valid_group(&self.group)
             || !event_id_is_valid(&self.account)
+            || !event_id_is_valid(&self.expiry_profile_sha256)
             || !event_id_is_valid(&self.storage_generation)
             || !event_id_is_valid(&self.key_package_ref)
             || self.operators.is_empty()
@@ -54,6 +56,42 @@ impl FreshProfile {
     }
 }
 
+/// Retained original startup bytes and separately pinned concrete expiry policy.
+struct FreshBinding {
+    source: File,
+    source_sha256: String,
+    expiry: expiry::Profile,
+}
+impl FreshBinding {
+    fn new(
+        source: File,
+        expiry: File,
+        profile: &FreshProfile,
+        source_sha256: String,
+    ) -> Result<Self, ReceiverHold> {
+        let bound = Self {
+            source,
+            source_sha256,
+            expiry: expiry::Profile::open(expiry, &profile.expiry_profile_sha256)?,
+        };
+        bound.check()?;
+        Ok(bound)
+    }
+    fn check(&self) -> Result<(), ReceiverHold> {
+        if self
+            .source
+            .metadata()
+            .map_err(|_| ReceiverHold::Configuration)?
+            .uid()
+            != 0
+            || digest(&read(&self.source, 65536)?) != self.source_sha256
+        {
+            return Err(ReceiverHold::ChangedState);
+        }
+        self.expiry.check()
+    }
+}
+
 pub(super) fn entry() -> bool {
     if std::env::args_os().count() != 1 {
         return false;
@@ -72,17 +110,18 @@ pub(super) fn entry() -> bool {
         let profile: FreshProfile =
             serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         profile.check()?;
-        let files: [File; 12] = (4..=15)
-            .map(inherited)
-            .collect::<Result<Vec<_>, _>>()?
+        let mut claimed = (4..=16).map(inherited).collect::<Result<Vec<_>, _>>()?;
+        let expiry = claimed.pop().ok_or(ReceiverHold::Configuration)?;
+        let files: [File; 12] = claimed
             .try_into()
             .map_err(|_| ReceiverHold::Configuration)?;
+        let binding = FreshBinding::new(profile_file, expiry, &profile, digest(&raw))?;
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|_| ReceiverHold::Engine)?;
-        rt.block_on(run(profile, digest(&raw), files))
+        rt.block_on(run(profile, digest(&raw), files, binding))
     })()
     .is_ok()
 }
@@ -176,10 +215,14 @@ fn enroll_joined<S: StorageProvider + 'static>(
     if evidence.group != group {
         return Err(ReceiverHold::ChangedState);
     }
+    let mut canonical_operators = profile.operators.clone();
+    canonical_operators.sort();
     let enrollment = Enrollment {
+        schema: Enrollment::SCHEMA.into(),
+        expiry_profile_sha256: profile.expiry_profile_sha256.clone(),
         account: profile.account.clone(),
         group: profile.group.clone(),
-        operators: profile.operators.clone(),
+        operators: canonical_operators,
         source_profile_sha256: profile_sha.to_owned(),
         storage_generation: profile.storage_generation.clone(),
         initial_native_state_sha256: digest(
@@ -195,6 +238,7 @@ async fn run(
     profile: FreshProfile,
     profile_sha: String,
     files: [File; 12],
+    binding: FreshBinding,
 ) -> Result<(), ReceiverHold> {
     let [
         key_file,
@@ -318,19 +362,22 @@ async fn run(
             if let Ok(delivery) = tokio::time::timeout_at(wait, adapter.receive()).await {
                 let Some(delivery) = delivery.map_err(|_| ReceiverHold::Engine)? else { return Err(ReceiverHold::Engine); };
                 if delivery.account_id != engine.self_id() { return Err(ReceiverHold::ChangedState); }
-                if let Some(evidence) = attempt_welcome(&mut engine, &profile, &intent, delivery.message).await? {
+                if let Some(evidence) = attempt_welcome(&mut engine, &profile, &intent, &binding, delivery.message).await? {
                     break evidence;
                 }
             }
         };
         let receiver = enroll_joined(engine, &profile, &profile_sha, files, evidence)?;
+        // Never insert a new guard between native commit and durable enrollment.
+        // A post-header mismatch preserves that enrollment and emits HOLD.
+        binding.check()?;
         // Enrollment is already durable; relay lifetime no longer determines it.
         let ReceiverJournal::Ordered(journal) = &receiver.journal else { return Err(ReceiverHold::Journal); };
         let enrolled = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
         let header = journal.source_at(1).map_err(|_| ReceiverHold::Journal)?;
         let output = serde_json::to_vec(&serde_json::json!({
-            "schema":"heterodyne-owned-fresh-enrollment.v1", "nonce_hex":hex::encode(nonce),
-            "startup_profile_sha256":profile_sha,"enrollment":enrolled,
+            "schema":"heterodyne-owned-fresh-enrollment.v2", "nonce_hex":hex::encode(nonce),
+            "startup_profile_sha256":profile_sha,"enrollment_sha256":enrolled.canonical_sha256().map_err(|_| ReceiverHold::Malformed)?,"enrollment":enrolled,
             "header_record":header.body,"header_sha256":journal.header_digest().map_err(|_| ReceiverHold::Journal)?,"checkpoint":journal.checkpoint(),
         })).map_err(|_| ReceiverHold::Malformed)?;
         write_frame(&mut peer,&output)?;
@@ -363,12 +410,14 @@ async fn attempt_welcome<S: StorageProvider + 'static>(
     engine: &mut crate::Engine<S>,
     profile: &FreshProfile,
     intent: &JoinIntent,
+    binding: &FreshBinding,
     wire: cgka_traits::TransportMessage,
 ) -> Result<Option<JoinEvidence>, ReceiverHold> {
     if !matches!(&wire.envelope, TransportEnvelope::Welcome {recipient} if recipient == &engine.self_id())
     {
         return Ok(None);
     }
+    binding.check()?;
     let attempt = JoinIntent {
         file: intent.file.try_clone().map_err(|_| ReceiverHold::Journal)?,
         directory: intent
@@ -458,16 +507,39 @@ mod tests {
     use crate::protected_join::tests::{intent, invitation, recovery_files};
     use cgka_traits::{GroupStorage, MessageStorage};
 
+    fn binding(root: &std::path::Path, p: &mut FreshProfile) -> FreshBinding {
+        use std::os::unix::fs::PermissionsExt;
+        let bytes =
+            br#"{"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":60000}"#;
+        p.expiry_profile_sha256 = digest(bytes);
+        let source = root.join("fresh-profile");
+        let policy = root.join("expiry-profile");
+        std::fs::write(&source, serde_json::to_vec(p).unwrap()).unwrap();
+        std::fs::write(&policy, bytes).unwrap();
+        for path in [&source, &policy] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let sha = digest(&std::fs::read(&source).unwrap());
+        FreshBinding::new(
+            File::open(source).unwrap(),
+            File::open(policy).unwrap(),
+            p,
+            sha,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn actual_loop_attempt_rejects_oversized_input_then_accepts_native_welcome() {
         let (mut engine, storage, wire, group, operator) = invitation().await;
-        let p = profile(&engine, &group, &operator, &wire);
+        let mut p = profile(&engine, &group, &operator, &wire);
         let root = tempfile::tempdir().unwrap();
+        let binding = binding(root.path(), &mut p);
         let intent = intent(root.path());
         let mut oversized = wire.clone();
         oversized.payload = vec![255; 400_000];
         assert!(
-            attempt_welcome(&mut engine, &p, &intent, oversized)
+            attempt_welcome(&mut engine, &p, &intent, &binding, oversized)
                 .await
                 .unwrap()
                 .is_none()
@@ -475,12 +547,204 @@ mod tests {
         assert!(storage.list_groups().unwrap().is_empty());
         assert_eq!(intent.file.metadata().unwrap().len(), 0);
         assert!(
-            attempt_welcome(&mut engine, &p, &intent, wire)
+            attempt_welcome(&mut engine, &p, &intent, &binding, wire)
                 .await
                 .unwrap()
                 .is_some()
         );
         assert_eq!(storage.list_groups().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn changed_retained_policy_or_source_refuses_before_native_intent() {
+        for name in ["fresh-profile", "expiry-profile"] {
+            let (mut engine, storage, wire, group, operator) = invitation().await;
+            let root = tempfile::tempdir().unwrap();
+            let mut p = profile(&engine, &group, &operator, &wire);
+            let binding = binding(root.path(), &mut p);
+            let intent = intent(root.path());
+            // Mutation after initial startup validation, during the Welcome wait.
+            std::fs::write(root.path().join(name), b"changed retained bytes").unwrap();
+            assert!(matches!(
+                attempt_welcome(&mut engine, &p, &intent, &binding, wire).await,
+                Err(ReceiverHold::ChangedState)
+            ));
+            assert!(storage.list_groups().unwrap().is_empty());
+            assert_eq!(intent.file.metadata().unwrap().len(), 0);
+            assert!(
+                storage
+                    .list_pending_application_events()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_change_after_native_commit_preserves_durable_v2_header_and_holds() {
+        let (mut engine, storage, wire, group, operator) = invitation().await;
+        let root = tempfile::tempdir().unwrap();
+        let mut p = profile(&engine, &group, &operator, &wire);
+        let binding = binding(root.path(), &mut p);
+        let files = Journal::prepare_fresh(recovery_files(root.path())).unwrap();
+        let intent = intent(root.path());
+        let evidence = attempt_welcome(&mut engine, &p, &intent, &binding, wire)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.list_groups().unwrap(), vec![group]);
+        // This models mutation in the irreversible native-commit→header window.
+        // No policy guard may prevent retaining the successful native join.
+        std::fs::write(root.path().join("expiry-profile"), b"changed after join").unwrap();
+        let receiver = enroll_joined(engine, &p, &binding.source_sha256, files, evidence).unwrap();
+        assert!(matches!(binding.check(), Err(ReceiverHold::ChangedState)));
+        let ReceiverJournal::Ordered(journal) = &receiver.journal else {
+            panic!("ordered")
+        };
+        let enrolled = journal.enrollment().unwrap();
+        assert_eq!(enrolled.source_profile_sha256, binding.source_sha256);
+        assert_eq!(enrolled.expiry_profile_sha256, p.expiry_profile_sha256);
+        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v2");
+        let bytes = std::fs::read(root.path().join("receiver/journal")).unwrap();
+        drop(receiver);
+        let reopened = Journal::reopen(recovery_files(root.path()), &enrolled).unwrap();
+        assert_eq!(reopened.enrollment().unwrap(), enrolled);
+        assert_eq!(
+            std::fs::read(root.path().join("receiver/journal")).unwrap(),
+            bytes
+        );
+        assert!(
+            storage
+                .list_pending_application_events()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_fresh_v2_join_reopens_expiry_then_real_mls_decision_consumes_once() {
+        use super::super::super::tests::{Relay, client, finite_original, reaction};
+        use cgka_traits::{
+            GroupStorage,
+            app_components::{
+                AppComponentData, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+                encode_nostr_routing_v1,
+            },
+            engine::CreateGroupRequest,
+        };
+        let mut operator = client(b"fresh-v2-operator");
+        let mut engine = client(b"fresh-v2-receiver");
+        let mut kp = engine.fresh_key_package().await.unwrap();
+        kp.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: cgka_traits::types::MessageId::new(vec![4; 32]),
+        });
+        let route = NostrRoutingV1::new([7; 32], vec!["wss://semantic.invalid".into()]).unwrap();
+        let (group, created) = operator
+            .create_group(CreateGroupRequest {
+                name: "fresh-v2".into(),
+                description: String::new(),
+                members: vec![kp],
+                required_features: vec![],
+                app_components: vec![AppComponentData {
+                    component_id: NOSTR_ROUTING_COMPONENT_ID,
+                    data: encode_nostr_routing_v1(&route).unwrap(),
+                }],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap();
+        let SendResult::GroupCreated {
+            pending,
+            mut welcomes,
+        } = created
+        else {
+            panic!("created")
+        };
+        operator.confirm_published(pending).await.unwrap();
+        engine.drain_events();
+        operator.drain_events();
+        let wire = welcomes.remove(0);
+        let root = tempfile::tempdir().unwrap();
+        let mut p = FreshProfile {
+            schema: "heterodyne-protected-receiver-fresh.v2".into(),
+            receiver_uid: unsafe { libc::geteuid() },
+            consumer_uid: unsafe { libc::geteuid() } + 1,
+            account: hex::encode(engine.self_id().as_slice()),
+            group: hex::encode(group.as_slice()),
+            operators: vec![hex::encode(operator.self_id().as_slice())],
+            storage_generation: "55".repeat(32),
+            key_package_ref: crate::key_package::key_package_metadata(
+                &engine.durably_owned_key_packages().unwrap()[0],
+            )
+            .unwrap()
+            .key_package_ref_hex,
+            endpoints: vec![TransportEndpoint::from("wss://semantic.invalid")],
+            wait_seconds: 1,
+            expiry_profile_sha256: "77".repeat(32),
+        };
+        let binding = binding(root.path(), &mut p);
+        let files = Journal::prepare_fresh(recovery_files(root.path())).unwrap();
+        let intent = intent(root.path());
+        let evidence = attempt_welcome(&mut engine, &p, &intent, &binding, wire)
+            .await
+            .unwrap()
+            .unwrap();
+        let receiver = enroll_joined(engine, &p, &binding.source_sha256, files, evidence).unwrap();
+        binding.check().unwrap();
+        let ReceiverJournal::Ordered(journal) = &receiver.journal else {
+            panic!("ordered")
+        };
+        let enrolled = journal.enrollment().unwrap();
+        let ProtectedReceiver {
+            engine, journal, ..
+        } = receiver;
+        drop(journal);
+        let journal = Journal::reopen(recovery_files(root.path()), &enrolled).unwrap();
+        let receiver = ProtectedReceiver::reopen_ordered(
+            engine,
+            group.clone(),
+            vec![operator.self_id()],
+            journal,
+        )
+        .unwrap();
+        assert_eq!(
+            receiver.engine.storage.list_groups().unwrap(),
+            vec![group.clone()]
+        );
+        let relay = Arc::new(Relay::default());
+        let adapter = NostrTransportAdapter::new(relay.clone());
+        adapter
+            .activate_account(TransportAccountActivation {
+                account_id: receiver.engine.self_id(),
+                inbox_endpoints: vec![],
+                group_subscriptions: vec![],
+                since: None,
+            })
+            .await
+            .unwrap();
+        let mut factory = SemanticFactory::new(receiver, adapter, p.endpoints.clone())
+            .unwrap()
+            .with_expiry_profile(File::open(root.path().join("expiry-profile")).unwrap())
+            .unwrap();
+        let original = finite_original("ask3", &group);
+        let original_sha = digest(&original.operation);
+        factory.post(original).await.unwrap();
+        let published = relay.wires.lock().unwrap().clone();
+        for wire in published {
+            operator.ingest(wire).await.unwrap();
+        }
+        operator.drain_events();
+        let target = factory.asks["ask3"].app_ids[0].clone();
+        let yes = reaction(&mut operator, &factory, &target, "👍").await;
+        assert_eq!(factory.ingest(yes).await.unwrap(), Some("ask3".into()));
+        assert_eq!(
+            factory
+                .consume("ask3", &original_sha)
+                .unwrap()
+                .operation_sha256,
+            original_sha
+        );
+        assert!(factory.consume("ask3", &original_sha).is_err());
     }
 
     #[test]
@@ -514,14 +778,14 @@ mod tests {
             Err(ReceiverHold::Configuration)
         ));
         // Every durable position is checked, not only the first directory.
-        if let Ok(other) = File::open("/dev/shm") {
-            if other.metadata().unwrap().dev() != cache.metadata().unwrap().dev() {
-                assert!(check_cache_devices(&other, &[&rw, &cache]).is_ok());
-                assert!(matches!(
-                    check_cache_devices(&cache, &[&other, &rw]),
-                    Err(ReceiverHold::Configuration)
-                ));
-            }
+        if let Ok(other) = File::open("/dev/shm")
+            && other.metadata().unwrap().dev() != cache.metadata().unwrap().dev()
+        {
+            assert!(check_cache_devices(&other, &[&rw, &cache]).is_ok());
+            assert!(matches!(
+                check_cache_devices(&cache, &[&other, &rw]),
+                Err(ReceiverHold::Configuration)
+            ));
         }
     }
 
@@ -554,7 +818,7 @@ mod tests {
         wire: &cgka_traits::TransportMessage,
     ) -> FreshProfile {
         FreshProfile {
-            schema: "heterodyne-protected-receiver-fresh.v1".into(),
+            schema: "heterodyne-protected-receiver-fresh.v2".into(),
             receiver_uid: unsafe { libc::geteuid() },
             consumer_uid: unsafe { libc::geteuid() }.checked_add(1).unwrap(),
             account: hex::encode(engine.self_id().as_slice()),
@@ -564,6 +828,7 @@ mod tests {
             key_package_ref: crate::protected_join::tests::key_package_ref(wire),
             endpoints: vec![TransportEndpoint("wss://fixture.invalid".into())],
             wait_seconds: 1,
+            expiry_profile_sha256: "77".repeat(32),
         }
     }
 
@@ -571,10 +836,10 @@ mod tests {
     async fn fresh_entry_derives_native_enrollment_retains_original_then_reopens() {
         let (engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
-        let profile = profile(&engine, &group, &operator, &wire);
-        let profile_sha = digest(
-            &serde_json::to_vec(&serde_json::json!({"synthetic":"profile custody"})).unwrap(),
-        );
+        let mut profile = profile(&engine, &group, &operator, &wire);
+        let binding = binding(root.path(), &mut profile);
+        let profile_sha = binding.source_sha256.clone();
+        binding.check().unwrap();
         let receiver = finish(
             engine,
             &profile,
@@ -606,6 +871,15 @@ mod tests {
             digest(&serde_json::to_vec(&actual).unwrap())
         );
         assert_eq!(enrolled.source_profile_sha256, profile_sha);
+        assert_eq!(
+            enrolled.expiry_profile_sha256,
+            profile.expiry_profile_sha256
+        );
+        assert_ne!(
+            enrolled.source_profile_sha256,
+            enrolled.expiry_profile_sha256
+        );
+        assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v2");
         let source = journal.source_at(2).unwrap();
         assert_eq!(
             source.body["value"]["native_join"]["original_wire"],

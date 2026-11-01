@@ -29,6 +29,8 @@ fn files(root: &Path) -> OwnedFiles {
 fn terminal_history_above_ten_thousand_and_32mib_rebuilds_with_bounded_live_projection() {
     let root = tempfile::tempdir().unwrap();
     let enrollment = Enrollment {
+        schema: "heterodyne-receiver-enrollment.v2".into(),
+        expiry_profile_sha256: "66".repeat(32),
         account: "11".repeat(32),
         group: "22".repeat(32),
         operators: vec!["33".repeat(32)],
