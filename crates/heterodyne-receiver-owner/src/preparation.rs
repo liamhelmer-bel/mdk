@@ -373,8 +373,9 @@ pub(crate) async fn prepare(
         || !slot
             .bytes()
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        || endpoints.is_empty()
-        || endpoints.len() > 16
+        || !crate::initializer::valid_targets(
+            &endpoints.iter().map(|e| e.0.clone()).collect::<Vec<_>>(),
+        )
     {
         return Err(Error::Hold);
     }
@@ -693,6 +694,10 @@ pub(crate) mod tests {
                 0 => endpoints.to_vec(),
                 1 => endpoints[..1].to_vec(),
                 2 => return std::future::pending().await,
+                4 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    endpoints.to_vec()
+                }
                 _ => vec![TransportEndpoint::from("wss://unexpected.invalid")],
             };
             Ok(transport_nostr_adapter::NostrPublishOutcome::accepted(
@@ -968,6 +973,48 @@ pub(crate) mod tests {
         }
         observer.shutdown().await;
         assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
+    async fn caller_timeout_preserves_later_actual_receipt_before_retry() {
+        use transport_nostr_adapter::NostrRelayClient;
+        let peer = Arc::new(PublicationPeer::default());
+        peer.mode.store(4, std::sync::atomic::Ordering::SeqCst);
+        let endpoints = vec![TransportEndpoint::from("wss://one.invalid")];
+        let fixture = JournaledFixture::create(
+            endpoints.clone(),
+            peer,
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        let event = serde_json::from_slice(&fixture.setup[0].bytes).unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                fixture.relay.publish_event(&endpoints, &event, 1)
+            )
+            .await
+            .is_err()
+        );
+        // A concurrent retry must wait until the detached original has fsynced
+        // its actual receipt; both Reported records remain in causal order.
+        fixture
+            .relay
+            .publish_event(&endpoints, &event, 1)
+            .await
+            .unwrap();
+        let records = fixture.records();
+        let reported: Vec<_> = records
+            .iter()
+            .filter(|r| r["attempt"]["state"] == "reported")
+            .collect();
+        assert_eq!(reported.len(), 2);
+        assert_eq!(
+            reported[0]["accepted"][0],
+            serde_json::json!([endpoints[0].as_str()])
+        );
+        assert_eq!(records.last().unwrap()["attempt"]["state"], "reported");
     }
 
     #[tokio::test]
