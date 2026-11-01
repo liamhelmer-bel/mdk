@@ -31,14 +31,14 @@ provenance. Merely constructing the files below does not constitute enrollment.
 | 4 | Exact32-byte Nostr account secret, regular read-only mode0400 |
 | 5 | Exact32-byte encrypted DB key, regular read-only mode0400; SQLCipher passphrase is its lowercase hex encoding |
 | 6–10 | Existing ordered journal, journal directory, storage lease, consumer anchor, anchor directory |
-| 11–12 | Existing protected expiry profile and disposable cache directory |
+| 11–12 | Exact root-owned0400/O_RDONLY expiry.v1 profile matching enrollment.expiry_profile_sha256; disposable cache directory |
 | 13 | Fixed Product `heterodyne-owned-card-profile.v1`, including exact target/profile/original/canonical/group/publication bindings |
 | 14–15 | Complete retained Git archive and commit object |
 | 16 | Protected existing account directory, mode0700 owned by receiver UID |
 | 17 | Connected AF_UNIX/SOCK_STREAM consumer channel; kernel SO_PEERCRED UID must equal enrolled consumer UID |
 | 18 | Exact original operation packet, regular single-link read-only mode0400, at most32768 bytes |
 
-Startup profile schema is `heterodyne-protected-receiver-process.v1`, with closed
+Startup profile schema is `heterodyne-protected-receiver-process.v2`, with closed
 fields `receiver_uid`, `consumer_uid`, exact existing `enrollment`, `endpoints`,
 `transport_group`, `python`, `product_source`, `purelib`, `producer_closure` (path,
 SHA256 pairs) and `wait_seconds` (1..86400). The complete original profile bytes are
@@ -238,3 +238,5 @@ closure remains an enrollment prerequisite, not established by hash manifests.
 All current source tests remain synthetic protected-custody/relay fixtures; no
 installed publisher, enrolled live account, fresh join, external consumer service,
 anchor custody amendment or end-to-end deployment qualification is implied.
+
+The consumed/HOLD schemas remain v1 because their fields and meanings are unchanged: `enrollment_sha256` always hashes the exact canonical retained Enrollment. Process-v2 binds Enrollment-v2, whose SHA includes distinct original fresh provenance and expiry-policy identities. Consumers must retain/check the exact enrolled version rather than reinterpret a v1 enrollment as v2.

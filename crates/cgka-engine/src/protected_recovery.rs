@@ -59,6 +59,7 @@ impl Enrollment {
         if self.schema != Self::SCHEMA
             || self.operators.is_empty()
             || self.operators.len() > 64
+            || self.operators.contains(&self.account)
             || self.operators.windows(2).any(|p| p[0] >= p[1])
             || ![
                 &self.account,
@@ -847,13 +848,6 @@ impl Journal {
         self.latched = true;
         append(&mut self.files.journal, &record)?;
         append(&mut self.files.anchor, &anchor)?;
-        match &record.body {
-            Body::Header { .. } => return Err(Hold::Changed),
-            Body::HeaderV2 { enrollment, .. } if record.sequence == 1 => enrollment.check()?,
-            Body::HeaderV2 { .. } => return Err(Hold::Changed),
-            _ if record.sequence == 1 => return Err(Hold::Changed),
-            _ => (),
-        }
         self.sequence = record.sequence;
         self.digest = record.sha256;
         self.anchor_digest = anchor.sha256;
@@ -863,10 +857,16 @@ impl Journal {
     }
 
     fn validate_body(&self, body: &Body) -> Result<()> {
+        if self.sequence == 0 && !matches!(body, Body::HeaderV2 { .. }) {
+            return Err(Hold::Changed);
+        }
         match body {
             Body::Header { .. } => Err(Hold::Changed),
-            Body::HeaderV2 { enrollment, .. } => {
-                if self.sequence != 0 {
+            Body::HeaderV2 {
+                enrollment,
+                generation,
+            } => {
+                if self.sequence != 0 || !is_hash(generation) {
                     return Err(Hold::Changed);
                 }
                 enrollment.check()
@@ -951,3 +951,23 @@ fn valid_ask(id: &str) -> bool {
 #[cfg(test)]
 #[path = "protected_recovery_tests.rs"]
 pub(super) mod tests;
+
+/// Run only the root-owned positive fixture in a disposable user namespace when
+/// ordinary CI invokes this test as an unprivileged user. The child still uses
+/// the exact production uid0 check; no auth branch is compiled out for tests.
+#[cfg(test)]
+pub(crate) fn root_expiry_fixture_available() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        return true;
+    }
+    let thread = std::thread::current();
+    let name = thread.name().expect("named libtest fixture");
+    let status = std::process::Command::new("unshare")
+        .args(["--user", "--map-root-user"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .status()
+        .expect("Linux protected-owner tests require unshare for disposable uid0 fixtures");
+    assert!(status.success(), "disposable uid0 fixture failed: {name}");
+    false
+}

@@ -4,7 +4,8 @@ use crate::protected_join::{JoinConstraint, JoinEvidence, JoinIntent};
 use crate::protected_receiver::ReceiverJournal;
 use cgka_traits::TransportEnvelope;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(deny_unknown_fields)]
 struct FreshProfile {
     schema: String,
@@ -351,6 +352,8 @@ async fn run(
     let sdk = nostr_sdk::Client::builder().build();
     let adapter = NostrTransportAdapter::new(Arc::new(NostrSdkRelayClient::new(sdk.clone())));
     let forwarder = forward(sdk.clone(), adapter.clone(), spool);
+    // Retain a committed receiver across every post-enrollment error until relay shutdown.
+    let mut retained = None;
     let result = async {
         tokio::time::timeout(Duration::from_secs(30), adapter.activate_account(TransportAccountActivation {
             account_id: engine.self_id(), inbox_endpoints: profile.endpoints.clone(), group_subscriptions:vec![], since:None,
@@ -367,10 +370,8 @@ async fn run(
                 }
             }
         };
-        let receiver = enroll_joined(engine, &profile, &profile_sha, files, evidence)?;
-        // Never insert a new guard between native commit and durable enrollment.
-        // A post-header mismatch preserves that enrollment and emits HOLD.
-        binding.check()?;
+        retain_enrollment(&mut retained, engine, &profile, &profile_sha, files, evidence, &binding)?;
+        let receiver = retained.as_ref().ok_or(ReceiverHold::Journal)?;
         // Enrollment is already durable; relay lifetime no longer determines it.
         let ReceiverJournal::Ordered(journal) = &receiver.journal else { return Err(ReceiverHold::Journal); };
         let enrolled = journal.enrollment().map_err(|_| ReceiverHold::Journal)?;
@@ -382,7 +383,7 @@ async fn run(
         })).map_err(|_| ReceiverHold::Malformed)?;
         write_frame(&mut peer,&output)?;
         // Receiver owns actual account/journal until after finite SDK shutdown.
-        Ok(receiver)
+        Ok(())
     }.await;
     if result.is_err() {
         // Conservative on purpose: no failure response authorizes a retry or
@@ -399,11 +400,32 @@ async fn run(
     forwarder.abort();
     let _ = forwarder.await;
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
-    drop((key_file, dbkey_file, account_dir, db_file));
+    drop((retained, key_file, dbkey_file, account_dir, db_file));
     if shutdown.is_err() {
         return Err(ReceiverHold::Engine);
     }
-    result.map(|_| ())
+    result
+}
+
+// One production postcommit operation: durable enrollment and retention must precede
+// the policy check. The caller keeps `retained` alive until SDK/forwarder shutdown.
+fn retain_enrollment<S: StorageProvider + 'static>(
+    retained: &mut Option<ProtectedReceiver<S>>,
+    engine: crate::Engine<S>,
+    profile: &FreshProfile,
+    profile_sha: &str,
+    files: OwnedFiles,
+    evidence: JoinEvidence,
+    binding: &FreshBinding,
+) -> Result<(), ReceiverHold> {
+    *retained = Some(enroll_joined(
+        engine,
+        profile,
+        profile_sha,
+        files,
+        evidence,
+    )?);
+    binding.check()
 }
 
 async fn attempt_welcome<S: StorageProvider + 'static>(
@@ -531,6 +553,10 @@ mod tests {
 
     #[tokio::test]
     async fn actual_loop_attempt_rejects_oversized_input_then_accepts_native_welcome() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         let (mut engine, storage, wire, group, operator) = invitation().await;
         let mut p = profile(&engine, &group, &operator, &wire);
         let root = tempfile::tempdir().unwrap();
@@ -557,6 +583,10 @@ mod tests {
 
     #[tokio::test]
     async fn changed_retained_policy_or_source_refuses_before_native_intent() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         for name in ["fresh-profile", "expiry-profile"] {
             let (mut engine, storage, wire, group, operator) = invitation().await;
             let root = tempfile::tempdir().unwrap();
@@ -582,6 +612,10 @@ mod tests {
 
     #[tokio::test]
     async fn policy_change_after_native_commit_preserves_durable_v2_header_and_holds() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         let (mut engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
         let mut p = profile(&engine, &group, &operator, &wire);
@@ -596,8 +630,20 @@ mod tests {
         // This models mutation in the irreversible native-commit→header window.
         // No policy guard may prevent retaining the successful native join.
         std::fs::write(root.path().join("expiry-profile"), b"changed after join").unwrap();
-        let receiver = enroll_joined(engine, &p, &binding.source_sha256, files, evidence).unwrap();
-        assert!(matches!(binding.check(), Err(ReceiverHold::ChangedState)));
+        let mut retained = None;
+        assert!(matches!(
+            retain_enrollment(
+                &mut retained,
+                engine,
+                &p,
+                &binding.source_sha256,
+                files,
+                evidence,
+                &binding
+            ),
+            Err(ReceiverHold::ChangedState)
+        ));
+        let receiver = retained.as_ref().unwrap();
         let ReceiverJournal::Ordered(journal) = &receiver.journal else {
             panic!("ordered")
         };
@@ -606,7 +652,11 @@ mod tests {
         assert_eq!(enrolled.expiry_profile_sha256, p.expiry_profile_sha256);
         assert_eq!(journal.source_at(1).unwrap().body["kind"], "header-v2");
         let bytes = std::fs::read(root.path().join("receiver/journal")).unwrap();
-        drop(receiver);
+        // A separate owner cannot acquire the account lease during postcommit HOLD.
+        let other = recovery_files(root.path());
+        assert!(other.storage_lease.try_lock().is_err());
+        drop(other);
+        drop(retained);
         let reopened = Journal::reopen(recovery_files(root.path()), &enrolled).unwrap();
         assert_eq!(reopened.enrollment().unwrap(), enrolled);
         assert_eq!(
@@ -623,6 +673,10 @@ mod tests {
 
     #[tokio::test]
     async fn actual_fresh_v2_join_reopens_expiry_then_real_mls_decision_consumes_once() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         use super::super::super::tests::{Relay, client, finite_original, reaction};
         use cgka_traits::{
             GroupStorage,
@@ -834,6 +888,10 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_entry_derives_native_enrollment_retains_original_then_reopens() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         let (engine, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
         let mut profile = profile(&engine, &group, &operator, &wire);

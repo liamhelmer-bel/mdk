@@ -11,6 +11,10 @@ const PRODUCT_HEAD: &str = "faec83f17b92d3251e3118942c982661b085be59";
 #[tokio::test]
 #[ignore = "qualification requires pinned Product checkout and Python test dependencies; no live relay"]
 async fn current_whole_product_packet_real_mls_approval_consumes_exact_checked_frame() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+
     let product = std::env::var_os("HETERODYNE_QUALIFICATION_PRODUCT")
         .expect("explicit test Product checkout");
     let python = std::env::var_os("HETERODYNE_QUALIFICATION_PYTHON").expect("explicit test Python");
@@ -431,6 +435,10 @@ async fn current_routed_fixture() -> (
 
 #[tokio::test]
 async fn current_native_group_context_checks_both_enrolled_domains_and_requires_routing() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+
     let (mut factory, _, _, _) = current_routed_fixture().await;
     let engine = &factory.receiver.engine;
     let group = &factory.receiver.group;
@@ -474,6 +482,10 @@ async fn current_native_group_context_checks_both_enrolled_domains_and_requires_
 
 #[tokio::test]
 async fn owned_exchange_refuses_wrong_native_or_transport_before_external_publication() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+
     for wrong_native in [true, false] {
         let (mut factory, _, _, relay) = current_routed_fixture().await;
         let mut ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
@@ -522,6 +534,10 @@ async fn owned_exchange_refuses_wrong_native_or_transport_before_external_public
 #[tokio::test]
 #[ignore = "requires disposable namespace with unchanged Product closure and verified loopback TLS"]
 async fn unchanged_installed_producer_real_tls_then_real_mls_exchange() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+
     use super::super::owned_producer::{Inputs, InstalledProducer};
     let fixture = std::path::Path::new("/opt/producer-qualification");
     let original = std::fs::read(fixture.join("original.json")).unwrap();

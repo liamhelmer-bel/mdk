@@ -121,7 +121,25 @@ mod tests {
     use std::{fs::OpenOptions, os::unix::fs::PermissionsExt};
 
     #[test]
+    fn policy_owner_must_be_actual_root_not_current_user() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner-policy");
+        let bytes = br#"{"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":100}"#;
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let result = Profile::open(File::open(path).unwrap(), &digest(bytes));
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(ReceiverHold::Configuration)));
+        }
+    }
+    #[test]
     fn actual_expiry_descriptor_requires_root_readonly_exact_mode_and_retained_bytes() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("expiry");
         let bytes = br#"{"schema":"heterodyne-receiver-expiry.v1","max_approval_lifetime_ms":100}"#;

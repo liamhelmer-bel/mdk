@@ -442,6 +442,9 @@ fn consumed_export_key_is_native_anchored_generation_bound_and_survives_reopen()
 #[test]
 fn v2_enrollment_canonical_digest_and_distinct_profile_pins_are_exact() {
     let enrolled = enrollment();
+    let mut self_operator = enrolled.clone();
+    self_operator.operators = vec![self_operator.account.clone()];
+    assert!(self_operator.check().is_err());
     let bytes = serde_json::to_vec(&enrolled).unwrap();
     assert!(
         std::str::from_utf8(&bytes)
@@ -487,6 +490,28 @@ fn v2_enrollment_canonical_digest_and_distinct_profile_pins_are_exact() {
         std::fs::read(root.path().join("receiver/journal")).unwrap(),
         bytes
     );
+}
+
+#[test]
+fn invalid_first_body_is_refused_before_journal_or_anchor_append() {
+    let root = tempfile::tempdir().unwrap();
+    let mut journal = Journal::enroll(files(root.path()), enrollment()).unwrap();
+    // Exercise the pre-header writer invariant directly without constructing a
+    // new public constructor for an impossible current caller path.
+    journal.sequence = 0;
+    let before = ["receiver/journal", "consumer/anchor"]
+        .map(|p| std::fs::read(root.path().join(p)).unwrap());
+    assert!(matches!(
+        journal.write(Body::CardComplete {
+            ask_id: "ask3".into(),
+            original_operation_sha256: "aa".repeat(32)
+        }),
+        Err(Hold::Changed)
+    ));
+    assert!(!journal.latched);
+    for (path, bytes) in ["receiver/journal", "consumer/anchor"].iter().zip(before) {
+        assert_eq!(std::fs::read(root.path().join(path)).unwrap(), bytes);
+    }
 }
 
 #[test]

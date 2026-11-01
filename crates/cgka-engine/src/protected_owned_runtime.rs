@@ -687,6 +687,10 @@ mod tests {
     }
     #[tokio::test]
     async fn owned_exchange_ignores_invalid_replay_and_oversize_then_consumes_after_eose() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         use nostr::{EventBuilder, Kind, Tag, TagKind};
         let (mut factory, mut operator, root, relay) =
             super::super::tests::finite_fixture_lifetime(60_000).await;
@@ -776,6 +780,10 @@ mod tests {
 
     #[tokio::test]
     async fn owned_exchange_posts_once_but_no_eose_or_dead_forwarder_never_consumes() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         for closed in [false, true] {
             let (mut factory, _, root, relay) =
                 super::super::tests::finite_fixture_lifetime(60_000).await;
@@ -819,6 +827,10 @@ mod tests {
     }
     #[tokio::test]
     async fn genuine_route_undecryptable_wire_retains_unknown_and_reports_hold_without_replay() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+
         use nostr::{EventBuilder, Kind, Tag, TagKind};
         let (mut factory, mut operator, root, relay) =
             super::super::tests::finite_fixture_lifetime(60_000).await;
