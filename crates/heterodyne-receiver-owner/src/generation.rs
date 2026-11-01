@@ -81,6 +81,26 @@ fn secret(parent: &File, name: &str, bytes: &[u8; 32]) -> Result<File, Error> {
     Ok(read)
 }
 
+fn private_bytes(file: &File) -> Result<Zeroizing<[u8; 32]>, Error> {
+    let m = file.metadata()?;
+    // SAFETY: metadata-only inspection of a retained descriptor.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if !m.is_file()
+        || m.uid() != unsafe { libc::geteuid() }
+        || m.nlink() != 1
+        || m.mode() & 0o7777 != 0o400
+        || m.len() != 32
+        || flags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || flags & libc::O_PATH != 0
+    {
+        return Err(Error::Hold);
+    }
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    std::os::unix::fs::FileExt::read_exact_at(file, bytes.as_mut(), 0)?;
+    Ok(bytes)
+}
+
 impl Generation {
     /// Persist all three exact signed events before the ledger can record
     /// exposure. O_EXCL preserves a partial write for reconciliation; it never
@@ -157,7 +177,13 @@ impl Generation {
         if artifacts.len() != 3 || bindings.len() != 3 {
             return Err(Error::Hold);
         }
-        let (_, keys, _) = self.native_inputs()?;
+        // Signature verification needs only the account key, never the
+        // SQLCipher seed or a second database/secret reconstruction.
+        let private = private_bytes(&self.key)?;
+        let identity = nostr::Keys::new(
+            nostr::SecretKey::from_slice(private.as_ref()).map_err(|_| Error::Hold)?,
+        )
+        .public_key();
         for ((bytes, binding), kind) in artifacts.iter().zip(bindings).zip([10002, 10050, 30443]) {
             if binding.kind != kind || hex::encode(sha2::Sha256::digest(bytes)) != binding.sha256 {
                 return Err(Error::Hold);
@@ -166,7 +192,7 @@ impl Generation {
             signed.verify().map_err(|_| Error::Hold)?;
             if signed.kind.as_u16() != kind
                 || signed.id.to_hex() != binding.event_id
-                || signed.pubkey != keys.public_key()
+                || signed.pubkey != identity
             {
                 return Err(Error::Hold);
             }
@@ -231,25 +257,39 @@ impl Generation {
         })
     }
 
+    /// Blocking readback owns its directory, database, and shared lease OFDs.
+    /// Cancelling an async caller must not close/reuse the directory descriptor
+    /// while a spawned SQLCipher operation still resolves /proc/self/fd/N.
+    pub(crate) fn retained_native_inputs(
+        &self,
+    ) -> Result<
+        (
+            PathBuf,
+            nostr::Keys,
+            storage_sqlite::SqlCipherKey,
+            [File; 3],
+        ),
+        Error,
+    > {
+        let (_, keys, sql) = self.native_inputs()?;
+        let retained = [
+            self.directory.try_clone()?,
+            self.database.try_clone()?,
+            self.lease.try_clone()?,
+        ];
+        let path = PathBuf::from(format!(
+            "/proc/self/fd/{}/account.sqlite3",
+            retained[0].as_raw_fd()
+        ));
+        Ok((path, keys, sql, retained))
+    }
+
     pub(crate) fn native_inputs(
         &self,
     ) -> Result<(PathBuf, nostr::Keys, storage_sqlite::SqlCipherKey), Error> {
         directory(&self.directory)?;
-        let mut key = Zeroizing::new([0u8; 32]);
-        let mut seed = Zeroizing::new([0u8; 32]);
-        for (file, target) in [(&self.key, &mut key), (&self.seed, &mut seed)] {
-            let m = file.metadata()?;
-            if !m.is_file()
-                || m.uid() != unsafe { libc::geteuid() }
-                || m.nlink() != 1
-                || m.mode() & 0o7777 != 0o400
-                || m.len() != 32
-            {
-                return Err(Error::Hold);
-            }
-            // Pread avoids changing inherited OFD offsets on repeated readback.
-            std::os::unix::fs::FileExt::read_exact_at(file, target.as_mut(), 0)?;
-        }
+        let key = private_bytes(&self.key)?;
+        let seed = private_bytes(&self.seed)?;
         let database = open_at(&self.directory, "account.sqlite3", libc::O_RDONLY, 0)?;
         let a = database.metadata()?;
         let b = self.database.metadata()?;
@@ -277,6 +317,44 @@ impl Generation {
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[tokio::test]
+    async fn retained_readback_owns_directory_and_same_lease_after_generation_drop() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let id = "c8".repeat(32);
+        let generation = Generation::create(&parent, &id).unwrap();
+        let (path, keys, key, retained) = generation.retained_native_inputs().unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join(&id).join("storage.lease"))
+            .unwrap();
+        drop(generation);
+        assert!(second.try_lock().is_err());
+        let resolved = File::open(&path).unwrap().metadata().unwrap();
+        let expected = retained[1].metadata().unwrap();
+        assert_eq!(
+            (resolved.dev(), resolved.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let prepared = crate::preparation::prepare(
+            &path,
+            &key,
+            keys.clone(),
+            &"c9".repeat(32),
+            vec![cgka_traits::TransportEndpoint::from("wss://relay.invalid")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.publication.account_id.as_slice(),
+            keys.public_key().to_bytes()
+        );
+        drop(retained);
+        second.try_lock().unwrap();
+    }
 
     #[tokio::test]
     async fn actual_material_native_preparation_and_no_existing_generation_adoption() {

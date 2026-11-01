@@ -37,6 +37,8 @@ pub(crate) enum Error {
     Native,
     #[error("native initialization state does not match its fresh preparation contract")]
     Hold,
+    #[error(transparent)]
+    Publication(#[from] marmot_account::AccountError),
 }
 
 /// This type cannot open a subscription, peel a Welcome, wrap or receive MLS.
@@ -208,6 +210,7 @@ impl KeyPackagePublisher for PrepareOnly {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Prepared {
     pub(crate) publication: KeyPackagePublication,
     pub(crate) artifact: SignedPublicationArtifact,
@@ -553,11 +556,106 @@ pub(crate) async fn publish_pending(
     runtime
         .publish_fresh_key_package()
         .await
-        .map_err(|_| Error::Hold)
+        .map_err(Error::Publication)
+}
+
+/// Recover only an already-promoted current native package using the exact
+/// authenticated retained event, without relying on a pre-crash Prepared DTO.
+/// There is no network, signing, preparation, rotation, or header mutation.
+pub(crate) fn promoted_from_retained(
+    database: &Path,
+    key: &SqlCipherKey,
+    keys: &nostr::Keys,
+    bytes: Vec<u8>,
+    endpoints: Vec<TransportEndpoint>,
+) -> Result<Prepared, Error> {
+    let signed = nostr::Event::from_json(&bytes).map_err(|_| Error::Hold)?;
+    signed.verify().map_err(|_| Error::Hold)?;
+    if signed.kind.as_u16() != 30443 || signed.pubkey != keys.public_key() {
+        return Err(Error::Hold);
+    }
+    let storage = SqliteAccountStorage::open_encrypted(database, key).map_err(|_| Error::Native)?;
+    let state = storage
+        .key_package_lifecycle()
+        .map_err(|_| Error::Native)?
+        .ok_or(Error::Hold)?;
+    let package = state.current_key_package.clone().ok_or(Error::Hold)?;
+    storage.close().map_err(|_| Error::Native)?;
+    let metadata = key_package_metadata(&package).map_err(|_| Error::Native)?;
+    if metadata.protocol_profile != ProtocolProfile::Current
+        || metadata.credential_identity_hex != keys.public_key().to_hex()
+    {
+        return Err(Error::Hold);
+    }
+    let prepared = Prepared {
+        publication: KeyPackagePublication {
+            account_id: MemberId::new(keys.public_key().to_bytes().to_vec()),
+            key_package: package,
+            slot_id: state.stable_slot_id,
+            created_at: cgka_traits::Timestamp(signed.created_at.as_secs()),
+            endpoints,
+        },
+        artifact: SignedPublicationArtifact {
+            id: cgka_traits::MessageId::new(signed.id.to_bytes().to_vec()),
+            created_at: cgka_traits::Timestamp(signed.created_at.as_secs()),
+            bytes,
+        },
+        metadata,
+    };
+    let expected = publication(&prepared.publication)
+        .map_err(|_| Error::Hold)?
+        .to_event_at(prepared.artifact.created_at.0)
+        .map_err(|_| Error::Hold)?;
+    let actual: NostrTransportEvent =
+        serde_json::from_slice(&prepared.artifact.bytes).map_err(|_| Error::Hold)?;
+    if actual.pubkey != expected.pubkey
+        || actual.kind != expected.kind
+        || actual.tags != expected.tags
+        || actual.content != expected.content
+        || actual.created_at != expected.created_at
+    {
+        return Err(Error::Hold);
+    }
+    verify_promoted(database, key, keys, &prepared)?;
+    Ok(prepared)
+}
+
+/// Read-only recovery of the exact native promotion, independent of relay
+/// acknowledgement bookkeeping. This does not publish, re-sign, or rotate.
+pub(crate) fn verify_promoted(
+    database: &Path,
+    key: &SqlCipherKey,
+    keys: &nostr::Keys,
+    prepared: &Prepared,
+) -> Result<(), Error> {
+    let storage = SqliteAccountStorage::open_encrypted(database, key).map_err(|_| Error::Native)?;
+    let state = storage
+        .key_package_lifecycle()
+        .map_err(|_| Error::Native)?
+        .ok_or(Error::Hold)?;
+    let owned =
+        cgka_engine::key_package::durably_owned_key_packages(&storage, ProtocolProfile::Current)
+            .map_err(|_| Error::Native)?;
+    if state.stable_slot_id != prepared.publication.slot_id
+        || state.current_key_package.as_ref() != Some(&prepared.publication.key_package)
+        || state.pending_replacement.is_some()
+        || state.authored_event_id.as_ref() != Some(&prepared.artifact.id)
+        || state.authored_event_created_at != Some(prepared.artifact.created_at)
+        || keys.public_key().to_bytes().as_slice() != prepared.publication.account_id.as_slice()
+        || owned != vec![prepared.publication.key_package.clone()]
+        || !storage.list_groups().map_err(|_| Error::Native)?.is_empty()
+        || !storage
+            .list_pending_application_events()
+            .map_err(|_| Error::Native)?
+            .is_empty()
+    {
+        return Err(Error::Hold);
+    }
+    storage.close().map_err(|_| Error::Native)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use cgka_engine::key_package::durably_owned_key_packages;
 
@@ -671,19 +769,19 @@ mod tests {
         assert_eq!(peer.events.lock().unwrap().len(), 5);
     }
 
-    struct JournaledFixture {
-        root: tempfile::TempDir,
-        _generation: crate::generation::Generation,
-        database: std::path::PathBuf,
-        keys: nostr::Keys,
-        key: SqlCipherKey,
-        prepared: Prepared,
-        setup: [SignedPublicationArtifact; 2],
-        relay: Arc<crate::publication::JournaledRelay>,
+    pub(crate) struct JournaledFixture {
+        pub(crate) root: tempfile::TempDir,
+        pub(crate) _generation: crate::generation::Generation,
+        pub(crate) database: std::path::PathBuf,
+        pub(crate) keys: nostr::Keys,
+        pub(crate) key: SqlCipherKey,
+        pub(crate) prepared: Prepared,
+        pub(crate) setup: [SignedPublicationArtifact; 2],
+        pub(crate) relay: Arc<crate::publication_journal::JournaledRelay>,
     }
 
     impl JournaledFixture {
-        async fn create(
+        pub(crate) async fn create(
             endpoints: Vec<TransportEndpoint>,
             peer: Arc<dyn transport_nostr_adapter::NostrRelayClient>,
             minimum: usize,
@@ -748,7 +846,7 @@ mod tests {
             ledger.prepared(bindings).unwrap();
             ledger.exposure_begun().unwrap();
             let relay = Arc::new(
-                crate::publication::JournaledRelay::new(
+                crate::publication_journal::JournaledRelay::new(
                     ledger,
                     &generation,
                     &retained,
@@ -769,7 +867,7 @@ mod tests {
             }
         }
 
-        fn records(&self) -> Vec<serde_json::Value> {
+        pub(crate) fn records(&self) -> Vec<serde_json::Value> {
             std::fs::read_to_string(self.root.path().join("initialization.jsonl"))
                 .unwrap()
                 .lines()
@@ -799,7 +897,7 @@ mod tests {
             fixture.setup[1].clone(),
             fixture.prepared.artifact.clone(),
         ];
-        assert!(fixture.relay.published().is_err());
+        assert!(fixture.relay.published(&fixture._generation).await.is_err());
         for artifact in &fixture.setup {
             let event = serde_json::from_slice(&artifact.bytes).unwrap();
             let outcome = fixture
@@ -819,7 +917,7 @@ mod tests {
         publish_pending(&fixture.database, &fixture.key, &fixture.keys, publisher)
             .await
             .unwrap();
-        fixture.relay.published().unwrap();
+        fixture.relay.published(&fixture._generation).await.unwrap();
         let records: Vec<serde_json::Value> =
             std::fs::read_to_string(fixture.root.path().join("initialization.jsonl"))
                 .unwrap()
@@ -931,7 +1029,7 @@ mod tests {
             fixture.records().last().unwrap()["attempt"]["state"],
             "begun"
         );
-        assert!(fixture.relay.published().is_err());
+        assert!(fixture.relay.published(&fixture._generation).await.is_err());
         peer.mode.store(3, Ordering::SeqCst);
         assert!(
             fixture
@@ -982,12 +1080,102 @@ mod tests {
                 .await
                 .unwrap();
         }
-        fixture.relay.published().unwrap();
-        assert_eq!(fixture.records().last().unwrap()["phase"], "published");
+        assert!(fixture.relay.published(&fixture._generation).await.is_err());
+        assert_eq!(fixture.records().last().unwrap()["phase"], "exposure_begun");
         let events = peer.events.lock().unwrap();
         for actual in events.iter().take(attempts + 1) {
             assert_eq!(serde_json::to_vec(actual).unwrap(), fixture.setup[0].bytes);
         }
+    }
+
+    #[tokio::test]
+    async fn reports_without_native_commit_hold_and_committed_native_reopens_without_resend() {
+        use std::fs::{File, OpenOptions};
+        use transport_nostr_adapter::NostrRelayClient;
+        let endpoint = TransportEndpoint::from("wss://one.invalid");
+        let peer = Arc::new(PublicationPeer::default());
+        let fixture = JournaledFixture::create(
+            vec![endpoint.clone()],
+            peer.clone(),
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+        for artifact in [
+            &fixture.setup[0],
+            &fixture.setup[1],
+            &fixture.prepared.artifact,
+        ] {
+            let event = serde_json::from_slice(&artifact.bytes).unwrap();
+            fixture
+                .relay
+                .publish_event(std::slice::from_ref(&endpoint), &event, 1)
+                .await
+                .unwrap();
+        }
+        // Actual durable transport reports exist for all three artifacts, but
+        // stopping before the native transaction must not finish Published.
+        assert!(fixture.relay.published(&fixture._generation).await.is_err());
+        assert_eq!(fixture.records().last().unwrap()["phase"], "exposure_begun");
+        let native = SqliteAccountStorage::open_encrypted(&fixture.database, &fixture.key).unwrap();
+        assert!(
+            native
+                .key_package_lifecycle()
+                .unwrap()
+                .unwrap()
+                .pending_replacement
+                .is_some()
+        );
+        native.close().unwrap();
+        let publisher = ExactPublisher::new(
+            fixture.prepared.clone(),
+            fixture.relay.clone(),
+            1,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        publish_pending(&fixture.database, &fixture.key, &fixture.keys, publisher)
+            .await
+            .unwrap();
+        let send_count = peer.events.lock().unwrap().len();
+        // Simulate process stop after the actual SQLCipher promotion, before
+        // the journal append. Reopen the actual journal and retained artifact
+        // descriptors and recover from native readback, with no relay send.
+        drop(fixture.relay);
+        let ledger = crate::initializer::Ledger::reopen(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(fixture.root.path().join("initialization.jsonl"))
+                .unwrap(),
+            File::open(fixture.root.path()).unwrap(),
+            &"f3".repeat(32),
+            &"b7".repeat(32),
+        )
+        .unwrap();
+        let retained = File::open(
+            fixture
+                .root
+                .path()
+                .join("b7".repeat(32))
+                .join("publications.json"),
+        )
+        .unwrap();
+        let reopened = crate::publication_journal::JournaledRelay::new(
+            ledger,
+            &fixture._generation,
+            &retained,
+            peer.clone(),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        reopened.published(&fixture._generation).await.unwrap();
+        assert_eq!(peer.events.lock().unwrap().len(), send_count);
+        let records =
+            std::fs::read_to_string(fixture.root.path().join("initialization.jsonl")).unwrap();
+        let last: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(last["phase"], "published");
     }
 
     #[tokio::test]

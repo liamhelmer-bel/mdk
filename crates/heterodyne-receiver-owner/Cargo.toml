@@ -10,7 +10,6 @@ async-trait.workspace = true
 cgka-engine.workspace = true
 cgka-session.workspace = true
 cgka-traits.workspace = true
-fs-private.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 libc.workspace = true

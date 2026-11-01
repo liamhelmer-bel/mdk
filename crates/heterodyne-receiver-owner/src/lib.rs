@@ -6,4 +6,7 @@
 mod generation;
 mod initializer;
 mod preparation;
-mod publication;
+mod publication_journal;
+
+#[cfg(test)]
+mod sdk_partial_tests;

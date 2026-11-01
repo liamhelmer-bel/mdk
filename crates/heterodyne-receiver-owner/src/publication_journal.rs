@@ -15,7 +15,7 @@ use crate::generation::Generation;
 use crate::initializer::{Artifact, Ledger};
 
 pub(crate) struct JournaledRelay {
-    ledger: Mutex<Ledger>,
+    ledger: Arc<Mutex<Ledger>>,
     serial: AsyncMutex<()>,
     bytes: [Vec<u8>; 3],
     bindings: Vec<Artifact>,
@@ -47,7 +47,7 @@ impl JournaledRelay {
             .read_publications(retained, &bindings)
             .map_err(|_| hold())?;
         Ok(Self {
-            ledger: Mutex::new(ledger),
+            ledger: Arc::new(Mutex::new(ledger)),
             serial: AsyncMutex::new(()),
             bytes,
             bindings,
@@ -56,19 +56,37 @@ impl JournaledRelay {
         })
     }
 
-    fn unknown(&self, sequence: usize, failed: Vec<String>) -> Result<(), TransportAdapterError> {
-        self.ledger
-            .lock()
-            .map_err(|_| hold())?
-            .unknown_attempt(sequence, failed)
-            .map_err(|_| hold())
+    // Blocking durability runs outside the async runtime worker. Cancellation
+    // never cancels an already-issued fsync or turns it into permission to send.
+    async fn update<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Ledger) -> Result<T, crate::initializer::Error> + Send + 'static,
+    ) -> Result<T, TransportAdapterError> {
+        let ledger = self.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut guard = ledger.lock().map_err(|_| crate::initializer::Error::Hold)?;
+            operation(&mut guard)
+        })
+        .await
+        .map_err(|_| hold())?
+        .map_err(|_| hold())
     }
 
-    fn report(
+    async fn unknown(
         &self,
         sequence: usize,
-        outcome: &NostrPublishOutcome,
+        failed: Vec<String>,
     ) -> Result<(), TransportAdapterError> {
+        self.update(move |ledger| ledger.unknown_attempt(sequence, failed))
+            .await
+    }
+
+    async fn report(
+        &self,
+        sequence: usize,
+        index: usize,
+        outcome: &NostrPublishOutcome,
+    ) -> Result<Vec<String>, TransportAdapterError> {
         let accepted = outcome
             .accepted
             .iter()
@@ -79,19 +97,47 @@ impl JournaledRelay {
             .iter()
             .map(|a| a.endpoint.0.clone())
             .collect();
-        self.ledger
-            .lock()
-            .map_err(|_| hold())?
-            .report_attempt(sequence, accepted, failed)
-            .map_err(|_| hold())
+        self.update(move |ledger| {
+            ledger.report_attempt(sequence, accepted, failed)?;
+            ledger.accepted(index)
+        })
+        .await
     }
 
-    pub(crate) fn published(&self) -> Result<(), TransportAdapterError> {
-        self.ledger
-            .lock()
-            .map_err(|_| hold())?
-            .published()
-            .map_err(|_| hold())
+    // Relay receipts alone cannot assert native promotion. Reconcile only an
+    // independently opened current SQLCipher lifecycle matching the exact
+    // retained package/event. A crash after native promotion but before this
+    // append is recoverable by repeating this readback, without another send.
+    pub(crate) async fn published(
+        &self,
+        generation: &Generation,
+    ) -> Result<(), TransportAdapterError> {
+        let (database, keys, key, retained) =
+            generation.retained_native_inputs().map_err(|_| hold())?;
+        let bytes = self.bytes[2].clone();
+        let endpoints = self.bindings[2]
+            .targets
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let result = crate::preparation::promoted_from_retained(
+                &database, &key, &keys, bytes, endpoints,
+            );
+            drop(retained);
+            result
+        })
+        .await
+        .map_err(|_| hold())?
+        .map_err(|_| hold())?;
+        self.update(move |ledger| {
+            if ledger.publication_slot()? != prepared.publication.slot_id {
+                return Err(crate::initializer::Error::Hold);
+            }
+            ledger.published()
+        })
+        .await
     }
 }
 
@@ -126,17 +172,19 @@ impl NostrRelayClient for JournaledRelay {
         {
             return Err(hold());
         }
+        let owned_binding = binding.clone();
         let sequence = self
-            .ledger
-            .lock()
-            .map_err(|_| hold())?
-            .begin_attempt(index, binding)
-            .map_err(|_| hold())?;
+            .update(move |ledger| ledger.begin_attempt(index, &owned_binding))
+            .await?;
         // Cancellation of this future leaves a durable Begun marker. A timeout
         // or error also remains possibly exposed; no replacement is prepared.
         match tokio::time::timeout(
             self.timeout,
-            self.relay.publish_event(endpoints, event, required_acks),
+            // Capture an actual positive report below the overall threshold.
+            // The SDK may return after its first positive; the immutable
+            // publisher threshold is enforced against the fsynced union.
+            // This does not guarantee fairness among slow relay endpoints.
+            self.relay.publish_event(endpoints, event, 1),
         )
         .await
         {
@@ -146,16 +194,25 @@ impl NostrRelayClient for JournaledRelay {
                     .as_ref()
                     .is_some_and(|id| hex::encode(id.as_slice()) != binding.event_id)
                 {
-                    self.unknown(sequence, vec![])?;
+                    self.unknown(sequence, vec![]).await?;
                     return Err(hold());
                 }
-                if self.report(sequence, &outcome).is_err() {
-                    // Invalid target reports cannot be accepted as evidence.
-                    // A failed fsync poisons the ledger and this also refuses.
-                    self.unknown(sequence, vec![])?;
-                    return Err(hold());
-                }
-                Ok(outcome)
+                let accepted = match self.report(sequence, index, &outcome).await {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        self.unknown(sequence, vec![]).await?;
+                        return Err(hold());
+                    }
+                };
+                let mut cumulative =
+                    NostrPublishOutcome::accepted(accepted.iter().cloned().map(TransportEndpoint));
+                cumulative.message_id = outcome.message_id;
+                cumulative.failed = outcome
+                    .failed
+                    .into_iter()
+                    .filter(|failure| !accepted.contains(&failure.endpoint.0))
+                    .collect();
+                Ok(cumulative)
             }
             Ok(Err(TransportAdapterError::PublishEndpoints(failure))) => {
                 let failed: Vec<_> = failure
@@ -171,11 +228,12 @@ impl NostrRelayClient for JournaledRelay {
                         .iter()
                         .enumerate()
                         .all(|(i, e)| binding.targets.contains(e) && !failed[..i].contains(e));
-                self.unknown(sequence, if valid { failed } else { vec![] })?;
+                self.unknown(sequence, if valid { failed } else { vec![] })
+                    .await?;
                 Err(hold())
             }
             _ => {
-                self.unknown(sequence, vec![])?;
+                self.unknown(sequence, vec![]).await?;
                 Err(hold())
             }
         }

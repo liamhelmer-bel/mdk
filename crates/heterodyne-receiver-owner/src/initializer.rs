@@ -8,7 +8,10 @@ use std::os::unix::fs::MetadataExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MAX_RECORD: usize = 65_536;
+// The closed maximum includes three 16-target vectors, their accepted
+// unions, a complete current attempt, and worst-case JSON escaping (6x).
+// Bound each frame, never the number of historical attempts.
+const MAX_RECORD: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -125,12 +128,16 @@ fn descriptor(file: &File, directory: &File) -> Result<(), Error> {
 }
 
 impl Ledger {
-    pub(crate) fn publication_bindings(&self) -> Result<Vec<Artifact>, Error> {
+    fn exposure(&self) -> Result<&Record, Error> {
         if self.poisoned || self.last.phase != Phase::ExposureBegun {
             return Err(Error::Hold);
         }
         descriptor(&self.file, &self.directory)?;
-        Ok(self.last.artifacts.clone())
+        Ok(&self.last)
+    }
+
+    pub(crate) fn publication_bindings(&self) -> Result<Vec<Artifact>, Error> {
+        Ok(self.exposure()?.artifacts.clone())
     }
     pub(crate) fn create(
         mut file: File,
@@ -139,10 +146,10 @@ impl Ledger {
         generation: &str,
     ) -> Result<Self, Error> {
         descriptor(&file, &directory)?;
+        file.try_lock().map_err(|_| Error::Hold)?;
         if !hash(request) || !hash(generation) || file.metadata()?.len() != 0 {
             return Err(Error::Hold);
         }
-        file.try_lock().map_err(|_| Error::Hold)?;
         let first = Record {
             schema: "heterodyne-receiver-initialization.v1".into(),
             sequence: 1,
@@ -348,6 +355,18 @@ impl Ledger {
         self.append(next)
     }
 
+    pub(crate) fn publication_slot(&self) -> Result<String, Error> {
+        self.exposure()?.slot.clone().ok_or(Error::Hold)
+    }
+
+    pub(crate) fn accepted(&self, artifact: usize) -> Result<Vec<String>, Error> {
+        self.exposure()?
+            .accepted
+            .get(artifact)
+            .cloned()
+            .ok_or(Error::Hold)
+    }
+
     pub(crate) fn published(&mut self) -> Result<(), Error> {
         self.advance(Phase::Published)
     }
@@ -533,6 +552,44 @@ mod tests {
                 required_acks: 1,
             })
             .collect()
+    }
+
+    #[test]
+    fn maximum_closed_targets_and_escaped_reports_fit_every_record() {
+        let (temp, file, dir) = fixture();
+        let mut ledger = Ledger::create(file, dir, &"aa".repeat(32), &"bb".repeat(32)).unwrap();
+        ledger.material("cc".repeat(32)).unwrap();
+        let mut artifacts = retained_artifacts();
+        // Six-byte JSON escaping is the worst encoding expansion for the
+        // accepted string contract; there is no hidden smaller request limit.
+        for artifact in &mut artifacts {
+            artifact.targets = (0..16)
+                .map(|i| format!("{i:02}{}", "\u{0001}".repeat(2046)))
+                .collect();
+            artifact.required_acks = 16;
+        }
+        ledger.prepared(artifacts.clone()).unwrap();
+        ledger.exposure_begun().unwrap();
+        for (i, artifact) in artifacts.iter().enumerate() {
+            let sequence = ledger.begin_attempt(i, artifact).unwrap();
+            ledger
+                .report_attempt(sequence, artifact.targets.clone(), vec![])
+                .unwrap();
+        }
+        ledger.published().unwrap();
+        drop(ledger);
+        let reopened = Ledger::reopen(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp.path().join("initialization.jsonl"))
+                .unwrap(),
+            File::open(temp.path()).unwrap(),
+            &"aa".repeat(32),
+            &"bb".repeat(32),
+        )
+        .unwrap();
+        assert_eq!(reopened.last.phase, Phase::Published);
     }
 
     #[test]
