@@ -159,3 +159,101 @@ async fn actual_sdk_partial_receipts_union_promotes_only_after_exact_retry() {
         relay.shutdown();
     }
 }
+
+#[derive(Debug)]
+struct SlowPositive {
+    delay: Duration,
+    received: Arc<AtomicUsize>,
+}
+impl WritePolicy for SlowPositive {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a Event,
+        _: &'a SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
+        Box::pin(async move {
+            if event.kind == Kind::Custom(30443) {
+                self.received.fetch_add(1, Ordering::SeqCst);
+            }
+            tokio::time::sleep(self.delay).await;
+            PolicyResult::Accept
+        })
+    }
+}
+#[tokio::test]
+async fn actual_sdk_slow_positive_is_retried_without_resending_fast_accepted_endpoint() {
+    let received = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let mut relays = Vec::new();
+    let mut endpoints = Vec::new();
+    for (ordinal, count) in received.iter().enumerate() {
+        let relay = LocalRelay::new(RelayBuilder::default().write_policy(SlowPositive {
+            delay: Duration::from_millis(if ordinal == 0 { 0 } else { 250 }),
+            received: count.clone(),
+        }));
+        relay.run().await.unwrap();
+        endpoints.push(TransportEndpoint(relay.url().await.to_string()));
+        relays.push(relay);
+    }
+    let sdk = Arc::new(NostrSdkRelayClient::new(
+        nostr_sdk::Client::builder().build(),
+    ));
+    let fixture = JournaledFixture::create(endpoints.clone(), sdk, 2, Duration::from_secs(5)).await;
+    for artifact in &fixture.setup {
+        let event = serde_json::from_slice(&artifact.bytes).unwrap();
+        for _ in 0..2 {
+            if fixture
+                .relay
+                .publish_event(&endpoints, &event, 2)
+                .await
+                .unwrap()
+                .accepted
+                .len()
+                == 2
+            {
+                break;
+            }
+        }
+    }
+    let original = fixture.prepared.artifact.bytes.clone();
+    for _ in 0..2 {
+        let publisher = ExactPublisher::new(
+            fixture.prepared.clone(),
+            fixture.relay.clone(),
+            2,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        if publish_pending(&fixture.database, &fixture.key, &fixture.keys, publisher)
+            .await
+            .is_ok()
+        {
+            break;
+        }
+    }
+    assert_eq!(fixture.prepared.artifact.bytes, original);
+    assert_eq!(
+        received[0].load(Ordering::SeqCst),
+        1,
+        "retained fast positive must not be resent"
+    );
+    assert!(received[1].load(Ordering::SeqCst) >= 1);
+    let count = received.each_ref().map(|n| n.load(Ordering::SeqCst));
+    let event = serde_json::from_slice(&original).unwrap();
+    assert_eq!(
+        fixture
+            .relay
+            .publish_event(&endpoints, &event, 2)
+            .await
+            .unwrap()
+            .accepted
+            .len(),
+        2
+    );
+    assert_eq!(
+        received.each_ref().map(|n| n.load(Ordering::SeqCst)),
+        count,
+        "complete retained union is readback-only"
+    );
+    fixture.relay.published(&fixture._generation).await.unwrap();
+    drop(relays);
+}

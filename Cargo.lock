@@ -2390,6 +2390,7 @@ dependencies = [
  "nostr",
  "nostr-relay-builder",
  "nostr-sdk",
+ "receiver-installation-verifier",
  "serde",
  "serde_json",
  "sha2 0.10.9",

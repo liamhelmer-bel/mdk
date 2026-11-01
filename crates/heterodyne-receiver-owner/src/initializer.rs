@@ -500,7 +500,7 @@ pub(crate) fn valid_targets(values: &[String]) -> bool {
         let Ok(url) = nostr::RelayUrl::parse(value) else {
             return false;
         };
-        if parsed.contains(&url) {
+        if url.to_string() != *value || parsed.contains(&url) {
             return false;
         }
         parsed.push(url);

@@ -21,3 +21,9 @@ mod initializer_entry;
 pub fn protected_initializer_entry() -> bool {
     initializer_entry::entry().is_ok()
 }
+
+mod owner_entry;
+/// Fixed root supervisor entry. No configurable executable or arbitrary plan.
+pub fn protected_owner_init_entry() -> bool {
+    owner_entry::entry().is_ok()
+}

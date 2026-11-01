@@ -43,6 +43,10 @@ fn duplicate(file: &File) -> Result<File> {
 impl OwnedChild {
     /// Called only by fixed source composition after its profile/custody checks.
     /// No process, authority context or executable path can arrive over JSON.
+    pub(crate) fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
     pub(crate) fn initializer(
         executable: &File,
         descriptors: &[(RawFd, &File)],
@@ -106,6 +110,7 @@ impl OwnedChild {
             return Err(io::Error::last_os_error().into());
         }
         let parentfd = unsafe { File::from_raw_fd(parentfd as i32) };
+        let parentfd = duplicate(&parentfd)?;
         // Linux x86_64 raw clone has fork semantics without a user stack. All
         // child operations below are libc/syscalls over preallocated buffers.
         let pid = unsafe {

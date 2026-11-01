@@ -15,6 +15,7 @@ pub(crate) struct Facts {
     pub(crate) expiry_profile_sha256: String,
     pub(crate) installation_index_sha256: String,
     pub(crate) account: String,
+    pub(crate) expected_welcomer: String,
     pub(crate) key_package_ref: String,
     pub(crate) capability_template: String,
     pub(crate) capability_policy_sha256: String,
@@ -132,7 +133,7 @@ pub(crate) fn receive(file: &File, pid: libc::pid_t, uid: u32) -> io::Result<(Fa
                 valid = false;
             } else if (*c).cmsg_type == libc::SCM_RIGHTS {
                 let bytes = (*c).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
-                if bytes % size_of::<i32>() != 0 {
+                if !bytes.is_multiple_of(size_of::<i32>()) {
                     valid = false;
                 }
                 for i in 0..bytes / size_of::<i32>() {
@@ -198,6 +199,7 @@ mod tests {
             expiry_profile_sha256: "12".repeat(32),
             installation_index_sha256: "23".repeat(32),
             account: "34".repeat(32),
+            expected_welcomer: "78".repeat(32),
             key_package_ref: "45".repeat(32),
             capability_template: "routing-only-v1".into(),
             capability_policy_sha256: "56".repeat(32),

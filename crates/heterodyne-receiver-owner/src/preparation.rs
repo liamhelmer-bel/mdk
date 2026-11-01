@@ -1003,7 +1003,7 @@ pub(crate) mod tests {
             .is_err()
         );
         // A concurrent retry must wait until the detached original has fsynced
-        // its actual receipt; both Reported records remain in causal order.
+        // its actual receipt; the completed retained union needs no resend.
         fixture
             .relay
             .publish_event(&endpoints, &event, 1)
@@ -1014,7 +1014,7 @@ pub(crate) mod tests {
             .iter()
             .filter(|r| r["attempt"]["state"] == "reported")
             .collect();
-        assert_eq!(reported.len(), 2);
+        assert_eq!(reported.len(), 1);
         assert_eq!(
             reported[0]["accepted"][0],
             serde_json::json!([endpoints[0].as_str()])
@@ -1331,7 +1331,7 @@ pub(crate) mod tests {
             first
                 .metadata
                 .app_components
-                .contains(&NOSTR_ROUTING_COMPONENT_ID)
+                .contains(&cgka_traits::NOSTR_ROUTING_COMPONENT_ID)
         );
         let second = prepare(&database, &key, keys.clone(), &slot, endpoints.clone())
             .await

@@ -25,39 +25,40 @@ use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 type Result<T> = std::result::Result<T, ()>;
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Profile {
-    schema: String,
-    request_sha256: String,
-    storage_generation: String,
-    receiver_uid: u32,
-    consumer_uid: u32,
-    group: String,
-    operators: Vec<String>,
-    inbox_endpoints: Vec<String>,
-    key_package_endpoints: Vec<String>,
-    minimum_accepted_endpoints: usize,
-    deadline_unix_ms: u64,
-    wait_seconds: u64,
-    expiry_profile_sha256: String,
-    installation: Installation,
-    capability_template: String,
-    capability_policy_sha256: String,
+pub(super) struct Profile {
+    pub(super) schema: String,
+    pub(super) request_sha256: String,
+    pub(super) storage_generation: String,
+    pub(super) receiver_uid: u32,
+    pub(super) consumer_uid: u32,
+    pub(super) group: String,
+    pub(super) operators: Vec<String>,
+    pub(super) expected_welcomer: String,
+    pub(super) inbox_endpoints: Vec<String>,
+    pub(super) key_package_endpoints: Vec<String>,
+    pub(super) minimum_accepted_endpoints: usize,
+    pub(super) deadline_unix_ms: u64,
+    pub(super) wait_seconds: u64,
+    pub(super) expiry_profile_sha256: String,
+    pub(super) installation: Installation,
+    pub(super) capability_template: String,
+    pub(super) capability_policy_sha256: String,
 }
-fn hash(value: &str, len: usize) -> bool {
+pub(super) fn hash(value: &str, len: usize) -> bool {
     value.len() == len
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 fn now() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ())?
         .as_millis()
         .try_into()
-        .map_err(|_| ())?)
+        .map_err(|_| ())
 }
-fn protected_bytes(file: &File) -> Result<Vec<u8>> {
+pub(super) fn protected_bytes(file: &File) -> Result<Vec<u8>> {
     let m = file.metadata().map_err(|_| ())?;
     let f = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
     if !m.is_file()
@@ -106,6 +107,7 @@ fn endpoints(values: &[String]) -> Result<()> {
         if value.len() > 2048
             || !value.starts_with("wss://")
             || nostr::RelayUrl::parse(value).is_err()
+            || nostr::RelayUrl::parse(value).is_ok_and(|url| url.to_string() != *value)
             || !seen.insert(value)
         {
             return Err(());
@@ -113,7 +115,7 @@ fn endpoints(values: &[String]) -> Result<()> {
     }
     Ok(())
 }
-fn profile(raw: &[u8]) -> Result<Profile> {
+pub(super) fn profile(raw: &[u8]) -> Result<Profile> {
     let value =
         receiver_installation_verifier::installation::parse_canonical(raw).map_err(|_| ())?;
     let p: Profile = serde_json::from_value(value).map_err(|_| ())?;
@@ -125,6 +127,7 @@ fn profile(raw: &[u8]) -> Result<Profile> {
         || p.consumer_uid == 0
         || p.consumer_uid == p.receiver_uid
         || !hash(&p.group, 32)
+        || !hash(&p.expected_welcomer, 64)
         || p.operators.is_empty()
         || p.operators.len() > 64
         || p.operators.iter().any(|o| !hash(o, 64))
@@ -321,24 +324,41 @@ pub(crate) fn entry() -> Result<()> {
             for (i, list) in lists.iter().enumerate() {
                 let event = serde_json::from_slice(&list.bytes).map_err(|_| ())?;
                 let targets = if i == 1 { &inbox } else { &kp };
-                let outcome = relay
-                    .publish_event(targets, &event, p.minimum_accepted_endpoints)
-                    .await
-                    .map_err(|_| ())?;
-                if outcome.accepted.len() < p.minimum_accepted_endpoints {
+                let mut complete = false;
+                for _ in 0..targets.len() {
+                    let outcome = relay
+                        .publish_event(targets, &event, p.minimum_accepted_endpoints)
+                        .await
+                        .map_err(|_| ())?;
+                    if outcome.accepted.len() >= p.minimum_accepted_endpoints {
+                        complete = true;
+                        break;
+                    }
+                }
+                if !complete {
                     return Err(());
                 }
             }
-            let publisher = preparation::ExactPublisher::new(
-                prepared.clone(),
-                relay.clone(),
-                p.minimum_accepted_endpoints,
-                Duration::from_secs(25),
-            )
-            .map_err(|_| ())?;
-            preparation::publish_pending(&database, &key, &keys, publisher)
-                .await
+            let mut promoted = false;
+            for _ in 0..kp.len() {
+                let publisher = preparation::ExactPublisher::new(
+                    prepared.clone(),
+                    relay.clone(),
+                    p.minimum_accepted_endpoints,
+                    Duration::from_secs(25),
+                )
                 .map_err(|_| ())?;
+                if preparation::publish_pending(&database, &key, &keys, publisher)
+                    .await
+                    .is_ok()
+                {
+                    promoted = true;
+                    break;
+                }
+            }
+            if !promoted {
+                return Err(());
+            }
             relay.published(&generation).await.map_err(|_| ())?;
             let facts = Facts {
                 schema: "heterodyne-owned-initialization.v1".into(),
@@ -348,6 +368,7 @@ pub(crate) fn entry() -> Result<()> {
                 expiry_profile_sha256: p.expiry_profile_sha256.clone(),
                 installation_index_sha256: p.installation.index_sha256.clone(),
                 account: keys.public_key().to_hex(),
+                expected_welcomer: p.expected_welcomer.clone(),
                 key_package_ref: prepared.metadata.key_package_ref_hex,
                 capability_template: p.capability_template.clone(),
                 capability_policy_sha256: p.capability_policy_sha256.clone(),

@@ -127,6 +127,23 @@ impl JournaledRelay {
         {
             return Err(hold());
         }
+        let accepted = self.update(move |ledger| ledger.accepted(index)).await?;
+        if accepted.len() >= binding.required_acks {
+            let mut cumulative =
+                NostrPublishOutcome::accepted(accepted.into_iter().map(TransportEndpoint));
+            cumulative.message_id = Some(cgka_traits::MessageId::new(
+                hex::decode(&binding.event_id).map_err(|_| hold())?,
+            ));
+            return Ok(cumulative);
+        }
+        let missing = endpoints
+            .iter()
+            .filter(|endpoint| !accepted.contains(&endpoint.0))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Err(hold());
+        }
         let owned_binding = binding.clone();
         let sequence = self
             .update(move |ledger| ledger.begin_attempt(index, &owned_binding))
@@ -138,8 +155,9 @@ impl JournaledRelay {
             // Capture an actual positive report below the overall threshold.
             // The SDK may return after its first positive; the immutable
             // publisher threshold is enforced against the fsynced union.
-            // This does not guarantee fairness among slow relay endpoints.
-            self.relay.publish_event(endpoints, event, 1),
+            // Already-retained positive endpoints cannot starve the missing
+            // endpoints when the SDK returns after its first positive.
+            self.relay.publish_event(&missing, event, 1),
         )
         .await
         {
