@@ -138,6 +138,11 @@ pub(super) fn entry() -> bool {
         let profile: FreshProfile =
             serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         profile.check()?;
+        // The bounded factory remains available for native qualification; its
+        // full receive/publication gate is not cleared for an installed generation.
+        if profile.template()? != crate::protected_capability_policy::routing_only_v1() {
+            return Err(ReceiverHold::Configuration);
+        }
         anchor_custody::harden_process(profile.receiver_uid)?;
         let mut claimed = (4..=16).map(inherited).collect::<Result<Vec<_>, _>>()?;
         let expiry = claimed.pop().ok_or(ReceiverHold::Configuration)?;

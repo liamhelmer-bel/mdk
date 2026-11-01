@@ -113,6 +113,15 @@ pub(crate) fn entry() -> bool {
             .enrollment
             .check()
             .map_err(|_| ReceiverHold::Configuration)?;
+        if crate::protected_capability_policy::Template::from_policy(
+            &profile.enrollment.capability_template,
+            &profile.enrollment.capability_policy_sha256,
+        )
+        .map_err(|_| ReceiverHold::Configuration)?
+            != crate::protected_capability_policy::routing_only_v1()
+        {
+            return Err(ReceiverHold::Configuration);
+        }
         // Claim every inherited slot before Tokio can allocate epoll/eventfd into
         // a missing descriptor number. No runtime owns any of these slots yet.
         let installation = profile
