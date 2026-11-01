@@ -143,6 +143,12 @@ pub(super) fn profile(raw: &[u8]) -> Result<Profile> {
     }
     endpoints(&p.inbox_endpoints)?;
     endpoints(&p.key_package_endpoints)?;
+    let selected = cgka_engine::protected_capability_policy::admind_receiver_v1();
+    if p.capability_template != selected.id()
+        || p.capability_policy_sha256 != selected.policy_sha256()
+    {
+        return Err(());
+    }
     Ok(p)
 }
 fn drop_privilege(uid: u32, parent: &File, ledger: &File) -> Result<()> {
@@ -216,8 +222,8 @@ pub(crate) fn entry() -> Result<()> {
         &p.capability_policy_sha256,
     )
     .map_err(|_| ())?;
-    // Bounded QUIC support is not qualified by schema selection alone.
-    if selected.id() != "routing-only-v1" {
+    // Fixed production policy is the reviewed current admin-group template.
+    if selected != cgka_engine::protected_capability_policy::admind_receiver_v1() {
         return Err(());
     }
     cgka_engine::protected_expiry_policy::verify_descriptor(&expiry, &p.expiry_profile_sha256)

@@ -50,6 +50,17 @@ impl Installation {
         )?))
     }
     pub fn verify(&self) -> Result<Verified> {
+        let checked = self.verify_readback()?;
+        crate::runtime_config::require_fixed_etc(&checked.root)?;
+        Ok(checked)
+    }
+    /// Read-only host-parent evidence. Complete indexed bytes and actual host
+    /// loader baseline are checked, but host /etc is deliberately not replaced.
+    /// This distinct result cannot be supplied to the receiver's strict API.
+    pub fn verify_host_parent(&self) -> Result<HostVerified> {
+        Ok(HostVerified(self.verify_readback()?))
+    }
+    fn verify_readback(&self) -> Result<Verified> {
         self.check()?;
         let root = open_protected(&self.root)?;
         let index = Index::read_published_until(
@@ -61,7 +72,6 @@ impl Installation {
             return Err(Error::Encoding);
         }
         crate::runtime_recipe::qualify_index(&index.as_value()?).map_err(|_| Error::Encoding)?;
-        crate::runtime_config::require_fixed_etc(&root)?;
         // The complete baseline bytes are corroborated independently of the tree.
         let external = index.inspect_external_baseline(&open_protected(Path::new("/"))?)?;
         crate::runtime_platform::qualify(&index, &root, &external)?;
@@ -150,5 +160,34 @@ impl Verified {
                 ))
             })
             .collect()
+    }
+}
+
+/// Fixed host composition evidence, not receiver mount admission or consent.
+pub struct HostVerified(Verified);
+impl HostVerified {
+    pub fn check(&self) -> Result<()> {
+        let checked = self.0.reference.verify_host_parent()?;
+        let old = self.0.root.metadata().map_err(|_| Error::Path)?;
+        let new = checked.0.root.metadata().map_err(|_| Error::Path)?;
+        if (old.dev(), old.ino()) != (new.dev(), new.ino())
+            || canonical(&serde_json::to_value(&checked.0.index).map_err(|_| Error::Encoding)?)?
+                != canonical(&serde_json::to_value(&self.0.index).map_err(|_| Error::Encoding)?)?
+        {
+            return Err(Error::Path);
+        }
+        Ok(())
+    }
+    pub fn python(&self) -> PathBuf {
+        self.0.python()
+    }
+    pub fn product_source(&self) -> PathBuf {
+        self.0.product_source()
+    }
+    pub fn purelib(&self) -> PathBuf {
+        self.0.purelib()
+    }
+    pub fn closure(&self) -> Result<Vec<(PathBuf, String)>> {
+        self.0.closure()
     }
 }

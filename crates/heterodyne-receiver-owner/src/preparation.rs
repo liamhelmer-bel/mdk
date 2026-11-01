@@ -128,7 +128,7 @@ fn publication(
 ) -> Result<NostrKeyPackagePublication, KeyPackagePublishError> {
     let metadata = key_package_metadata(&value.key_package)
         .map_err(|_| KeyPackagePublishError::unexposed("invalid native package"))?;
-    if cgka_engine::protected_capability_policy::routing_only_v1()
+    if cgka_engine::protected_capability_policy::admind_receiver_v1()
         .validate_metadata(&metadata)
         .is_err()
         || metadata.protocol_profile != ProtocolProfile::Current
@@ -395,7 +395,7 @@ pub(crate) async fn prepare(
             .map_err(|_| Error::Native)?;
     for package in &existing {
         let metadata = key_package_metadata(package).map_err(|_| Error::Native)?;
-        if cgka_engine::protected_capability_policy::routing_only_v1()
+        if cgka_engine::protected_capability_policy::admind_receiver_v1()
             .validate_metadata(&metadata)
             .is_err()
             || metadata.protocol_profile != ProtocolProfile::Current
@@ -498,7 +498,7 @@ fn open_session(
     key: &SqlCipherKey,
     keys: &nostr::Keys,
 ) -> Result<AccountDeviceSession, Error> {
-    let selected = cgka_engine::protected_capability_policy::routing_only_v1();
+    let selected = cgka_engine::protected_capability_policy::admind_receiver_v1();
     let config = SessionConfig::new(
         database,
         SqlCipherKey::new(key.as_secret_str()).map_err(|_| Error::Native)?,
@@ -1326,6 +1326,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(first.metadata.protocol_profile, ProtocolProfile::Current);
+        cgka_engine::protected_capability_policy::admind_receiver_v1()
+            .validate_metadata(&first.metadata)
+            .unwrap();
+        assert!(
+            cgka_engine::protected_capability_policy::routing_only_v1()
+                .validate_metadata(&first.metadata)
+                .is_err()
+        );
         assert_eq!(first.metadata.credential_identity_hex, identity.to_hex());
         assert!(
             first

@@ -131,7 +131,7 @@ impl OwnedConsumedDeployment {
     }
     fn admission(
         self,
-        verified: &receiver_installation_verifier::reference::Verified,
+        verified: &receiver_installation_verifier::reference::HostVerified,
         admission: &File,
         profile: &pins::ParentProfile,
         nonce_file: &File,
@@ -255,7 +255,7 @@ pub(crate) fn entry() -> Result<()> {
     {
         return Err(());
     }
-    let verified = p.installation.verify().map_err(|_| ())?;
+    let verified = p.installation.verify_host_parent().map_err(|_| ())?;
     let (nonce, nonce_file) = channel::nonce()?;
     let (incoming, outgoing) = crate::owner_entry::channel()?;
     crate::initializer_handoff::enable_credentials(&incoming).map_err(|_| ())?;

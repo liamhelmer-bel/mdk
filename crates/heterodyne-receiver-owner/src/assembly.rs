@@ -76,7 +76,7 @@ struct Request {
 }
 fn profile(installation: Installation, request: Value) -> Result<Vec<u8>> {
     let r: Request = serde_json::from_value(request).map_err(|_| ())?;
-    let template = cgka_engine::protected_capability_policy::routing_only_v1();
+    let template = cgka_engine::protected_capability_policy::admind_receiver_v1();
     let p = crate::initializer_entry::Profile {
         schema: "heterodyne-protected-receiver-initializer.v2".into(),
         request_sha256: r.request_sha256,
@@ -163,7 +163,19 @@ mod tests {
         let actual = parse_canonical(&profile(i.clone(), r.clone()).unwrap()).unwrap();
         assert_eq!(actual["receiver_uid"], 899);
         assert_eq!(actual["consumer_uid"], 898);
-        assert_eq!(actual["capability_template"], "routing-only-v1");
+        assert_eq!(actual["capability_template"], "admind-receiver-v1");
+        for template in [
+            cgka_engine::protected_capability_policy::routing_only_v1(),
+            cgka_engine::protected_capability_policy::bounded_app_receiver_v1(),
+        ] {
+            let mut changed = actual.clone();
+            changed["capability_template"] = json!(template.id());
+            changed["capability_policy_sha256"] = json!(template.policy_sha256());
+            assert!(crate::initializer_entry::profile(&canonical(&changed).unwrap()).is_err());
+        }
+        let mut changed = actual.clone();
+        changed["capability_policy_sha256"] = json!("0".repeat(64));
+        assert!(crate::initializer_entry::profile(&canonical(&changed).unwrap()).is_err());
         for field in [
             "receiver_uid",
             "consumer_uid",

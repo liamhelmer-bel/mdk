@@ -50,4 +50,6 @@ mod host_child;
 mod host_inputs;
 mod host_parent;
 /// Fixed live host parent. No result-file or caller capability constructor.
-pub fn protected_host_parent_entry()->bool { host_parent::entry().is_ok() }
+pub fn protected_host_parent_entry() -> bool {
+    host_parent::entry().is_ok()
+}
