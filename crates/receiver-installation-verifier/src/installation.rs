@@ -555,4 +555,4 @@ pub mod index_tests {
 
 #[path = "installation_tree.rs"]
 mod tree;
-pub use tree::{inventory_candidate, ElfObject, ExternalObject};
+pub use tree::{ElfObject, ExternalObject, inventory_candidate};

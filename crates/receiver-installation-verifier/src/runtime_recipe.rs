@@ -34,6 +34,7 @@ pub fn qualify_index(index: &Value) -> Result<(), &'static str> {
             || path == "bin/heterodyne-receiver-initialize"
             || path == "bin/heterodyne-receiver-owner-init"
             || path == "python"
+            || path == "python/empty-certs"
             || path == "python/bin"
             || path == "python/bin/python3.12"
             || path == "python/lib"
