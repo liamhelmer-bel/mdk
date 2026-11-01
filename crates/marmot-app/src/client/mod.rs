@@ -2542,6 +2542,49 @@ impl AppClient {
         })
     }
 
+    /// Capture native membership, policy, routing and capabilities without
+    /// changing the UI projection or persisting membership reconciliation.
+    pub(crate) fn group_native_roster(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<crate::AppNativeGroupRoster, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let mut group_record = self
+            .state_group_record(group_id)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?;
+        let members = self.members_with_profiles_unchecked(group_id, &HashMap::new())?;
+        let my_id = hex::encode(self.adapter.account_id().as_slice());
+        let stored = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_record.group_id_hex)?;
+        // Durable departure/removal is a local veto even while an older native
+        // epoch still contains this account. Never turn that veto into Member.
+        group_record.self_membership = stored.unwrap_or(group_record.self_membership);
+        if group_record.self_membership == SelfMembership::Member
+            && !members.iter().any(|m| m.member_id_hex == my_id)
+        {
+            group_record.self_membership = SelfMembership::Removed;
+        }
+        group_record.admin_policy =
+            crate::AppGroupAdminPolicyComponent::new(self.runtime.admin_pubkeys(group_id)?);
+        let nostr_routing = self.nostr_routing_for_group(group_id)?;
+        let mls_state = self.group_mls_state_unchecked(group_id)?;
+        let roster = crate::groups::app_group_roster_from_session(
+            crate::groups::AppGroupRosterSession {
+                group_record,
+                members,
+                mls_state: mls_state.clone(),
+            },
+            &my_id,
+            HashMap::new(),
+        );
+        Ok(crate::AppNativeGroupRoster {
+            roster,
+            mls_state,
+            nostr_routing,
+        })
+    }
+
     fn group_mls_state_unchecked(&self, group_id: &GroupId) -> Result<AppGroupMlsState, AppError> {
         let group = self.runtime.group_record(group_id)?;
         let lifecycle_state = self
@@ -2580,6 +2623,18 @@ impl AppClient {
             epoch: group.epoch.0,
             member_count: group.members.len(),
             unrecoverable: group.unrecoverable,
+            required_extensions: group
+                .required_capabilities
+                .extensions
+                .iter()
+                .copied()
+                .collect(),
+            required_proposals: group
+                .required_capabilities
+                .proposals
+                .iter()
+                .copied()
+                .collect(),
             required_app_components: group
                 .required_capabilities
                 .app_components

@@ -31,6 +31,8 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid group create request: {0}")]
     InvalidGroupCreate(&'static str),
+    #[error("native group roster is inconsistent or exceeds control limits")]
+    InvalidNativeGroupRoster,
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
     #[error("invalid profile {0}: {1}")]
@@ -91,6 +93,7 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
+            Self::InvalidNativeGroupRoster => "invalid_native_group_roster",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::InvalidProfileField(_, _) => "invalid_profile_field",
             Self::InvalidRelayUrl(_) => "invalid_relay_url",
@@ -140,6 +143,9 @@ impl ConnectorError {
                 "only a group admin can make this change"
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
+            Self::InvalidNativeGroupRoster => {
+                "native group roster is inconsistent or exceeds control limits"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::InvalidProfileField(_, _) => "invalid profile field",
             Self::InvalidRelayUrl(_) => "invalid relay URL",
@@ -174,7 +180,11 @@ impl ConnectorError {
             self,
             Self::SendInProgress
                 | Self::RelayListInconclusive(_)
-                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+                | Self::App(
+                    AppError::AccountWorkerBusy
+                        | AppError::MediaUploadTimedOut
+                        | AppError::AgentStreamSendFailed(_)
+                )
         )
     }
 

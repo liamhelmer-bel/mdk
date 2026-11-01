@@ -40,6 +40,22 @@ pub(crate) fn group_info_subject_from_projection<E>(
     }
 }
 
+/// Pending records can project membership ahead of committed admin policy.
+/// Refuse them before constructing any successful authority response.
+pub(crate) fn validate_native_roster_state(
+    native: &marmot_app::AppNativeGroupRoster,
+) -> Result<(), ConnectorError> {
+    if native.mls_state.lifecycle_state != marmot_app::AppGroupLifecycleState::Stable
+        || native.mls_state.unrecoverable
+        || native.mls_state.disbanding
+        || native.roster.members.len() > 4096
+        || native.roster.members.len() != native.mls_state.member_count
+    {
+        return Err(ConnectorError::InvalidNativeGroupRoster);
+    }
+    Ok(())
+}
+
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
 /// Current schema version for persisted `send_media` request fingerprints.
@@ -380,6 +396,61 @@ impl AgentConnector {
             message_ids_hex: summary.message_ids,
             maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
         })
+    }
+
+    /// Observe membership, routing and the complete required-capability set from
+    /// one live account-worker read. Cached startup/Welcome snapshots are refused.
+    pub(crate) async fn group_roster_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(normalize_hex(group_id_hex)?)?);
+        let native = self
+            .runtime
+            .group_native_roster(&account.label, &group_id)
+            .await?;
+        validate_native_roster_state(&native)?;
+        let roster = native.roster;
+        let members = roster
+            .members
+            .into_iter()
+            .map(|member| agent_control::AgentControlGroupRosterMember {
+                member_id_hex: member.member_id_hex,
+                is_admin: member.is_admin,
+                is_self: member.is_self,
+            })
+            .collect();
+        let self_membership = match roster.self_membership {
+            marmot_app::SelfMembership::Member => "member",
+            marmot_app::SelfMembership::Left => "left",
+            marmot_app::SelfMembership::Removed => "removed",
+        };
+        let response = AgentControlResponse::GroupRoster {
+            account_id_hex: account.account_id_hex,
+            group_id_hex: native.mls_state.group_id_hex,
+            epoch: native.mls_state.epoch,
+            roster_revision: roster.roster_revision,
+            member_count: native.mls_state.member_count,
+            self_membership: self_membership.to_owned(),
+            lifecycle_state: "stable".to_owned(),
+            unrecoverable: native.mls_state.unrecoverable,
+            required_extensions: native.mls_state.required_extensions,
+            required_proposals: native.mls_state.required_proposals,
+            required_app_components: native.mls_state.required_app_components,
+            nostr_group_id_hex: native.nostr_routing.nostr_group_id_hex,
+            relays: native.nostr_routing.relays,
+            members,
+        };
+        // Bound serialized output, including arbitrarily long routing URLs.
+        // Connection handling separately checks the complete actual envelope.
+        if agent_control::encode_frame(&response)?.len()
+            > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+        {
+            return Err(ConnectorError::InvalidNativeGroupRoster);
+        }
+        Ok(response)
     }
 
     /// Report group membership for an account's group so a channel can decide

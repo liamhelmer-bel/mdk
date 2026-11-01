@@ -4059,6 +4059,162 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     ))
     .unwrap();
 
+    // The live read comes from the owning native session, including the full
+    // capability sets and native admin policy, rather than a count/UI cache.
+    let roster = timeout(Duration::from_secs(30), async {
+        loop {
+            match connector
+                .group_roster_response(&agent.account.account_id_hex, &named_group_hex)
+                .await
+            {
+                Err(crate::ConnectorError::App(AppError::AccountWorkerBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let AgentControlResponse::GroupRoster {
+        account_id_hex,
+        group_id_hex,
+        epoch,
+        roster_revision,
+        member_count,
+        self_membership,
+        lifecycle_state,
+        unrecoverable,
+        required_extensions,
+        required_proposals,
+        required_app_components,
+        nostr_group_id_hex,
+        relays,
+        members,
+    } = &roster
+    else {
+        panic!("expected native roster")
+    };
+    assert_eq!(account_id_hex, &agent.account.account_id_hex);
+    assert_eq!(group_id_hex, &named_group_hex);
+    assert_eq!(*member_count, 2);
+    assert_eq!(self_membership, "member");
+    assert!(!unrecoverable);
+    assert_eq!(lifecycle_state, "stable");
+    assert!(!nostr_group_id_hex.is_empty());
+    assert!(!relays.is_empty());
+    let state = connector
+        .runtime
+        .group_mls_state(&agent.account.account_id_hex, &named_group)
+        .await
+        .unwrap();
+    assert_eq!(*epoch, state.epoch);
+    assert_eq!(*roster_revision, epoch.saturating_mul(3));
+    assert_eq!(required_extensions, &state.required_extensions);
+    assert_eq!(required_proposals, &state.required_proposals);
+    assert_eq!(required_app_components, &state.required_app_components);
+    // The actual native snapshot is accepted only at a stable frontier.
+    let native = connector
+        .runtime
+        .group_native_roster(&agent.account.account_id_hex, &named_group)
+        .await
+        .unwrap();
+    crate::messaging::validate_native_roster_state(&native).unwrap();
+    for lifecycle in [
+        marmot_app::AppGroupLifecycleState::PendingPublish,
+        marmot_app::AppGroupLifecycleState::Merging,
+        marmot_app::AppGroupLifecycleState::Recovering,
+        marmot_app::AppGroupLifecycleState::Unrecoverable,
+        marmot_app::AppGroupLifecycleState::Disbanded,
+    ] {
+        let mut unstable = native.clone();
+        unstable.mls_state.lifecycle_state = lifecycle;
+        assert!(matches!(
+            crate::messaging::validate_native_roster_state(&unstable),
+            Err(crate::ConnectorError::InvalidNativeGroupRoster)
+        ));
+    }
+    let mut unreadable = native.clone();
+    unreadable.mls_state.unrecoverable = true;
+    assert!(matches!(
+        crate::messaging::validate_native_roster_state(&unreadable),
+        Err(crate::ConnectorError::InvalidNativeGroupRoster)
+    ));
+    let mut disbanding = native.clone();
+    disbanding.mls_state.disbanding = true;
+    assert!(matches!(
+        crate::messaging::validate_native_roster_state(&disbanding),
+        Err(crate::ConnectorError::InvalidNativeGroupRoster)
+    ));
+    // Normative constants, independent of the response's MLS projection.
+    assert!(
+        required_app_components.contains(&cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID)
+    );
+    assert!(
+        required_app_components
+            .contains(&cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+    );
+    assert!(!required_extensions.is_empty());
+    assert!(!required_proposals.is_empty());
+
+    assert_eq!(members.len(), 2);
+    let owner = members
+        .iter()
+        .find(|m| m.member_id_hex == agent.account.account_id_hex)
+        .unwrap();
+    assert!(owner.is_admin && owner.is_self);
+    let peer = members
+        .iter()
+        .find(|m| m.member_id_hex == human.account.account_id_hex)
+        .unwrap();
+    assert!(!peer.is_admin && !peer.is_self);
+    let frame = encode_frame(&roster).unwrap();
+    assert_eq!(
+        decode_frame::<AgentControlResponse>(&frame).unwrap(),
+        roster
+    );
+    // A legal incoming frame can still produce an oversized outgoing envelope
+    // when its echoed request ID is combined with the actual native roster.
+    let oversized_id = "x".repeat(agent_control::MAX_AGENT_CONTROL_FRAME_BYTES - 256);
+    let request = AgentControlEnvelope::new(
+        Some(oversized_id),
+        AgentControlRequest::GroupRoster {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: named_group_hex.clone(),
+        },
+    );
+    assert!(encode_frame(&request).unwrap().len() <= agent_control::MAX_AGENT_CONTROL_FRAME_BYTES);
+    let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (result, bytes) = tokio::join!(connector.handle_connection(server), async {
+        write_frame(&mut client, &request).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut bytes)
+            .await
+            .unwrap();
+        bytes
+    });
+    result.unwrap();
+    assert!(bytes.len() <= agent_control::MAX_AGENT_CONTROL_FRAME_BYTES);
+    let error = decode_frame::<AgentControlEnvelope<AgentControlResponse>>(&bytes).unwrap();
+    assert_eq!(error.id, request.id);
+    assert!(
+        matches!(error.payload, AgentControlResponse::Error { code, .. } if code == "invalid_native_group_roster")
+    );
+    assert!(crate::ConnectorError::App(AppError::AccountWorkerBusy).retryable());
+
+    assert!(
+        connector
+            .group_roster_response(&"00".repeat(32), &named_group_hex)
+            .await
+            .is_err()
+    );
+    assert!(
+        connector
+            .group_roster_response(&agent.account.account_id_hex, &other_group_hex)
+            .await
+            .is_err()
+    );
+
     let named = connector
         .group_info_response(&agent.account.account_id_hex, &named_group_hex)
         .await

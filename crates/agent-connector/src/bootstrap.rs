@@ -522,6 +522,7 @@ fn response_type_name(response: &AgentControlResponse) -> &'static str {
         AgentControlResponse::GroupCreated { .. } => "group_created",
         AgentControlResponse::GroupInfo { .. } => "group_info",
         AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
+        AgentControlResponse::GroupRoster { .. } => "group_roster",
         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlResponse::KeyPackageMaintenanceStatus { .. } => {
             "key_package_maintenance_status"

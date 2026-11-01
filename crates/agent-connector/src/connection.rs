@@ -125,7 +125,24 @@ impl AgentConnector {
             Ok(response) => response,
             Err(err) => self.error_response("handle_connection", &err),
         };
-        let response = AgentControlEnvelope::new(request.id, response);
+        let native_roster = matches!(&response, AgentControlResponse::GroupRoster { .. });
+        let mut response = AgentControlEnvelope::new(request.id, response);
+        if native_roster
+            && agent_control::encode_frame(&response)?.len()
+                > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+        {
+            response.payload = self.error_response(
+                "group_roster_envelope",
+                &ConnectorError::InvalidNativeGroupRoster,
+            );
+            // Prefer preserving correlation. If the echoed ID alone prevents a
+            // bounded error, omit it rather than writing an oversized frame.
+            if agent_control::encode_frame(&response)?.len()
+                > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+            {
+                response.id = None;
+            }
+        }
         write_control_frame(&mut write_half, &response).await?;
         Ok(())
     }
@@ -186,6 +203,7 @@ impl AgentConnector {
             | AgentControlRequest::AccountRelayLists { .. }
             | AgentControlRequest::DiagnosticStatus { .. }
             | AgentControlRequest::GroupInfo { .. }
+            | AgentControlRequest::GroupRoster { .. }
             | AgentControlRequest::MaintenanceStatus { .. }
             | AgentControlRequest::KeyPackageMaintenanceStatus { .. }
             | AgentControlRequest::MaintenanceGetPolicy { .. }
@@ -324,6 +342,13 @@ impl AgentConnector {
                     description,
                 )
                 .await
+            }
+            AgentControlRequest::GroupRoster {
+                account_id_hex,
+                group_id_hex,
+            } => {
+                self.group_roster_response(&account_id_hex, &group_id_hex)
+                    .await
             }
             AgentControlRequest::MaintenanceStatus {
                 account_id_hex,

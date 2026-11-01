@@ -170,6 +170,7 @@ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'sta
         AgentControlRequest::GroupCreate { .. } => "group_create",
         AgentControlRequest::GroupInfo { .. } => "group_info",
         AgentControlRequest::GroupProfileUpdate { .. } => "group_profile_update",
+        AgentControlRequest::GroupRoster { .. } => "group_roster",
         AgentControlRequest::GroupLeave { .. } => "group_leave",
         AgentControlRequest::MaintenanceStatus { .. } => "maintenance_status",
         AgentControlRequest::KeyPackageMaintenanceStatus { .. } => "key_package_maintenance_status",
