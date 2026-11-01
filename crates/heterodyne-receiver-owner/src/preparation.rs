@@ -671,6 +671,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actual_sdk_loopback_publishes_exact_setup_cohort() {
+        use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let endpoint = TransportEndpoint(relay.url().await.to_string());
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("account.sqlite3");
+        let key = SqlCipherKey::new("disposable-loopback-sdk-only").unwrap();
+        let keys = nostr::Keys::generate();
+        let prepared = prepare(
+            &database,
+            &key,
+            keys.clone(),
+            &"d4".repeat(32),
+            vec![endpoint.clone()],
+        )
+        .await
+        .unwrap();
+        let setup = relay_lists(
+            &keys,
+            prepared.artifact.created_at,
+            vec![endpoint.clone()],
+            vec![endpoint.clone()],
+        )
+        .unwrap();
+        let expected = [
+            setup[0].clone(),
+            setup[1].clone(),
+            prepared.artifact.clone(),
+        ];
+        // No SDK signer is installed: all published events must already carry
+        // the exact retained native account's real signature.
+        let sdk = Arc::new(NostrSdkRelayClient::new(
+            nostr_sdk::Client::builder().build(),
+        ));
+        for artifact in &setup {
+            let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes).unwrap();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(outcome.accepted.len(), 1);
+        }
+        let publisher =
+            ExactPublisher::new(prepared, sdk.clone(), 1, std::time::Duration::from_secs(5))
+                .unwrap();
+        publish_pending(&database, &key, &keys, publisher)
+            .await
+            .unwrap();
+        let observer = nostr_sdk::Client::builder().build();
+        observer.add_relay(endpoint.as_str()).await.unwrap();
+        observer.connect().await;
+        let ids: Vec<_> = expected
+            .iter()
+            .map(|a| nostr::EventId::from_slice(a.id.as_slice()).unwrap())
+            .collect();
+        let fetched = observer
+            .fetch_events(
+                nostr::Filter::new().ids(ids),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.len(), 3);
+        for artifact in expected {
+            let event = fetched
+                .iter()
+                .find(|e| e.id.to_bytes().as_slice() == artifact.id.as_slice())
+                .unwrap();
+            event.verify().unwrap();
+            assert_eq!(event.pubkey, keys.public_key());
+            assert_eq!(
+                serde_json::to_vec(&NostrTransportEvent::from_nostr_event(event).unwrap()).unwrap(),
+                artifact.bytes
+            );
+        }
+        observer.shutdown().await;
+        assert_eq!(sdk.relay_health().await.total_relays, 0);
+    }
+
+    #[tokio::test]
     async fn native_promotion_requires_threshold_and_refuses_promoted_reentry() {
         use std::sync::atomic::Ordering;
         let temp = tempfile::tempdir().unwrap();

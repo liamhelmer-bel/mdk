@@ -2388,6 +2388,8 @@ dependencies = [
  "libc",
  "marmot-account",
  "nostr",
+ "nostr-relay-builder",
+ "nostr-sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
