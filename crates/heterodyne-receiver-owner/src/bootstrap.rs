@@ -257,6 +257,10 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         return Err(());
     }
     mount_configuration(&p.installation)?;
+    // SQLite resolves /proc/self/fd paths to their filesystem path. The
+    // protected host ancestor is deliberately unsearchable by the receiver.
+    // Retain the same directory through a private, traversable namespace path.
+    let parent = crate::material_mount::bind(&parent, p.receiver_uid).map_err(|_| ())?;
     let verified = p.installation.verify().map_err(|_| ())?;
     cgka_engine::protected_expiry_policy::verify_descriptor(&expiry, &p.expiry_profile_sha256)
         .map_err(|_| ())?;

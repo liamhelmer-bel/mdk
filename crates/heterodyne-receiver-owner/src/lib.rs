@@ -5,6 +5,7 @@
 
 mod generation;
 mod initializer;
+mod material_mount;
 mod preparation;
 mod publication_journal;
 
