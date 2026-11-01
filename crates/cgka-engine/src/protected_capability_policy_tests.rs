@@ -173,6 +173,7 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             .unwrap();
         let constraint = |template| JoinConstraint {
             group: group.clone(),
+            expected_welcomer: inviter.self_id(),
             operators: vec![inviter.self_id()],
             key_package_ref: reference.clone(),
             template,
@@ -317,8 +318,16 @@ async fn rollbackable_bounded_policy_refuses_native_valid_wider_values_without_s
             // the protected receiver never retries its refused original.
             assert!(matches!(
                 native_control.ingest(commit).await.unwrap(),
-                cgka_traits::ingest::IngestOutcome::Processed
+                cgka_traits::ingest::IngestOutcome::Buffered { .. }
             ));
+            // The ordinary engine uses its deterministic convergence tick;
+            // unlike the protected direct-update path it may adopt new policy.
+            assert!(
+                native_control
+                    .advance_convergence_inputs_until_settled(&group, u64::MAX)
+                    .await
+                    .unwrap()
+            );
             assert!(
                 native_control
                     .with_mls_group(&group, |native| bounded_app_receiver_v1()
@@ -469,6 +478,7 @@ async fn extra_required_primitives_refuse_before_intent_with_native_valid_contro
         };
         let constraint = |template| JoinConstraint {
             group: group.clone(),
+            expected_welcomer: inviter.self_id(),
             operators: vec![inviter.self_id()],
             key_package_ref: reference.clone(),
             template,
@@ -703,6 +713,7 @@ async fn unrequired_group_context_extension_refuses_before_intent_with_native_co
     };
     let constraint = |template| JoinConstraint {
         group: group.clone(),
+        expected_welcomer: inviter.self_id(),
         operators: vec![inviter.self_id()],
         key_package_ref: reference.clone(),
         template,
@@ -749,6 +760,12 @@ async fn unrequired_group_context_extension_refuses_before_intent_with_native_co
 fn exact_closed_policy_codec_matches_design_bytes_and_rejects_cross_binding() {
     for template in [routing_only_v1(), bounded_app_receiver_v1()] {
         let raw = template.canonical_policy();
+        let golden: &[u8] = if template == routing_only_v1() {
+            include_bytes!("../tests/fixtures/receiver-v3/routing-only-v1.json")
+        } else {
+            include_bytes!("../tests/fixtures/receiver-v3/bounded-app-receiver-v1.json")
+        };
+        assert_eq!(raw, golden);
         let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(value["template"], template.id());
         assert_eq!(value["mls_proposals"], serde_json::json!([8]));

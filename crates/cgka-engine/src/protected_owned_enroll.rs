@@ -14,6 +14,7 @@ struct FreshProfile {
     account: String,
     group: String,
     operators: Vec<String>,
+    expected_welcomer: String,
     storage_generation: String,
     // Exact native KeyPackageRef selected by this fresh enrollment, not the
     // outer Nostr event id. Historical invitations for other packages refuse.
@@ -46,6 +47,8 @@ impl FreshProfile {
             || self.wait_seconds > 86400
             || self.endpoints.is_empty()
             || !crate::protected_recovery::valid_group(&self.group)
+            || !event_id_is_valid(&self.expected_welcomer)
+            || self.expected_welcomer == self.account
             || !event_id_is_valid(&self.account)
             || !event_id_is_valid(&self.expiry_profile_sha256)
             || !event_id_is_valid(&self.storage_generation)
@@ -213,6 +216,9 @@ async fn finish<S: StorageProvider + 'static>(
 
 fn constraint(profile: &FreshProfile) -> Result<JoinConstraint, ReceiverHold> {
     Ok(JoinConstraint {
+        expected_welcomer: MemberId::new(
+            hex::decode(&profile.expected_welcomer).map_err(|_| ReceiverHold::Malformed)?,
+        ),
         template: profile.template()?,
         group: GroupId::new(hex::decode(&profile.group).map_err(|_| ReceiverHold::Malformed)?),
         operators: profile
@@ -257,6 +263,7 @@ fn enroll_joined<S: StorageProvider + 'static>(
         account: profile.account.clone(),
         group: profile.group.clone(),
         operators: canonical_operators,
+        expected_welcomer: profile.expected_welcomer.clone(),
         source_profile_sha256: profile_sha.to_owned(),
         storage_generation: profile.storage_generation.clone(),
         initial_native_state_sha256: digest(
@@ -862,6 +869,7 @@ mod tests {
             account: hex::encode(engine.self_id().as_slice()),
             group: hex::encode(group.as_slice()),
             operators: vec![hex::encode(operator.self_id().as_slice())],
+            expected_welcomer: hex::encode(operator.self_id().as_slice()),
             storage_generation: "55".repeat(32),
             key_package_ref: crate::key_package::key_package_metadata(
                 &engine.durably_owned_key_packages().unwrap()[0],
@@ -1039,6 +1047,7 @@ mod tests {
             account: hex::encode(engine.self_id().as_slice()),
             group: hex::encode(group.as_slice()),
             operators: vec![hex::encode(operator.as_slice())],
+            expected_welcomer: hex::encode(operator.as_slice()),
             storage_generation: "55".repeat(32),
             key_package_ref: crate::protected_join::tests::key_package_ref(wire),
             endpoints: vec![TransportEndpoint("wss://fixture.invalid".into())],

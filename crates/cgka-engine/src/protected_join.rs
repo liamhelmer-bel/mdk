@@ -18,7 +18,7 @@ pub(crate) struct JoinEvidence {
     original_wire_sha256: String,
     pub(crate) group: GroupId,
     canonical_content: MessageId,
-    authenticated_welcomer: MemberId,
+    pub(super) authenticated_welcomer: MemberId,
     pub(crate) joined: Projection,
 }
 impl JoinEvidence {
@@ -46,6 +46,7 @@ pub(crate) struct Capture {
 pub(super) struct JoinConstraint {
     pub(super) group: GroupId,
     pub(super) operators: Vec<MemberId>,
+    pub(super) expected_welcomer: MemberId,
     pub(super) key_package_ref: Vec<u8>,
     pub(super) template: crate::protected_capability_policy::Template,
 }
@@ -61,7 +62,7 @@ impl Capture {
     ) -> Result<(), EngineError> {
         if self.constraint.as_ref().is_some_and(|expected| {
             &expected.group != group
-                || !expected.operators.contains(welcomer)
+                || &expected.expected_welcomer != welcomer
                 || expected.key_package_ref != key_package_ref
         }) {
             self.policy_rejected = true;

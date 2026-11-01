@@ -301,6 +301,11 @@ async fn run(
         &original,
         &binding,
     )?;
+    // The child may have performed external reads. Revalidate the complete
+    // installed inventory before publishing its retained card.
+    installation
+        .check()
+        .map_err(|_| ReceiverHold::ChangedState)?;
     let forwarder = forward(sdk.clone(), adapter.clone(), relay_spool);
     let result = exchange(
         &mut factory,

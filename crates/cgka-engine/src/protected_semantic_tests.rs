@@ -1037,6 +1037,7 @@ async fn fresh_recovery_factory() -> (
     )
     .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        expected_welcomer: hex::encode(operator.self_id().as_slice()),
         schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: digest(&profile),
         installation_index_sha256: "aa".repeat(32),

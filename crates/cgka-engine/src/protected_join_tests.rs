@@ -216,6 +216,7 @@ async fn native_welcome_is_acked_only_after_original_join_is_in_anchored_chain()
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        expected_welcomer: hex::encode(inviter.as_slice()),
         schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: "66".repeat(32),
         installation_index_sha256: "aa".repeat(32),
@@ -283,6 +284,7 @@ async fn wrong_join_provenance_pin_preserves_actual_native_pending_welcome() {
         .await
         .unwrap();
     let enrollment = crate::protected_recovery::Enrollment {
+        expected_welcomer: hex::encode(inviter.as_slice()),
         schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: "66".repeat(32),
         installation_index_sha256: "aa".repeat(32),
@@ -353,8 +355,8 @@ async fn failed_postcommit_capture_still_finalizes_actual_native_join() {
 }
 
 #[tokio::test]
-async fn enrolled_group_operator_and_keypackage_are_checked_before_durable_intent() {
-    for wrong in ["group", "operator", "keypackage", "malformed"] {
+async fn enrolled_group_nonoperator_welcomer_and_keypackage_are_checked_before_durable_intent() {
+    for wrong in ["group", "welcomer", "keypackage", "malformed"] {
         let (mut recipient, storage, wire, group, operator) = invitation().await;
         let root = tempfile::tempdir().unwrap();
         let original = intent(root.path());
@@ -365,14 +367,17 @@ async fn enrolled_group_operator_and_keypackage_are_checked_before_durable_inten
         let expected = || JoinConstraint {
             template: crate::protected_capability_policy::routing_only_v1(),
             group: group.clone(),
-            operators: vec![operator.clone()],
+            expected_welcomer: operator.clone(),
+            // Approval eligibility is independent of the genuine inviter.
+            operators: vec![MemberId::new(vec![88; 32])],
             key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
         };
+        assert!(!expected().operators.contains(&operator));
         let mut constraint = expected();
         let mut candidate = wire.clone();
         match wrong {
             "group" => constraint.group = GroupId::new(vec![77; 16]),
-            "operator" => constraint.operators = vec![MemberId::new(vec![88; 32])],
+            "welcomer" => constraint.expected_welcomer = MemberId::new(vec![88; 32]),
             "keypackage" => constraint.key_package_ref = vec![99; 32],
             _ => {
                 candidate.payload = vec![0xff; 13];
@@ -428,6 +433,7 @@ async fn intent_io_failure_rolls_back_native_join_but_preserves_unknown() {
             JoinConstraint {
                 template: crate::protected_capability_policy::routing_only_v1(),
                 group,
+                expected_welcomer: operator.clone(),
                 operators: vec![operator],
                 key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
             },
@@ -493,6 +499,7 @@ async fn forged_nip59_giftwrap_does_not_spend_real_welcome_attempt() {
     let expected = || JoinConstraint {
         template: crate::protected_capability_policy::routing_only_v1(),
         group: group.clone(),
+        expected_welcomer: operator.clone(),
         operators: vec![operator.clone()],
         key_package_ref: hex::decode(key_package_ref(&raw)).unwrap(),
     };

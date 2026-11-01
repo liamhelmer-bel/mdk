@@ -248,6 +248,11 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
                 != operators.len()
+            || journal
+                .enrollment()
+                .map_err(|_| ReceiverHold::Journal)?
+                .expected_welcomer
+                != hex::encode(evidence.authenticated_welcomer.as_slice())
             || evidence.group != group
             || evidence.joined != projection
             || pending.len() != 1

@@ -865,6 +865,7 @@ pub(super) fn ordered_fixture_profile(
         .with_mls_group(group, crate::protected_merge::Projection::read)
         .unwrap();
     let enrollment = Enrollment {
+        expected_welcomer: "55".repeat(32),
         schema: "heterodyne-receiver-enrollment.v3".into(),
         expiry_profile_sha256: profile,
         installation_index_sha256: "aa".repeat(32),
