@@ -28,6 +28,8 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid group create request: {0}")]
     InvalidGroupCreate(&'static str),
+    #[error("native group roster is inconsistent or exceeds control limits")]
+    InvalidNativeGroupRoster,
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
     #[error("connector operation timed out: {0}")]
@@ -78,6 +80,7 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
+            Self::InvalidNativeGroupRoster => "invalid_native_group_roster",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::OperationTimedOut(_) => "operation_timed_out",
             Self::SendInProgress => "send_in_progress",
@@ -108,6 +111,9 @@ impl ConnectorError {
                 "stream durable send failed; retry the same finish request"
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
+            Self::InvalidNativeGroupRoster => {
+                "native group roster is inconsistent or exceeds control limits"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::OperationTimedOut(_) => "connector operation timed out",
             Self::SendInProgress => {

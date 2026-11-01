@@ -1928,6 +1928,16 @@ impl MarmotAppRuntime {
         self.accounts.group_mls_state(account_ref, group_id).await
     }
 
+    pub async fn group_native_roster(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::AppNativeGroupRoster, AppError> {
+        self.accounts
+            .group_native_roster(account_ref, group_id)
+            .await
+    }
+
     pub async fn group_roster(
         &self,
         account_ref: &str,

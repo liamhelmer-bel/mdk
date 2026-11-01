@@ -124,7 +124,15 @@ impl AgentConnector {
             Ok(response) => response,
             Err(err) => self.error_response("handle_connection", &err),
         };
+        let native_roster = matches!(&response, AgentControlResponse::GroupRoster { .. });
         let response = AgentControlEnvelope::new(request.id, response);
+        if native_roster
+            && agent_control::encode_frame(&response)?.len()
+                > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+        {
+            // No partial or oversized authority projection crosses the socket.
+            return Err(ConnectorError::InvalidNativeGroupRoster);
+        }
         write_control_frame(&mut write_half, &response).await?;
         Ok(())
     }

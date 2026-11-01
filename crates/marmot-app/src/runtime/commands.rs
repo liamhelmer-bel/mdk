@@ -570,6 +570,23 @@ impl AccountManager {
         result
     }
 
+    pub async fn group_native_roster(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::AppNativeGroupRoster, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::GroupNativeRoster {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
     pub async fn group_roster(
         &self,
         account_ref: &str,

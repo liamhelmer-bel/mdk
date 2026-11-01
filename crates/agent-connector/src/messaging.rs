@@ -359,7 +359,7 @@ impl AgentConnector {
     }
 
     /// Observe membership, routing and the complete required-capability set from
-    /// one account-worker snapshot. This does not change any MLS or local policy.
+    /// one live account-worker read. Cached startup/Welcome snapshots are refused.
     pub(crate) async fn group_roster_response(
         &self,
         account_id_hex: &str,
@@ -367,38 +367,29 @@ impl AgentConnector {
     ) -> Result<AgentControlResponse, ConnectorError> {
         let account = self.local_account_for_account_id(account_id_hex)?;
         let group_id = GroupId::new(hex::decode(normalize_hex(group_id_hex)?)?);
-        let snapshot = self
+        let native = self
             .runtime
-            .group_conversation_snapshot(&account.label, &group_id)
+            .group_native_roster(&account.label, &group_id)
             .await?;
-        if snapshot.members.len() > 4096
-            || snapshot.members.len() != snapshot.mls_state.member_count
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "native roster exceeds bound or differs from native member count",
-            )
-            .into());
+        let roster = native.roster;
+        if roster.members.len() > 4096 || roster.members.len() != native.mls_state.member_count {
+            return Err(ConnectorError::InvalidNativeGroupRoster);
         }
-        let members = snapshot
+        let members = roster
             .members
             .into_iter()
             .map(|member| agent_control::AgentControlGroupRosterMember {
-                is_admin: snapshot
-                    .group
-                    .admin_policy
-                    .admins
-                    .contains(&member.member_id_hex),
-                is_self: member.member_id_hex == snapshot.my_account_id_hex,
                 member_id_hex: member.member_id_hex,
+                is_admin: member.is_admin,
+                is_self: member.is_self,
             })
             .collect();
-        let (self_membership, membership_revision) = match snapshot.group.self_membership {
-            marmot_app::SelfMembership::Member => ("member", 0),
-            marmot_app::SelfMembership::Left => ("left", 1),
-            marmot_app::SelfMembership::Removed => ("removed", 2),
+        let self_membership = match roster.self_membership {
+            marmot_app::SelfMembership::Member => "member",
+            marmot_app::SelfMembership::Left => "left",
+            marmot_app::SelfMembership::Removed => "removed",
         };
-        let lifecycle_state = match snapshot.mls_state.lifecycle_state {
+        let lifecycle_state = match native.mls_state.lifecycle_state {
             marmot_app::AppGroupLifecycleState::Stable => "stable",
             marmot_app::AppGroupLifecycleState::PendingPublish => "pending_publish",
             marmot_app::AppGroupLifecycleState::Merging => "merging",
@@ -407,26 +398,30 @@ impl AgentConnector {
             marmot_app::AppGroupLifecycleState::Disbanded => "disbanded",
         }
         .to_owned();
-        Ok(AgentControlResponse::GroupRoster {
-            account_id_hex: snapshot.my_account_id_hex,
-            group_id_hex: snapshot.mls_state.group_id_hex,
-            epoch: snapshot.mls_state.epoch,
-            roster_revision: snapshot
-                .mls_state
-                .epoch
-                .saturating_mul(3)
-                .saturating_add(membership_revision),
-            member_count: snapshot.mls_state.member_count,
+        let response = AgentControlResponse::GroupRoster {
+            account_id_hex: account.account_id_hex,
+            group_id_hex: native.mls_state.group_id_hex,
+            epoch: native.mls_state.epoch,
+            roster_revision: roster.roster_revision,
+            member_count: native.mls_state.member_count,
             self_membership: self_membership.to_owned(),
             lifecycle_state,
-            unrecoverable: snapshot.mls_state.unrecoverable,
-            required_extensions: snapshot.mls_state.required_extensions,
-            required_proposals: snapshot.mls_state.required_proposals,
-            required_app_components: snapshot.mls_state.required_app_components,
-            nostr_group_id_hex: snapshot.group.nostr_routing.nostr_group_id_hex,
-            relays: snapshot.group.nostr_routing.relays,
+            unrecoverable: native.mls_state.unrecoverable,
+            required_extensions: native.mls_state.required_extensions,
+            required_proposals: native.mls_state.required_proposals,
+            required_app_components: native.mls_state.required_app_components,
+            nostr_group_id_hex: native.nostr_routing.nostr_group_id_hex,
+            relays: native.nostr_routing.relays,
             members,
-        })
+        };
+        // Bound serialized output, including arbitrarily long routing URLs.
+        // Connection handling separately checks the complete actual envelope.
+        if agent_control::encode_frame(&response)?.len()
+            > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
+        {
+            return Err(ConnectorError::InvalidNativeGroupRoster);
+        }
+        Ok(response)
     }
 
     /// Report group membership for an account's group so a channel can decide

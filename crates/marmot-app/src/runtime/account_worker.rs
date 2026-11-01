@@ -174,6 +174,10 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: oneshot::Sender<Result<AppGroupMlsState, AppError>>,
     },
+    GroupNativeRoster {
+        group_id: GroupId,
+        respond: oneshot::Sender<Result<crate::AppNativeGroupRoster, AppError>>,
+    },
     GroupRoster {
         group_id: GroupId,
         respond: oneshot::Sender<Result<crate::groups::AppGroupRosterSession, AppError>>,
@@ -866,6 +870,9 @@ async fn run_app_runtime_account_worker(
                                     AccountWorkerCommand::GroupMlsState { group_id, respond },
                                 ))),
                             }
+                        }
+                        Some(AccountWorkerCommand::GroupNativeRoster { respond, .. }) => {
+                            let _ = respond.send(Err(AppError::AccountWorkerBusy));
                         }
                         Some(AccountWorkerCommand::GroupRoster { group_id, respond }) => {
                             match &read_snapshot {
@@ -2032,6 +2039,9 @@ async fn handle_account_worker_catch_up(
                         .expect("snapshot availability checked above");
                     let _ = respond.send(snapshot.group_mls_state(&group_id));
                 }
+                AccountWorkerCommand::GroupNativeRoster { respond, .. } => {
+                    let _ = respond.send(Err(AppError::AccountWorkerBusy));
+                }
                 AccountWorkerCommand::GroupRoster { group_id, respond }
                     if snapshot_reads_available =>
                 {
@@ -2564,6 +2574,9 @@ async fn handle_startup_hydration_command(
                 .ensure_group_hydrated(&group_id);
             let _ = respond.send(client.group_mls_state(&group_id));
         }
+        AccountWorkerCommand::GroupNativeRoster { group_id, respond } => {
+            let _ = respond.send(group_native_roster_after_hydration(client, &group_id));
+        }
         AccountWorkerCommand::GroupRoster { group_id, respond } => {
             let _ = respond.send(group_roster_after_hydration(client, &group_id));
         }
@@ -3060,6 +3073,9 @@ where
                     .as_ref()
                     .expect("snapshot availability checked above");
                 let _ = respond.send(snapshot.group_mls_state(&group_id));
+            }
+            AccountWorkerCommand::GroupNativeRoster { respond, .. } => {
+                let _ = respond.send(Err(AppError::AccountWorkerBusy));
             }
             AccountWorkerCommand::GroupRoster { group_id, respond } if snapshot_reads_available => {
                 let snapshot = read_snapshot
@@ -3608,6 +3624,11 @@ fn account_worker_command_future<'a>(
                 .session_mut()
                 .ensure_group_hydrated(&group_id);
             let result = client.group_mls_state(&group_id);
+            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
+            true
+        }),
+        AccountWorkerCommand::GroupNativeRoster { group_id, respond } => Box::pin(async move {
+            let result = group_native_roster_after_hydration(client, &group_id);
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result);
             true
         }),
@@ -4727,6 +4748,17 @@ fn group_recovery_after_hydration(
         .session_mut()
         .ensure_group_hydrated(group_id)?;
     client.group_recovery_status(group_id)
+}
+
+fn group_native_roster_after_hydration(
+    client: &mut AppClient,
+    group_id: &GroupId,
+) -> Result<crate::AppNativeGroupRoster, AppError> {
+    client
+        .runtime
+        .session_mut()
+        .ensure_group_hydrated(group_id)?;
+    client.group_native_roster(group_id)
 }
 
 pub(super) fn group_roster_after_hydration(
@@ -6327,6 +6359,43 @@ mod tests {
                 .reference,
             reference
         );
+    }
+
+    #[tokio::test]
+    async fn native_roster_refuses_snapshot_fanout_with_or_without_cache() {
+        for cached in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let app = MarmotApp::with_relay(dir.path(), "ws://127.0.0.1:1");
+            let (tx, mut commands) = mpsc::channel(1);
+            let (respond, response) = oneshot::channel();
+            tx.send(AccountWorkerCommand::GroupNativeRoster {
+                group_id: GroupId::new(vec![7; 16]),
+                respond,
+            })
+            .await
+            .unwrap();
+            let mut pending = VecDeque::new();
+            let snapshot = cached.then(crate::client::GroupReadSnapshot::default);
+            let result = serve_snapshot_reads_until(
+                snapshot,
+                async {
+                    timeout(Duration::from_secs(2), response)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                },
+                &mut commands,
+                &mut pending,
+                &app,
+                "owner",
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::AccountWorkerBusy)));
+            assert!(
+                pending.is_empty(),
+                "native authority query must not be deferred as a cached read"
+            );
+        }
     }
 
     #[test]

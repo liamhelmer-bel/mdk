@@ -3510,10 +3510,21 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
 
     // The live read comes from the owning native session, including the full
     // capability sets and native admin policy, rather than a count/UI cache.
-    let roster = connector
-        .group_roster_response(&agent.account.account_id_hex, &named_group_hex)
-        .await
-        .unwrap();
+    let roster = timeout(Duration::from_secs(30), async {
+        loop {
+            match connector
+                .group_roster_response(&agent.account.account_id_hex, &named_group_hex)
+                .await
+            {
+                Err(crate::ConnectorError::App(AppError::AccountWorkerBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => break result.unwrap(),
+            }
+        }
+    })
+    .await
+    .unwrap();
     let AgentControlResponse::GroupRoster {
         account_id_hex,
         group_id_hex,
@@ -3551,6 +3562,17 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     assert_eq!(required_extensions, &state.required_extensions);
     assert_eq!(required_proposals, &state.required_proposals);
     assert_eq!(required_app_components, &state.required_app_components);
+    // Normative constants, independent of the response's MLS projection.
+    assert!(
+        required_app_components.contains(&cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID)
+    );
+    assert!(
+        required_app_components
+            .contains(&cgka_traits::app_components::ACCOUNT_IDENTITY_PROOF_COMPONENT_ID)
+    );
+    assert!(!required_extensions.is_empty());
+    assert!(!required_proposals.is_empty());
+
     assert_eq!(members.len(), 2);
     let owner = members
         .iter()
@@ -3567,6 +3589,35 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
         decode_frame::<AgentControlResponse>(&frame).unwrap(),
         roster
     );
+    // A legal incoming frame can still produce an oversized outgoing envelope
+    // when its echoed request ID is combined with the actual native roster.
+    let oversized_id = "x".repeat(agent_control::MAX_AGENT_CONTROL_FRAME_BYTES - 256);
+    let request = AgentControlEnvelope::new(
+        Some(oversized_id),
+        AgentControlRequest::GroupRoster {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: named_group_hex.clone(),
+        },
+    );
+    assert!(encode_frame(&request).unwrap().len() <= agent_control::MAX_AGENT_CONTROL_FRAME_BYTES);
+    let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let (result, bytes) = tokio::join!(connector.handle_connection(server), async {
+        write_frame(&mut client, &request).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut client, &mut bytes)
+            .await
+            .unwrap();
+        bytes
+    });
+    assert!(matches!(
+        result,
+        Err(crate::ConnectorError::InvalidNativeGroupRoster)
+    ));
+    assert!(
+        bytes.is_empty(),
+        "oversized authority response must never be written"
+    );
+
     assert!(
         connector
             .group_roster_response(&"00".repeat(32), &named_group_hex)

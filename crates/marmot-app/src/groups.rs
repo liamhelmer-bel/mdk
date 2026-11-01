@@ -294,6 +294,14 @@ pub(crate) struct AppGroupRosterSession {
     pub mls_state: AppGroupMlsState,
 }
 
+/// Native-only authority projection, never served from a catch-up snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppNativeGroupRoster {
+    pub roster: AppGroupRoster,
+    pub mls_state: AppGroupMlsState,
+    pub nostr_routing: AppGroupNostrRoutingComponent,
+}
+
 /// One conversation-loading view captured from a single account-worker read.
 ///
 /// `group`, `members`, and `mls_state` come from the same live-session or
