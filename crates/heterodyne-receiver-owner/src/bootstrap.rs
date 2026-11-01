@@ -191,6 +191,8 @@ pub(crate) fn entry() -> Result<()> {
         .try_into()
         .map_err(|_| ())?;
     let host_channel = inherited(8)?;
+    // Refuse an unusable return path before generation or one-use consumption.
+    crate::host_channel::capacity(&host_channel)?;
     let host_nonce = crate::host_channel::read_nonce(&inherited(9)?)?;
     let [producer, archive, commit, packet] = [13, 14, 15, 18]
         .map(inherited)

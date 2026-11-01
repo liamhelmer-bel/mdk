@@ -2,13 +2,13 @@
 
 This continuation implements the approved consumed-deployment root-admission handoff. It is source work, not evidence of an installed authorization flow or completed host effects.
 
-The no-argument `/opt/heterodyne-receiver/bin/heterodyne-receiver-host-parent` runs as root in the original host PID and mount namespaces, with an empty inherited environment. It retains the original initializer/profile/artifact descriptors and the actual lifetime lease OFD until both owned children have ceased. It verifies its own source-selected executable and the fixed bootstrap executable against root-owned immutable profiles. There is no receipt-file importer, public consumed constructor, arbitrary command, module selector, or replacement lease.
+The no-argument `/opt/heterodyne-receiver/bin/heterodyne-receiver-host-parent` runs as root in the original host PID and mount namespaces, with an empty inherited environment. It retains the original initializer/profile/artifact descriptors and the actual lifetime lease OFD until both owned children and their original process groups have ceased. Session/process-group escape is not contained by this trusted no-effect runner. It verifies its own source-selected executable and the fixed bootstrap executable against root-owned immutable profiles. There is no receipt-file importer, public consumed constructor, arbitrary command, module selector, or replacement lease.
 
 Host input descriptors are FD3 initializer profile, FD4 generation parent, FD5 initializer ledger, FD6 original lifetime lease, FD7 expiry profile, FD13 producer profile, FD14 complete Git archive, FD15 raw commit object, and FD18 exact original deployment packet. The private bootstrap child additionally gets FD8 a created-before-exec SOCK_SEQPACKET and FD9 a sealed read-only 32-byte nonce. Bootstrap retains its normal private mount/PID-namespace behavior. It forwards the original consumed record and actual permanent process profile descriptor only after receiver cessation. The host parent additionally requires normal bootstrap exit before constructing its private consumed context.
 
 The fixed host admission child uses the indexed CPython interpreter with `-I -S -B` and source-fixed prologue importing `heterodyne.actions.deployment_admission_entry._entry`. Its import path is replaced with exactly the verified stdlib, lib-dynload, Product source, and purelib directories. The installation must actually contain this entry; the old Product94dca inventory does not and is refused. FD3 is the admission profile, FD4 the private credentialled channel, FD5 the retained original lease, FD6 the sealed nonce, FD7 the actual process profile, and FD13/14/15/18 the retained original artifacts. No child acquires a new lease.
 
-The parent sends two records: canonical finite identity metadata (maximum4096bytes), then the exact unmodified native Consumed record (maximum262144bytes). Both peers check kernel SCM credentials; the native side pins the actual child PID and owns a pidfd. SO_SNDBUF is explicitly sized for the maximum record. The packet schema/original bound remains32768bytes. The parent accepts only the exact nonce-bound three-field result with status `complete` and normal child exit. `failed-no-effect`, `unknown`, `cancelled`, malformed records, timeout, missing immutable entry and abnormal cessation remain HOLD. A child exit code alone is never completion. Root-global journal and effect readback remain the separately reviewed Product admission implementation's responsibility.
+The parent sends two records: canonical finite identity metadata (maximum4096bytes), then the exact unmodified native Consumed record (maximum262144bytes). Both peers check kernel SCM credentials; the native side pins the actual child PID and owns a pidfd. SO_SNDBUF is explicitly sized and checked for the maximum record on the bootstrap return channel before generation or consumption, and on the admission channel before sending. The packet schema/original bound remains32768bytes. The parent accepts only the exact nonce-bound three-field result with status `complete` and normal child exit. `failed-no-effect`, `unknown`, `cancelled`, malformed records, timeout, missing immutable entry and abnormal cessation remain HOLD. A child exit code alone is never completion. Root-global journal and effect readback remain the separately reviewed Product admission implementation's responsibility.
 
 Fixed root0400 files are `/var/lib/heterodyne/receiver-owner/host-launch-profile.json` and `admission-profile.json`. The former pins bootstrap/admission-profile hashes; the latter binds parent executable, installation index/source, semantic-factory source, packet and producer-profile hashes. They are checked descriptor inputs, not independently mintable consent. Missing actual source-qualified owner custody cannot be replaced with a DTO or file assertion.
 
@@ -42,6 +42,11 @@ but does not independently equate it to a local semantic source-file hash.
 Semantic-source admission remains the separately reviewed Product boundary;
 this source does not claim a second native semantic-source verifier.
 
-SIGKILL/process-group reaping retains the lease until actual cessation, including
-if waitpid blocks on uninterruptible kernel I/O. This residual is intentionally
-unbounded and fail-closed, not a claim of bounded operating-system cleanup.
+SIGKILL/process-group reaping retains the lease until actual original process-group
+cessation, including if waitpid blocks on uninterruptible kernel I/O. Descendants
+that use setsid/setpgid to leave that group are not contained or reaped by this
+mechanism; this source-qualified zero-effect entry must not create them. The
+parent does not claim whole descendant-tree or hostile-root cessation. The
+original-group wait is intentionally unbounded and fail-closed, not a claim of
+bounded operating-system cleanup. Pre-exec PR_SET_DUMPABLE is only transient
+hardening: exec resets it, so this source does not claim post-exec nondumpability.
