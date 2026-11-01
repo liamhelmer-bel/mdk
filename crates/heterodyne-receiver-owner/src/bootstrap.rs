@@ -177,24 +177,49 @@ fn retain_process_result(state: &File, response: &[u8], nonce: &[u8; 32]) -> Res
     create(state, "07-process-result.json", 0, 0o400, response)?;
     Ok(())
 }
+struct Publication {
+    host_channel: File,
+    host_nonce: [u8; 32],
+    producer: File,
+    archive: File,
+    commit: File,
+    packet: File,
+}
+impl Publication {
+    fn inherited() -> Result<Self> {
+        let host_channel = inherited(8)?;
+        crate::host_channel::capacity(&host_channel)?;
+        Ok(Self {
+            host_channel,
+            host_nonce: crate::host_channel::read_nonce(&inherited(9)?)?,
+            producer: inherited(13)?,
+            archive: inherited(14)?,
+            commit: inherited(15)?,
+            packet: inherited(18)?,
+        })
+    }
+}
+/// The fixed owned entry still preflights every publication descriptor before
+/// generation. The separate manual entry cannot run the publication branch.
 pub(crate) fn entry() -> Result<()> {
+    validate_entry()?;
+    run(Some(Publication::inherited()?))
+}
+pub(crate) fn manual_entry() -> Result<()> {
+    run(None)
+}
+fn validate_entry() -> Result<()> {
     if unsafe { libc::geteuid() } != 0
         || std::env::args_os().count() != 1
         || std::env::vars_os().next().is_some()
     {
         return Err(());
     }
+    Ok(())
+}
+fn run(publication: Option<Publication>) -> Result<()> {
+    validate_entry()?;
     let [original, parent, ledger, lease, expiry] = [3, 4, 5, 6, 7]
-        .map(inherited)
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .map_err(|_| ())?;
-    let host_channel = inherited(8)?;
-    // Refuse an unusable return path before generation or one-use consumption.
-    crate::host_channel::capacity(&host_channel)?;
-    let host_nonce = crate::host_channel::read_nonce(&inherited(9)?)?;
-    let [producer, archive, commit, packet] = [13, 14, 15, 18]
         .map(inherited)
         .into_iter()
         .collect::<Result<Vec<_>>>()?
@@ -335,6 +360,43 @@ pub(crate) fn entry() -> Result<()> {
         return Err(());
     }
     record(&state, "04-enrolled.json", &enrolled)?;
+    let Some(Publication {
+        host_channel,
+        host_nonce,
+        producer,
+        archive,
+        commit,
+        packet,
+    }) = publication
+    else {
+        // No permanent child or effect is issued. Keep the ORIGINAL account,
+        // storage and root lease OFDs alive after genuine native enrollment.
+        // This is an operational custody hold, never an approval or adoption.
+        crate::manual_custody::retain(vec![
+            original,
+            parent,
+            ledger,
+            lease,
+            expiry,
+            root,
+            state,
+            account,
+            key,
+            seed,
+            _database,
+            storage_lease,
+            journals,
+            intents,
+            anchors,
+            cache,
+            journal,
+            intent,
+            anchor,
+            fresh_profile,
+            _same_root_lease,
+            _fresh_cessation,
+        ]);
+    };
     let process = json!({"schema":"heterodyne-protected-receiver-process.v3","receiver_uid":899,"consumer_uid":898,"enrollment":enrollment,"endpoints":p.inbox_endpoints,"transport_group":transport_group,"python":verified.python(),"product_source":verified.product_source(),"purelib":verified.purelib(),"installation":p.installation,"wait_seconds":p.wait_seconds});
     let process_profile = record(&state, "05-process-profile.json", &process)?;
     let exe = crate::owner_entry::selected(&verified, "protected-receiver")?;

@@ -53,3 +53,9 @@ mod host_parent;
 pub fn protected_host_parent_entry() -> bool {
     host_parent::entry().is_ok()
 }
+
+mod manual_custody;
+/// Fixed manual initializer/join supervisor. Never consumes a deployment packet.
+pub fn protected_manual_bootstrap_entry() -> bool {
+    bootstrap::manual_entry().is_ok()
+}
