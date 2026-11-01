@@ -1,0 +1,1 @@
+{"component_inputs":[32769,32771,32772,32780],"effective_extensions":[1,2,3,4,5,6],"effective_proposals":[1,2,3,4,5,6,7,8],"features":[],"key_package_components":[1,32769,32771,32772,32777,32780],"media":"none","mls_extensions":[6],"mls_proposals":[8],"protocol":"current","quic":null,"schema":"heterodyne-receiver-capability-policy.v1","template":"routing-only-v1"}

@@ -23,7 +23,6 @@ test-conformance-snapshot = []
 protected-owner-runtime = ["dep:storage-sqlite", "dep:transport-nostr-peeler", "dep:nostr-sdk", "transport-nostr-adapter/sdk", "tokio/rt-multi-thread"]
 
 [dependencies]
-receiver-installation-verifier = { path = "../receiver-installation-verifier" }
 cgka-traits.workspace = true
 openmls.workspace = true
 openmls_basic_credential.workspace = true
@@ -54,6 +53,7 @@ transport-nostr-adapter.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+receiver-installation-verifier = { path = "../receiver-installation-verifier" }
 libc.workspace = true
 storage-sqlite = { workspace = true, optional = true }
 transport-nostr-peeler = { workspace = true, optional = true }
