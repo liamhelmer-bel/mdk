@@ -71,11 +71,10 @@ fn owned_routed_engine(
     storage: SqliteAccountStorage,
     keys: nostr::Keys,
 ) -> Result<crate::Engine<SqliteAccountStorage>, ReceiverHold> {
-    use cgka_traits::app_components::{NOSTR_ROUTING_COMPONENT_ID, default_group_components};
-    let mut components = default_group_components();
-    components.insert(NOSTR_ROUTING_COMPONENT_ID);
+    let template = crate::protected_capability_policy::routing_only_v1();
     EngineBuilder::new(storage)
-        .supported_app_components(components)
+        .supported_app_components(template.components())
+        .feature_registry(template.registry())
         .identity(keys.public_key().to_bytes().to_vec())
         .account_identity_proof_signer(Arc::new(Signer(keys.clone())))
         .peeler(Box::new(NostrMlsPeeler::new().with_welcome_signer(keys)))
@@ -1017,3 +1016,7 @@ pub(crate) fn enroll_entry() -> bool {
 #[cfg(test)]
 #[path = "protected_whole_packet_tests.rs"]
 mod whole_packet_qualification;
+
+#[cfg(test)]
+#[path = "protected_capability_policy_tests.rs"]
+mod capability_tests;

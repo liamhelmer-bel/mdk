@@ -188,6 +188,7 @@ async fn finish<S: StorageProvider + 'static>(
 
 fn constraint(profile: &FreshProfile) -> Result<JoinConstraint, ReceiverHold> {
     Ok(JoinConstraint {
+        template: crate::protected_capability_policy::routing_only_v1(),
         group: GroupId::new(hex::decode(&profile.group).map_err(|_| ReceiverHold::Malformed)?),
         operators: profile
             .operators

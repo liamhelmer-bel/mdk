@@ -349,6 +349,7 @@ async fn enrolled_group_operator_and_keypackage_are_checked_before_durable_inten
             directory: original.directory.try_clone().unwrap(),
         };
         let expected = || JoinConstraint {
+            template: crate::protected_capability_policy::routing_only_v1(),
             group: group.clone(),
             operators: vec![operator.clone()],
             key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
@@ -411,6 +412,7 @@ async fn intent_io_failure_rolls_back_native_join_but_preserves_unknown() {
             wire.clone(),
             read_only,
             JoinConstraint {
+                template: crate::protected_capability_policy::routing_only_v1(),
                 group,
                 operators: vec![operator],
                 key_package_ref: hex::decode(key_package_ref(&wire)).unwrap(),
@@ -475,6 +477,7 @@ async fn forged_nip59_giftwrap_does_not_spend_real_welcome_attempt() {
         directory: original.directory.try_clone().unwrap(),
     };
     let expected = || JoinConstraint {
+        template: crate::protected_capability_policy::routing_only_v1(),
         group: group.clone(),
         operators: vec![operator.clone()],
         key_package_ref: hex::decode(key_package_ref(&raw)).unwrap(),

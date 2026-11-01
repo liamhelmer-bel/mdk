@@ -1488,7 +1488,12 @@ impl<S: StorageProvider> Engine<S> {
 
             #[cfg(unix)]
             if let Some(capture) = &mut owned_join_capture {
-                capture.prepare_commit(&group_id, &welcome_sender_id, &consumed_key_package_ref)?;
+                capture.prepare_commit(
+                    &group_id,
+                    &welcome_sender_id,
+                    &consumed_key_package_ref,
+                    &mls_group,
+                )?;
             }
 
             Ok::<_, EngineError>((
