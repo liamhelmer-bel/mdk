@@ -160,7 +160,7 @@ fn selected(
     verified.check().map_err(|_| ())?;
     Ok(f)
 }
-fn mount_configuration(
+pub(super) fn mount_configuration(
     installation: &receiver_installation_verifier::reference::Installation,
 ) -> Result<()> {
     if installation.root
@@ -211,7 +211,7 @@ fn positive(child: OwnedChild, timeout: Duration) -> Result<File> {
     Ok(result.into_lease())
 }
 fn frame(raw: &[u8], nonce: &[u8; 32], schema: &str) -> Result<Value> {
-    let v = receiver_installation_verifier::installation::parse_canonical(raw).map_err(|_| ())?;
+    let v = crate::native_frame::read(raw)?;
     if v.get("schema").and_then(Value::as_str) != Some(schema)
         || v.get("nonce_hex").and_then(Value::as_str) != Some(hex::encode(nonce).as_str())
     {

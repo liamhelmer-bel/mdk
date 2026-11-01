@@ -34,3 +34,11 @@ mod bootstrap_peer;
 pub fn protected_bootstrap_entry() -> bool {
     bootstrap::entry().is_ok()
 }
+
+mod assembly;
+/// Root read-only source-qualified index/profile assembly; grants no consent.
+pub fn protected_assembly_entry() -> bool {
+    assembly::entry().is_ok()
+}
+
+mod native_frame;

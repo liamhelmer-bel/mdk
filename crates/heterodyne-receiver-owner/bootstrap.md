@@ -73,3 +73,68 @@ This source is not yet qualification of a real live join, transport policy,
 publication, immutable installed runtime, or deployment. Those require the actual
 combined reviewed bytes, source-created publication inputs, measured target group
 capabilities, and the explicit deployment execution receipts.
+
+### Concrete installation/index/profile assembly
+
+`heterodyne-receiver-assemble` is a separate root-only read-only preparation
+executable, outside the four runtime roles. Pin its source/binary alongside the
+external bootstrap. It grants no consent and writes only canonical bytes to
+stdout. It never copies, adopts, deletes or publishes a candidate.
+
+1. Copy the complete normalized runtime (including finite `runtime-etc`) and the
+   four exact reviewed ELF files into a new root-owned candidate. Preserve every
+   compiled inventory row; executable files are0555, ordinary files0444, source
+   directories0755 and protected config/empty-certs directories0555. Keep the
+   candidate root0755, with no existing installation-index.json.
+2. Supply canonical evidence JSON containing exactly `release_identity` and
+   `external` (the sorted full independently measured OS baseline rows
+   `{path,sha256,size}`). Run as root:
+
+   ```sh
+   heterodyne-receiver-assemble index /absolute/new-candidate < evidence.json > /root/new-index.json
+   sha256sum /root/new-index.json
+   ```
+
+   This independently walks and hashes the entire candidate, checks the exact
+   compiled complete source inventory and four finite native roles, derives
+   source/lock hashes from the compiled inventory and native artifact hashes
+   from actual bytes. The supplied external observations are correlation data;
+   actual installed verification must independently reread them and resolve the
+   complete ELF graph. Index generation alone does not qualify the OS baseline.
+3. Under root's exclusive install procedure, copy that exact candidate to
+   `/opt/heterodyne-receiver/releases/<index-sha256>` and the index to its
+   `installation-index.json`, root:root0400, single link. Do not alter the tree
+   after generating the index. Preserve original candidate/index evidence.
+4. Supply canonical request JSON with exactly these operational selections:
+   `request_sha256`, `storage_generation`, `group` (actual native MLS hex), sorted
+   `operators`, `expected_welcomer`, `inbox_endpoints`, `key_package_endpoints`,
+   `minimum_accepted_endpoints`, `deadline_unix_ms`, `wait_seconds`, and
+   `expiry_profile_sha256`. Run:
+
+   ```sh
+   heterodyne-receiver-assemble profile /opt/heterodyne-receiver/releases/<index-sha256> < request.json > /root/new-initializer-profile.json
+   ```
+
+   This creates a private mount namespace, mounts only installed fixed config
+   over `/etc`, and invokes the actual complete published installation/platform
+   verifier. It derives the closed profile schema, UID899/GID899, UID898/GID898,
+   installation reference, routing-only template and exact policy digest. It
+   reuses production deadline/relay/operator validation. Unknown request fields
+   and caller overrides are refused. The output still needs root:root0400,
+   single-link/O_RDONLY custody and the exact retained expiry descriptor.
+5. Launch `/opt/heterodyne-receiver/bin/heterodyne-receiver-bootstrap` with no
+   arguments and an empty environment, inheriting original descriptors:
+   FD3 profile; FD4 fresh UID899/GID8990700 generation parent; FD5 fresh
+   UID899/GID8990600 empty initialization ledger; FD6 root:root0600 lifetime lease;
+   FD7 actual root0400 expiry; FD13 producer profile; FD14 full Git archive;
+   FD15 raw commit; FD18 exact original canonical deployment packet. Open
+   profiles/evidence readonly and lease/ledger readwrite. These are original
+   OFDs retained by bootstrap throughout, not paths to be reopened between
+   children. Root's launch preparation must create fresh files/directories
+   exclusively; an existing generation/ledger is reconciliation, not restart.
+
+The assembly executable's libc/loader and root launcher remain part of the
+external root deployment receipt. Runtime index roles remain exactly four.
+Full positive installed bootstrap, real-group capability compatibility and
+actual publication/MLS response are separate qualification; unit/root mechanical
+checks do not establish them.
