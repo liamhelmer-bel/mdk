@@ -3549,7 +3549,7 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     assert_eq!(*member_count, 2);
     assert_eq!(self_membership, "member");
     assert!(!unrecoverable);
-    assert_ne!(lifecycle_state, "disbanded");
+    assert_eq!(lifecycle_state, "stable");
     assert!(!nostr_group_id_hex.is_empty());
     assert!(!relays.is_empty());
     let state = connector
@@ -3562,6 +3562,33 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     assert_eq!(required_extensions, &state.required_extensions);
     assert_eq!(required_proposals, &state.required_proposals);
     assert_eq!(required_app_components, &state.required_app_components);
+    // The actual native snapshot is accepted only at a stable frontier.
+    let native = connector
+        .runtime
+        .group_native_roster(&agent.account.account_id_hex, &named_group)
+        .await
+        .unwrap();
+    crate::messaging::validate_native_roster_state(&native).unwrap();
+    for lifecycle in [
+        marmot_app::AppGroupLifecycleState::PendingPublish,
+        marmot_app::AppGroupLifecycleState::Merging,
+        marmot_app::AppGroupLifecycleState::Recovering,
+        marmot_app::AppGroupLifecycleState::Unrecoverable,
+        marmot_app::AppGroupLifecycleState::Disbanded,
+    ] {
+        let mut unstable = native.clone();
+        unstable.mls_state.lifecycle_state = lifecycle;
+        assert!(matches!(
+            crate::messaging::validate_native_roster_state(&unstable),
+            Err(crate::ConnectorError::InvalidNativeGroupRoster)
+        ));
+    }
+    let mut unreadable = native.clone();
+    unreadable.mls_state.unrecoverable = true;
+    assert!(matches!(
+        crate::messaging::validate_native_roster_state(&unreadable),
+        Err(crate::ConnectorError::InvalidNativeGroupRoster)
+    ));
     // Normative constants, independent of the response's MLS projection.
     assert!(
         required_app_components.contains(&cgka_traits::app_components::NOSTR_ROUTING_COMPONENT_ID)

@@ -40,6 +40,21 @@ pub(crate) fn group_info_subject_from_projection<E>(
     }
 }
 
+/// Pending records can project membership ahead of committed admin policy.
+/// Refuse them before constructing any successful authority response.
+pub(crate) fn validate_native_roster_state(
+    native: &marmot_app::AppNativeGroupRoster,
+) -> Result<(), ConnectorError> {
+    if native.mls_state.lifecycle_state != marmot_app::AppGroupLifecycleState::Stable
+        || native.mls_state.unrecoverable
+        || native.roster.members.len() > 4096
+        || native.roster.members.len() != native.mls_state.member_count
+    {
+        return Err(ConnectorError::InvalidNativeGroupRoster);
+    }
+    Ok(())
+}
+
 /// Current schema version for persisted `send_final` request fingerprints.
 pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
 /// Current schema version for persisted `send_media` request fingerprints.
@@ -371,10 +386,8 @@ impl AgentConnector {
             .runtime
             .group_native_roster(&account.label, &group_id)
             .await?;
+        validate_native_roster_state(&native)?;
         let roster = native.roster;
-        if roster.members.len() > 4096 || roster.members.len() != native.mls_state.member_count {
-            return Err(ConnectorError::InvalidNativeGroupRoster);
-        }
         let members = roster
             .members
             .into_iter()
@@ -389,15 +402,6 @@ impl AgentConnector {
             marmot_app::SelfMembership::Left => "left",
             marmot_app::SelfMembership::Removed => "removed",
         };
-        let lifecycle_state = match native.mls_state.lifecycle_state {
-            marmot_app::AppGroupLifecycleState::Stable => "stable",
-            marmot_app::AppGroupLifecycleState::PendingPublish => "pending_publish",
-            marmot_app::AppGroupLifecycleState::Merging => "merging",
-            marmot_app::AppGroupLifecycleState::Recovering => "recovering",
-            marmot_app::AppGroupLifecycleState::Unrecoverable => "unrecoverable",
-            marmot_app::AppGroupLifecycleState::Disbanded => "disbanded",
-        }
-        .to_owned();
         let response = AgentControlResponse::GroupRoster {
             account_id_hex: account.account_id_hex,
             group_id_hex: native.mls_state.group_id_hex,
@@ -405,7 +409,7 @@ impl AgentConnector {
             roster_revision: roster.roster_revision,
             member_count: native.mls_state.member_count,
             self_membership: self_membership.to_owned(),
-            lifecycle_state,
+            lifecycle_state: "stable".to_owned(),
             unrecoverable: native.mls_state.unrecoverable,
             required_extensions: native.mls_state.required_extensions,
             required_proposals: native.mls_state.required_proposals,
