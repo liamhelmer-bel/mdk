@@ -13,7 +13,7 @@ use std::{
 };
 type Result<T> = std::result::Result<T, ()>;
 
-fn selected_initializer(
+pub(super) fn selected_initializer(
     verified: &receiver_installation_verifier::reference::Verified,
 ) -> Result<File> {
     let path = verified
@@ -72,7 +72,7 @@ fn selected_initializer(
     verified.check().map_err(|_| ())?;
     Ok(file)
 }
-fn channel() -> Result<(File, File)> {
+pub(super) fn channel() -> Result<(File, File)> {
     let mut fds = [-1; 2];
     if unsafe {
         libc::socketpair(
@@ -87,7 +87,7 @@ fn channel() -> Result<(File, File)> {
     }
     Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
 }
-fn validate_handles(handles: &[File; 5], uid: u32) -> Result<()> {
+pub(super) fn validate_handles(handles: &[File; 5], uid: u32) -> Result<()> {
     let mut identities = std::collections::BTreeSet::new();
     let mut device = None;
     for (ordinal, file) in handles.iter().enumerate() {
@@ -95,9 +95,20 @@ fn validate_handles(handles: &[File; 5], uid: u32) -> Result<()> {
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
         if flags < 0
             || flags & (libc::O_PATH | libc::O_APPEND) != 0
+            || flags & libc::O_ACCMODE
+                != if ordinal <= 2 {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_RDWR
+                }
             || m.uid() != uid
             || m.gid() != uid
-            || m.mode() & 0o7777 != if ordinal == 0 { 0o700 } else { 0o600 }
+            || m.mode() & 0o7777
+                != match ordinal {
+                    0 => 0o700,
+                    1 | 2 => 0o400,
+                    _ => 0o600,
+                }
             || (ordinal == 0 && !m.is_dir())
             || (ordinal != 0 && (!m.is_file() || m.nlink() != 1))
             || !identities.insert((m.dev(), m.ino()))
@@ -174,6 +185,7 @@ pub(crate) fn entry() -> Result<()> {
         || profile.operators.contains(&facts.account)
         || facts.account == profile.expected_welcomer
         || !input::hash(&facts.key_package_ref, 64)
+        || !input::hash(&facts.key_package_event_id, 64)
     {
         return Err(());
     }
@@ -188,4 +200,53 @@ pub(crate) fn entry() -> Result<()> {
     drop(retained_lease);
     drop(lease);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    #[ignore = "actual root dedicated UID899 descriptor custody"]
+    fn generated_role_modes_and_access_are_admitted_exactly() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("account");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let account = File::open(&dir).unwrap();
+        assert_eq!(unsafe { libc::fchown(account.as_raw_fd(), 899, 899) }, 0);
+        let mut handles = vec![account];
+        for (n, mode) in [
+            ("key", 0o400),
+            ("seed", 0o400),
+            ("database", 0o600),
+            ("lease", 0o600),
+        ] {
+            let path = dir.join(n);
+            std::fs::write(&path, [1u8; 32]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let file = File::options()
+                .read(true)
+                .write(mode == 0o600)
+                .open(path)
+                .unwrap();
+            assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 899, 899) }, 0);
+            handles.push(file);
+        }
+        let mut handles: [File; 5] = handles.try_into().unwrap();
+        validate_handles(&handles, 899).unwrap();
+        let original = std::mem::replace(
+            &mut handles[1],
+            File::options()
+                .read(true)
+                .write(true)
+                .open(dir.join("key"))
+                .unwrap(),
+        );
+        assert!(validate_handles(&handles, 899).is_err());
+        handles[1] = original;
+        validate_handles(&handles, 899).unwrap();
+        std::fs::set_permissions(dir.join("seed"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_handles(&handles, 899).is_err());
+    }
 }

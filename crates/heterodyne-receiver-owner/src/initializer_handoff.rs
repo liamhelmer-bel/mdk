@@ -17,6 +17,7 @@ pub(crate) struct Facts {
     pub(crate) account: String,
     pub(crate) expected_welcomer: String,
     pub(crate) key_package_ref: String,
+    pub(crate) key_package_event_id: String,
     pub(crate) capability_template: String,
     pub(crate) capability_policy_sha256: String,
 }
@@ -200,6 +201,8 @@ mod tests {
             installation_index_sha256: "23".repeat(32),
             account: "34".repeat(32),
             expected_welcomer: "78".repeat(32),
+            key_package_event_id:
+                "0000000000000000000000000000000000000000000000000000000000000000".into(),
             key_package_ref: "45".repeat(32),
             capability_template: "routing-only-v1".into(),
             capability_policy_sha256: "56".repeat(32),

@@ -370,6 +370,7 @@ pub(crate) fn entry() -> Result<()> {
                 account: keys.public_key().to_hex(),
                 expected_welcomer: p.expected_welcomer.clone(),
                 key_package_ref: prepared.metadata.key_package_ref_hex,
+                key_package_event_id: hex::encode(prepared.artifact.id.as_slice()),
                 capability_template: p.capability_template.clone(),
                 capability_policy_sha256: p.capability_policy_sha256.clone(),
             };

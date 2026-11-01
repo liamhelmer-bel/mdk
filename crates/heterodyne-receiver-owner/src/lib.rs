@@ -27,3 +27,10 @@ mod owner_entry;
 pub fn protected_owner_init_entry() -> bool {
     owner_entry::entry().is_ok()
 }
+
+mod bootstrap;
+mod bootstrap_peer;
+/// Finite root-owned descriptor lifecycle; no parsed consent constructor.
+pub fn protected_bootstrap_entry() -> bool {
+    bootstrap::entry().is_ok()
+}

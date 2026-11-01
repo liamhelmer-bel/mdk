@@ -60,6 +60,53 @@ impl OwnedChild {
             descriptors,
             lease,
             &[CString::new("heterodyne-receiver-initialize").unwrap()],
+            9,
+            None,
+        )
+    }
+
+    pub(crate) fn owner_init(
+        executable: &File,
+        descriptors: &[(RawFd, &File)],
+        lease: File,
+    ) -> Result<Self> {
+        if descriptors.len() != 6 || !(3..=8).all(|n| descriptors.iter().any(|(fd, _)| *fd == n)) {
+            return Err(Error::Hold);
+        }
+        Self::launch(
+            executable,
+            descriptors,
+            lease,
+            &[CString::new("heterodyne-receiver-owner-init").unwrap()],
+            9,
+            None,
+        )
+    }
+
+    pub(crate) fn receiver(
+        executable: &File,
+        descriptors: &[(RawFd, &File)],
+        lease: File,
+        fresh: bool,
+    ) -> Result<Self> {
+        let last = if fresh { 16 } else { 18 };
+        if descriptors.len() != (last - 2) as usize
+            || !(3..=last).all(|n| descriptors.iter().any(|(fd, _)| *fd == n))
+        {
+            return Err(Error::Hold);
+        }
+        Self::launch(
+            executable,
+            descriptors,
+            lease,
+            &[CString::new(if fresh {
+                "heterodyne-protected-receiver-enroll"
+            } else {
+                "heterodyne-protected-receiver"
+            })
+            .unwrap()],
+            19,
+            Some(899),
         )
     }
 
@@ -68,6 +115,8 @@ impl OwnedChild {
         descriptors: &[(RawFd, &File)],
         lease: File,
         arguments: &[CString],
+        parent_slot: RawFd,
+        receiver_uid: Option<u32>,
     ) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0
             || !cfg!(target_arch = "x86_64")
@@ -92,7 +141,7 @@ impl OwnedChild {
         let mut targets = std::collections::BTreeSet::new();
         let mut retained = Vec::new();
         for (target, file) in descriptors {
-            if !(3..=18).contains(target) || *target == 9 || !targets.insert(*target) {
+            if !(3..=18).contains(target) || *target == parent_slot || !targets.insert(*target) {
                 return Err(Error::Hold);
             }
             retained.push((*target, duplicate(file)?));
@@ -153,18 +202,18 @@ impl OwnedChild {
                 // account/credential handles from the supervising process.
                 if libc::syscall(
                     libc::SYS_close_range,
-                    19u32,
+                    20u32,
                     u32::MAX,
                     libc::CLOSE_RANGE_CLOEXEC,
                 ) < 0
                 {
                     libc::_exit(125);
                 }
-                if libc::dup2(parentfd.as_raw_fd(), 9) < 0 {
+                if libc::dup2(parentfd.as_raw_fd(), parent_slot) < 0 {
                     libc::_exit(125);
                 }
-                for target in 3..=18 {
-                    if target != 9 && !targets.contains(&target) {
+                for target in 3..=19 {
+                    if target != parent_slot && !targets.contains(&target) {
                         libc::close(target);
                     }
                 }
@@ -172,6 +221,15 @@ impl OwnedChild {
                     libc::_exit(125);
                 }
                 libc::umask(0o077);
+                if let Some(uid) = receiver_uid
+                    && (libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(uid, uid, uid) != 0
+                        || libc::setresuid(uid, uid, uid) != 0
+                        || libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
+                        || libc::poll(&mut parent_poll, 1, 0) != 0)
+                {
+                    libc::_exit(125);
+                }
                 libc::syscall(
                     libc::SYS_execveat,
                     executable.as_raw_fd(),
@@ -206,7 +264,7 @@ impl OwnedChild {
         }
     }
     pub(crate) fn wait(mut self, timeout: Duration) -> Result<Cessation> {
-        if timeout.is_zero() || timeout > Duration::from_secs(600) {
+        if timeout.is_zero() || timeout > Duration::from_secs(86400) {
             return Err(Error::Hold);
         }
         let deadline = Instant::now() + timeout;
@@ -295,8 +353,15 @@ mod tests {
             CString::new(command).unwrap(),
         ];
         let borrowed = lease.try_clone().unwrap();
-        let child =
-            OwnedChild::launch(&executable, &[(3, &output), (6, &borrowed)], lease, &args).unwrap();
+        let child = OwnedChild::launch(
+            &executable,
+            &[(3, &output), (6, &borrowed)],
+            lease,
+            &args,
+            9,
+            None,
+        )
+        .unwrap();
         (child, output, independent, dir)
     }
     #[test]
@@ -345,5 +410,44 @@ mod tests {
             }
         }
         independent.try_lock().unwrap();
+    }
+    #[test]
+    #[ignore = "actual root receiver UID and namespace descriptor map"]
+    fn receiver_namespace_keeps_anchor9_and_drops_to_dedicated_identity() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let output = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("out"))
+            .unwrap();
+        let lease = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("lease"))
+            .unwrap();
+        lease.try_lock().unwrap();
+        let other = File::options()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("lease"))
+            .unwrap();
+        let executable = File::open("/usr/bin/dash").unwrap();
+        let args=[CString::new("dash").unwrap(),CString::new("-c").unwrap(),CString::new("test \"$$\" = 1 && test \"$(/usr/bin/id -u)\" = 899 && test \"$(/usr/bin/id -g)\" = 899 && test \"$(/usr/bin/id -G)\" = 899 && printf actual899 >&9").unwrap()];
+        let descriptors = (3..=16).map(|fd| (fd, &output)).collect::<Vec<_>>();
+        let child =
+            OwnedChild::launch(&executable, &descriptors, lease, &args, 19, Some(899)).unwrap();
+        assert!(other.try_lock().is_err());
+        let ceased = child.wait(Duration::from_secs(5)).unwrap();
+        assert!(libc::WIFEXITED(ceased.status));
+        assert_eq!(libc::WEXITSTATUS(ceased.status), 0);
+        let mut raw = [0; 9];
+        std::os::unix::fs::FileExt::read_exact_at(&output, &mut raw, 0).unwrap();
+        assert_eq!(&raw, b"actual899");
+        assert!(other.try_lock().is_err());
+        drop(ceased);
+        other.try_lock().unwrap();
     }
 }
