@@ -21,7 +21,7 @@ pub(crate) struct OwnedChild {
     pidfd: File,
     lease: Option<File>,
     reaped: bool,
-    diagnostic: File,
+    diagnostic: Option<Diagnostic>,
 }
 pub(crate) struct Cessation {
     pub(crate) status: i32,
@@ -150,12 +150,20 @@ impl OwnedChild {
         let executable = duplicate(executable)?;
         let null = File::options().read(true).write(true).open("/dev/null")?;
         let null = duplicate(&null)?;
-        let mut pipe = [-1; 2];
-        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let diagnostic = unsafe { File::from_raw_fd(pipe[0]) };
-        let diagnostic_writer = unsafe { File::from_raw_fd(pipe[1]) };
+        // Only the source-fixed fresh receiver gets diagnostic capture. Other
+        // children retain /dev/null, including the permanent receiver.
+        let capture = arguments[0].as_c_str() == c"heterodyne-protected-receiver-enroll";
+        let (diagnostic_reader, diagnostic_writer) = if capture {
+            let mut pipe = [-1; 2];
+            if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+                return Err(io::Error::last_os_error().into());
+            }
+            (Some(unsafe { File::from_raw_fd(pipe[0]) }), unsafe {
+                File::from_raw_fd(pipe[1])
+            })
+        } else {
+            (None, null.try_clone()?)
+        };
         let diagnostic_writer = duplicate(&diagnostic_writer)?;
         let mut argv: Vec<_> = arguments.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
@@ -252,19 +260,25 @@ impl OwnedChild {
                 libc::_exit(126);
             }
         }
-        Ok(Self {
+        let mut owned = Self {
             pid: pid as libc::pid_t,
             pidfd: unsafe { File::from_raw_fd(pidfd) },
             lease: Some(lease),
             reaped: false,
-            diagnostic,
-        })
+            diagnostic: None,
+        };
+        // Start only after clone: no new Rust thread exists in the forked child.
+        // A failed thread creation drops owned and reaps the child before return.
+        if let Some(reader) = diagnostic_reader {
+            owned.diagnostic = Some(Diagnostic::start(reader)?);
+        }
+        Ok(owned)
     }
 
     /// Failure-only observation. Kill/reap the entire owned namespace first,
     /// preserving the original lease until cessation; never interpret a stage
     /// token or an exit status as evidence of enrollment or permission to retry.
-    pub(crate) fn failure_diagnostic(mut self) -> serde_json::Value {
+    pub(crate) fn failure_diagnostic(&mut self) -> serde_json::Value {
         self.kill();
         let status = self.reap().ok();
         let stage = self.observed_stage();
@@ -277,10 +291,7 @@ impl OwnedChild {
         })
     }
     pub(crate) fn observed_stage(&self) -> Option<String> {
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        let _ = (&self.diagnostic).take(4096).read_to_end(&mut bytes);
-        diagnostic_stage(&bytes).map(str::to_owned)
+        self.diagnostic.as_ref()?.stage.lock().ok()?.clone()
     }
     fn kill(&self) {
         unsafe {
@@ -300,6 +311,9 @@ impl OwnedChild {
             let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
             if result == self.pid {
                 self.reaped = true;
+                if let Some(diagnostic) = &mut self.diagnostic {
+                    diagnostic.finish();
+                }
                 return Ok(status);
             }
             let error = io::Error::last_os_error();
@@ -323,6 +337,61 @@ impl Drop for OwnedChild {
             // Killing PID1 tears down its descendants in this owned PIDns.
             self.kill();
             let _ = self.reap();
+        }
+    }
+}
+
+// Continuously drain a blocking child pipe, with bounded parser memory and no
+// retained raw stderr. This preserves ordinary write semantics under log floods.
+struct Diagnostic {
+    stage: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Diagnostic {
+    fn start(mut reader: File) -> io::Result<Self> {
+        use std::io::Read;
+        let stage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let observed = stage.clone();
+        let worker = std::thread::Builder::new()
+            .name("fresh-diagnostic".into())
+            .spawn(move || {
+                let mut chunk = [0; 1024];
+                let mut line = Vec::with_capacity(128);
+                let mut overflow = false;
+                loop {
+                    let length = match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(length) => length,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    for byte in &chunk[..length] {
+                        if *byte == b'\n' {
+                            if !overflow
+                                && let Some(value) = diagnostic_stage(&line)
+                                && let Ok(mut current) = observed.lock()
+                            {
+                                *current = Some(value.to_owned());
+                            }
+                            line.clear();
+                            overflow = false;
+                        } else if line.len() < 128 && !overflow {
+                            line.push(*byte);
+                        } else {
+                            line.clear();
+                            overflow = true;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            stage,
+            worker: Some(worker),
+        })
+    }
+    fn finish(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -384,7 +453,7 @@ mod tests {
     #[test]
     #[ignore = "actual root PID namespace and same-OFD failure custody"]
     fn failed_child_stage_survives_null_stdout_and_is_not_a_success_receipt() {
-        let (child, _, independent, _dir) =
+        let (mut child, _, independent, _dir) =
             fixture("printf 'SECRET VALUE\nfresh-stage=database-open\n' >&2; exit 23");
         crate::supervision::ready(&child.pidfd, Duration::from_secs(5)).unwrap();
         assert!(independent.try_lock().is_err());
@@ -393,7 +462,56 @@ mod tests {
         assert_eq!(value["exit_code"], 23);
         assert_eq!(value["automatic_replay_forbidden"], true);
         assert!(!value.to_string().contains("SECRET"));
+        assert!(
+            independent.try_lock().is_err(),
+            "failure record still owns lease"
+        );
+        drop(child);
         independent.try_lock().unwrap();
+    }
+
+    #[test]
+    #[ignore = "actual root PID namespace and stderr backpressure control"]
+    fn diagnostic_drains_large_stderr_and_retains_final_stage() {
+        let (mut child, _, independent, _dir) = fixture(
+            "head -c 262144 /dev/zero >&2; printf '\nfresh-stage=welcome-native-join\n' >&2; exit 23",
+        );
+        crate::supervision::ready(&child.pidfd, Duration::from_secs(10)).unwrap();
+        let value = child.failure_diagnostic();
+        assert_eq!(value["exit_code"], 23);
+        assert_eq!(value["last_stage"], "welcome-native-join");
+        assert!(independent.try_lock().is_err());
+        drop(child);
+        independent.try_lock().unwrap();
+    }
+
+    #[test]
+    #[ignore = "actual root PID namespace and non-fresh stderr control"]
+    fn non_fresh_children_keep_null_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("lease"))
+            .unwrap();
+        lease.try_lock().unwrap();
+        let args = [CString::new("python3").unwrap(), CString::new("-I").unwrap(),
+            CString::new("-S").unwrap(),CString::new("-c").unwrap(),
+            CString::new("import os; assert os.readlink('/proc/self/fd/2')=='/dev/null'; os.write(2,b'x'*262144)").unwrap()];
+        let child = OwnedChild::launch(
+            &File::open("/usr/bin/python3.12").unwrap(),
+            &[],
+            lease,
+            &args,
+            9,
+            None,
+        )
+        .unwrap();
+        assert!(child.diagnostic.is_none());
+        let ceased = child.wait(Duration::from_secs(10)).unwrap();
+        assert!(libc::WIFEXITED(ceased.status));
+        assert_eq!(libc::WEXITSTATUS(ceased.status), 0);
     }
 
     #[test]
@@ -416,7 +534,7 @@ mod tests {
             .unwrap();
         lease.try_lock().unwrap();
         let descriptors = (3..=16).map(|fd| (fd, &input)).collect::<Vec<_>>();
-        let child =
+        let mut child =
             OwnedChild::receiver(&File::open(path).unwrap(), &descriptors, lease, true).unwrap();
         crate::supervision::ready(&child.pidfd, Duration::from_secs(10)).unwrap();
         let value = child.failure_diagnostic();
@@ -542,7 +660,7 @@ mod tests {
             .unwrap();
         let executable = File::open("/usr/bin/dash").unwrap();
         let args = [
-            CString::new("dash").unwrap(),
+            CString::new("heterodyne-protected-receiver-enroll").unwrap(),
             CString::new("-c").unwrap(),
             CString::new(command).unwrap(),
         ];

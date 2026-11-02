@@ -333,7 +333,7 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         "03-fresh-issued.json",
         &json!({"automatic_replay_forbidden":true}),
     )?;
-    let child = OwnedChild::receiver(
+    let mut child = OwnedChild::receiver(
         &exe,
         &[
             (3, &fresh_profile),
@@ -355,7 +355,9 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         true,
     )
     .map_err(|_| ())?;
-    let response = match peer.result(crate::supervision::receiver(p.wait_seconds)?) {
+    let response = match crate::supervision::receiver(p.wait_seconds)
+        .and_then(|timeout| peer.result(timeout).map_err(|_| ()))
+    {
         Ok(response) => response,
         Err(_) => {
             let diagnostic = child.failure_diagnostic();
@@ -364,13 +366,13 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         }
     };
     create(&state, "03-fresh-observed.json", 0, 0o400, &response)?;
-    record(
+    let _ = record(
         &state,
         "03-fresh-stage.json",
         &json!({
             "last_stage":child.observed_stage(), "diagnostic_only":true,
         }),
-    )?;
+    );
     let _fresh_cessation = positive(child, crate::supervision::CESSATION)?;
     let enrolled = frame(&response, &nonce, "heterodyne-owned-fresh-enrollment.v3")?;
     if enrolled
