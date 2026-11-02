@@ -22,6 +22,7 @@ fn socket_option(fd: i32, name: i32) -> Result<i32, ReceiverHold> {
 pub(super) fn check_listener(file: &File) -> Result<(), ReceiverHold> {
     if socket_option(file.as_raw_fd(), libc::SO_ACCEPTCONN)? != 1
         || socket_option(file.as_raw_fd(), libc::SO_TYPE)? != libc::SOCK_STREAM
+        || !peer_uid(file.as_raw_fd(), 0)
     {
         return Err(ReceiverHold::Configuration);
     }
@@ -42,24 +43,27 @@ pub(super) fn check_listener(file: &File) -> Result<(), ReceiverHold> {
     }
     Ok(())
 }
-fn authenticated(peer: &UnixStream, uid: u32, token: &str, request: &Value) -> bool {
+fn peer_uid(fd: i32, uid: u32) -> bool {
     let mut c = libc::ucred {
         pid: 0,
         uid: 0,
         gid: 0,
     };
     let mut n = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let credentials = unsafe {
+    (unsafe {
         libc::getsockopt(
-            peer.as_raw_fd(),
+            fd,
             libc::SOL_SOCKET,
             libc::SO_PEERCRED,
             (&mut c as *mut libc::ucred).cast(),
             &mut n,
         )
-    } == 0
+    }) == 0
         && n as usize == std::mem::size_of::<libc::ucred>()
-        && c.uid == uid;
+        && c.uid == uid
+}
+fn authenticated(peer: &UnixStream, uid: u32, token: &str, request: &Value) -> bool {
+    let credentials = peer_uid(peer.as_raw_fd(), uid);
     let supplied = request
         .get("auth_token")
         .and_then(Value::as_str)
@@ -113,6 +117,9 @@ fn connection(
     token: &str,
     tx: mpsc::SyncSender<Command>,
 ) -> Result<(), ReceiverHold> {
+    if !peer_uid(peer.as_raw_fd(), uid) {
+        return Err(ReceiverHold::Configuration);
+    }
     peer.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Engine)?;
     peer.set_write_timeout(Some(Duration::from_secs(5)))
@@ -143,7 +150,7 @@ fn connection(
     {
         Ok(payload) => write(&mut peer, &id, payload)?,
         Err(error) => {
-            let retryable = matches!(error, ReceiverHold::Engine | ReceiverHold::Capacity);
+            let retryable = matches!(error, ReceiverHold::Engine);
             write(
                 &mut peer,
                 &id,

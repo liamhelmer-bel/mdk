@@ -260,17 +260,11 @@ async fn serve(
                         .map_err(|_| ReceiverHold::ChangedState)?;
                     closure_checked = std::time::Instant::now();
                     let result = dispatch(factory, profile, history, call.request).await;
-                    // Journal/native uncertainty stops this owner, never retries
-                    // native preparation. Request-shape refusals are harmless.
-                    let fatal =
-                        matches!(&result, Err(ReceiverHold::Journal | ReceiverHold::Latched));
-                    let _ = call.reply.send(result);
-                    if fatal {
-                        return Err(ReceiverHold::Latched);
-                    }
+                    finish_call(factory, call.reply, result)?;
                 }
                 Command::Replay { after, reply } => {
-                    let _ = reply.send(projection::replay(factory, profile, history, after));
+                    let result = projection::replay(factory, profile, history, after);
+                    finish_replay(reply, result)?;
                 }
             }
         }
@@ -296,6 +290,41 @@ async fn serve(
                 .map_err(|_| ReceiverHold::ChangedState)?;
             closure_checked = std::time::Instant::now();
         }
+    }
+}
+// Native uncertainty overrides otherwise retryable transport errors. The
+// actual owner exits after sending this terminal refusal, retaining no claim
+// of continued availability or automatic generation recovery.
+fn finish_call<S: StorageProvider + 'static>(
+    factory: &SemanticFactory<S>,
+    reply: mpsc::SyncSender<Result<Value, ReceiverHold>>,
+    result: Result<Value, ReceiverHold>,
+) -> Result<(), ReceiverHold> {
+    let fatal = factory.held
+        || factory.receiver.latched
+        || matches!(&result, Err(ReceiverHold::Journal | ReceiverHold::Latched));
+    let _ = reply.send(if fatal {
+        Err(ReceiverHold::Latched)
+    } else {
+        result
+    });
+    if fatal {
+        Err(ReceiverHold::Latched)
+    } else {
+        Ok(())
+    }
+}
+fn finish_replay(
+    reply: mpsc::SyncSender<Result<(Vec<Value>, u64), ReceiverHold>>,
+    result: Result<(Vec<Value>, u64), ReceiverHold>,
+) -> Result<(), ReceiverHold> {
+    // Replaying an identical retained prefix cannot cure a refused record.
+    let failed = result.is_err();
+    let _ = reply.send(result);
+    if failed {
+        Err(ReceiverHold::Latched)
+    } else {
+        Ok(())
     }
 }
 #[path = "protected_serving_dispatch.rs"]

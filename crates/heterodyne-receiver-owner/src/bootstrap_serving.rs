@@ -55,6 +55,26 @@ impl Inputs {
         {
             return Err(());
         }
+        let mut credentials = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut size,
+            )
+        } != 0
+            || size as usize != std::mem::size_of::<libc::ucred>()
+            || credentials.uid != 0
+        {
+            return Err(());
+        }
         // Publication/card inputs must never select a hidden effect lane.
         for fd in [13, 14, 15, 18] {
             if unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0 {

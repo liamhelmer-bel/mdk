@@ -312,7 +312,7 @@ fn serving_channel_reports_only_recoverable_holds_as_retryable() {
         ReceiverHold::Malformed,
         ReceiverHold::Configuration,
     ] {
-        let expected = matches!(error, ReceiverHold::Engine | ReceiverHold::Capacity);
+        let expected = matches!(error, ReceiverHold::Engine);
         let (mut client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -442,4 +442,75 @@ async fn serving_reopen_material_refuses_changes_before_reading_consumer_nonce()
         .unwrap();
         std::fs::set_permissions(&anchor_path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+}
+
+#[test]
+fn serving_foreign_peer_is_refused_without_waiting_for_request_bytes() {
+    use std::io::Read;
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    channel::spawn(
+        server,
+        unsafe { libc::geteuid() } + 1,
+        "a".repeat(64),
+        tx,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    // No request or newline is sent. The kernel peer check must precede read.
+    assert_eq!(client.read(&mut [0]).unwrap(), 0);
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
+}
+
+#[test]
+fn serving_listener_requires_actual_root_creator() {
+    use std::os::fd::IntoRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(dir.path().join("socket")).unwrap();
+    let file = unsafe { File::from_raw_fd(listener.into_raw_fd()) };
+    assert_eq!(
+        channel::check_listener(&file).is_ok(),
+        unsafe { libc::geteuid() } == 0
+    );
+    if unsafe { libc::geteuid() } != 0 {
+        // Execute the same actual listener control in the existing disposable
+        // mapped-root fixture, without claiming a production installation.
+        assert!(!crate::protected_recovery::root_expiry_fixture_available());
+    }
+}
+
+#[tokio::test]
+async fn serving_native_uncertainty_and_retained_replay_refusal_stop_owner() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, _, _root, _) =
+        super::super::whole_packet_qualification::current_routed_fixture().await;
+    // The native owner has latched an in-flight prepare. A transport Engine
+    // error must not escape as retryable while the owner continues serving.
+    factory.held = true;
+    let (tx, rx) = mpsc::sync_channel(1);
+    assert!(finish_call(&factory, tx, Err(ReceiverHold::Engine)).is_err());
+    assert!(matches!(rx.recv().unwrap(), Err(ReceiverHold::Latched)));
+    factory.held = false;
+    let (tx, rx) = mpsc::sync_channel(1);
+    assert!(finish_call(&factory, tx, Err(ReceiverHold::Engine)).is_ok());
+    assert!(matches!(rx.recv().unwrap(), Err(ReceiverHold::Engine)));
+    for error in [
+        ReceiverHold::Journal,
+        ReceiverHold::ChangedState,
+        ReceiverHold::Capacity,
+    ] {
+        let (tx, rx) = mpsc::sync_channel(1);
+        assert!(finish_replay(tx, Err(error)).is_err());
+        assert!(rx.recv().unwrap().is_err());
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    assert!(finish_replay(tx, Ok((vec![], 0))).is_ok());
+    assert!(rx.recv().unwrap().is_ok());
 }
