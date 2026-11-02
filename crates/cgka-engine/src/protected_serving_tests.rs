@@ -282,7 +282,10 @@ fn serving_unix_channel_requires_peer_and_token_before_dispatch() {
         let active = Arc::new(AtomicUsize::new(0));
         channel::spawn(server, uid, "a".repeat(64), tx, active);
         let req = json!({"id":"request-1","type":"group_info","marmot_agent_control":PROTOCOL,"auth_token":token});
-        writeln!(client, "{req}").unwrap();
+        if let Err(error) = writeln!(client, "{req}") {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+            return false; // Peer refusal may close before the request write.
+        }
         if let Ok(Command::Call(call)) = rx.recv_timeout(Duration::from_secs(1)) {
             call.reply.send(Ok(json!({"type":"group_info"}))).unwrap();
             let mut line = String::new();
@@ -513,4 +516,46 @@ async fn serving_native_uncertainty_and_retained_replay_refusal_stop_owner() {
     let (tx, rx) = mpsc::sync_channel(1);
     assert!(finish_replay(tx, Ok((vec![], 0))).is_ok());
     assert!(rx.recv().unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn serving_actual_sdk_activation_requires_inbox_relays() {
+    use transport_nostr_adapter::NostrSdkRelayClient;
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (factory, _operator, _root, _relay) =
+        super::super::whole_packet_qualification::current_routed_fixture().await;
+    let mut p = profile(&factory);
+    // A bound loopback socket supplies a finite local relay address. This
+    // qualifies SDK subscription registration, not relay delivery or TLS.
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    p.endpoints = vec![TransportEndpoint(format!(
+        "ws://{}",
+        socket.local_addr().unwrap()
+    ))];
+    let account = factory.receiver.engine.self_id();
+    let group = factory.receiver.group.clone();
+    let client = nostr_sdk::Client::builder().build();
+    let sdk = NostrSdkRelayClient::new(client.clone());
+    let adapter = NostrTransportAdapter::new(Arc::new(sdk.clone()));
+    let mut broken = activation(&p, account.clone(), group.clone());
+    broken.inbox_endpoints.clear();
+    let error = tokio::time::timeout(Duration::from_secs(5), adapter.activate_account(broken))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, cgka_traits::TransportAdapterError::Subscription(_)),
+        "{error:?}"
+    );
+    eprintln!("empty-inbox actual SDK refusal: {error}");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        adapter.activate_account(activation(&p, account, group)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    client.shutdown().await;
 }

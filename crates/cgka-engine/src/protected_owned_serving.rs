@@ -205,6 +205,24 @@ struct Listener {
     socket: UnixListener,
     token: String,
 }
+// The adapter always subscribes both the account inbox and the group. Both
+// routes use only the exact relays retained in the enrolled serving profile.
+fn activation(
+    profile: &ServingProfile,
+    account_id: MemberId,
+    group_id: GroupId,
+) -> TransportAccountActivation {
+    TransportAccountActivation {
+        account_id,
+        inbox_endpoints: profile.endpoints.clone(),
+        group_subscriptions: vec![TransportGroupSubscription {
+            group_id,
+            transport_group_id: profile.transport_group.clone(),
+            endpoints: profile.endpoints.clone(),
+        }],
+        since: None,
+    }
+}
 async fn serve(
     profile: &ServingProfile,
     factory: &mut SemanticFactory<SqliteAccountStorage>,
@@ -221,20 +239,26 @@ async fn serve(
     stage("transport-activate");
     tokio::time::timeout(
         Duration::from_secs(30),
-        adapter.activate_account(TransportAccountActivation {
-            account_id: factory.receiver.engine.self_id(),
-            inbox_endpoints: vec![],
-            group_subscriptions: vec![TransportGroupSubscription {
-                group_id: factory.receiver.group.clone(),
-                transport_group_id: profile.transport_group.clone(),
-                endpoints: profile.endpoints.clone(),
-            }],
-            since: None,
-        }),
+        adapter.activate_account(activation(
+            profile,
+            factory.receiver.engine.self_id(),
+            factory.receiver.group.clone(),
+        )),
     )
     .await
-    .map_err(|_| ReceiverHold::Engine)?
-    .map_err(|_| ReceiverHold::Engine)?;
+    .map_err(|_| {
+        stage("transport-activate-timeout");
+        ReceiverHold::Engine
+    })?
+    .map_err(|error| {
+        // Never log adapter Display: implementations may carry endpoint data.
+        stage(match error {
+            cgka_traits::TransportAdapterError::Subscription(_) => "transport-subscription-refused",
+            cgka_traits::TransportAdapterError::Closed => "transport-closed",
+            _ => "transport-activate-refused",
+        });
+        ReceiverHold::Engine
+    })?;
     stage("serve-loop");
     let (tx, rx) = mpsc::sync_channel(64);
     let active = Arc::new(AtomicUsize::new(0));

@@ -472,6 +472,10 @@ fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
         "semantic-reopen",
         "group-binding",
         "transport-activate",
+        "transport-activate-timeout",
+        "transport-subscription-refused",
+        "transport-closed",
+        "transport-activate-refused",
         "serve-loop",
     ];
     if let Some(stage) = std::str::from_utf8(raw)
@@ -537,6 +541,17 @@ mod tests {
 
     #[test]
     fn serving_diagnostics_accept_only_closed_source_stage_names() {
+        for stage in [
+            "transport-activate-timeout",
+            "transport-subscription-refused",
+            "transport-closed",
+            "transport-activate-refused",
+        ] {
+            assert_eq!(
+                diagnostic_stage(format!("serving-stage={stage}").as_bytes()),
+                Some(stage)
+            );
+        }
         assert_eq!(
             diagnostic_stage(b"serving-stage=journal-reopen"),
             Some("journal-reopen")
