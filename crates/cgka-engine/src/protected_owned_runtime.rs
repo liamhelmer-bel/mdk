@@ -225,6 +225,7 @@ async fn run(
         reopening,
         material,
         crate::protected_receiver::ReceiverMode::Authority,
+        profile.transport_group.clone(),
     )?;
     let journal_sha = factory
         .ordered()?
@@ -1271,6 +1272,7 @@ fn open_receiver(
     files: [File; 10],
     material: ReopenMaterial,
     mode: crate::protected_receiver::ReceiverMode,
+    transport_group: Vec<u8>,
 ) -> Result<Opened, ReceiverHold> {
     let [
         key_file,
@@ -1370,6 +1372,7 @@ fn open_receiver(
             expiry,
             cache,
             mode,
+            transport_group,
         },
     )?;
     Ok(Opened {

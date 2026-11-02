@@ -183,12 +183,7 @@ async fn run(
         reopening,
         material,
         CONVERSATION_MODE,
-    )?;
-    stage("group-binding");
-    owned_producer::GroupBinding::read(
-        &factory.receiver.engine,
-        &factory.receiver.group,
-        &profile.transport_group,
+        profile.transport_group.clone(),
     )?;
     let forwarder = forward(sdk.clone(), adapter.clone(), relay_spool);
     let result = serve(
@@ -212,9 +207,11 @@ async fn run(
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
     // Exact originals and factory remain owned through transport shutdown.
     drop((factory, _custody));
-    if shutdown.is_err() && result.is_ok() {
+    if shutdown.is_err() {
         stage("serve-shutdown-timeout");
-        return Err(ReceiverHold::Engine);
+        if result.is_ok() {
+            return Err(ReceiverHold::Engine);
+        }
     }
     result
 }

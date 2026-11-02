@@ -1129,6 +1129,17 @@ pub(super) async fn restart_factory_for_mode(
     cache_name: &str,
     mode: crate::protected_receiver::ReceiverMode,
 ) -> Result<SemanticFactory<SqliteAccountStorage>, ReceiverHold> {
+    restart_factory_for_mode_and_transport(f, root, relay, cache_name, mode, vec![7; 32]).await
+}
+#[cfg(target_os = "linux")]
+pub(super) async fn restart_factory_for_mode_and_transport(
+    f: SemanticFactory<SqliteAccountStorage>,
+    root: &std::path::Path,
+    relay: Arc<Relay>,
+    cache_name: &str,
+    mode: crate::protected_receiver::ReceiverMode,
+    transport_group: Vec<u8>,
+) -> Result<SemanticFactory<SqliteAccountStorage>, ReceiverHold> {
     let storage = f.receiver.engine.storage.clone();
     let group = f.receiver.group.clone();
     let operators = f.receiver.operators.clone();
@@ -1161,6 +1172,7 @@ pub(super) async fn restart_factory_for_mode(
             expiry: std::fs::File::open(root.join("profile")).unwrap(),
             cache: cache(root, cache_name),
             mode,
+            transport_group,
         },
     )
 }

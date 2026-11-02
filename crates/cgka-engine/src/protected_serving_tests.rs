@@ -967,3 +967,32 @@ async fn failed_conversation_reopen_keeps_unfinished_wire_unsealed_and_unchanged
         anchor
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_conversation_transport_binding_keeps_source_unsealed_and_unchanged() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (factory, _, root, relay) = super::super::super::tests::fresh_recovery_factory().await;
+    let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    let result = super::super::super::tests::restart_factory_for_mode_and_transport(
+        factory,
+        root.path(),
+        relay,
+        "failed-transport-binding",
+        CONVERSATION_MODE,
+        vec![8; 32],
+    )
+    .await;
+    assert!(matches!(result, Err(ReceiverHold::ChangedState)));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        journal
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+        anchor
+    );
+}

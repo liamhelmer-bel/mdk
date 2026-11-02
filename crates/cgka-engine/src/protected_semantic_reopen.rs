@@ -8,6 +8,7 @@ pub(super) struct ReopenFiles {
     pub(super) expiry: File,
     pub(super) cache: File,
     pub(super) mode: super::super::ReceiverMode,
+    pub(super) transport_group: Vec<u8>,
 }
 
 impl<S: StorageProvider + 'static> SemanticFactory<S> {
@@ -30,6 +31,13 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
     ) -> Result<Self, ReceiverHold> {
         let receiver = ProtectedReceiver::reopen_ordered_for_mode(
             engine, group, operators, journal, files.mode,
+        )?;
+        // Reject a mismatched owned routing profile before any reconstruction,
+        // pending acknowledgment, expiry writes, or permanent conversation seal.
+        super::owned_producer::GroupBinding::read(
+            &receiver.engine,
+            &receiver.group,
+            &files.transport_group,
         )?;
         let pending = receiver.check_reopened_pending()?;
         let mut factory =
