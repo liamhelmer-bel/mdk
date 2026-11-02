@@ -996,3 +996,173 @@ async fn failed_conversation_transport_binding_keeps_source_unsealed_and_unchang
         anchor
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn conversation_genuine_future_epoch_retains_while_new_chat_continues() {
+    use cgka_traits::storage::MessageStorage;
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    let mut factory = super::super::super::tests::restart_factory_for_mode(
+        factory,
+        root.path(),
+        relay.clone(),
+        "early-epoch",
+        CONVERSATION_MODE,
+    )
+    .await
+    .unwrap();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: factory.receiver.group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native update")
+    };
+    operator.confirm_published(pending).await.unwrap();
+    let early_app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1500,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "future epoch member",
+    );
+    let SendResult::ApplicationMessage { msg: early, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: factory.receiver.group.clone(),
+            payload: early_app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("actual future epoch message")
+    };
+    assert!(factory.ingest(early.clone()).await.unwrap().is_none());
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .storage
+            .get_message(&early.id)
+            .unwrap()
+            .state,
+        cgka_traits::message::MessageState::PeelDeferred
+    );
+    let retained_deferred = |factory: &SemanticFactory<SqliteAccountStorage>| {
+        let mut source = factory.ordered().unwrap().source_cursor().unwrap();
+        let mut count = 0;
+        while let Some(record) = source.next().unwrap() {
+            let value = &record.body["value"];
+            if value["schema"] == "receiver-outcome.v1" {
+                let outcome: crate::protected_receiver::RetainedOutcome =
+                    serde_json::from_value(value.clone()).unwrap();
+                if outcome.message_id == hex::encode(early.id.as_slice())
+                    && outcome.is_opaque_deferred_for(&factory.receiver.group)
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+    assert_eq!(retained_deferred(&factory), 1);
+    // Actual owned SDK ingress is Engine::ingest, not the general app runtime's
+    // separate advance_convergence drain. The real update changes epoch but
+    // leaves this original row PeelDeferred; no old-ID event is emitted here.
+    assert!(factory.ingest(commit).await.unwrap().is_none());
+    assert!(!factory.held && !factory.receiver.latched);
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .storage
+            .get_message(&early.id)
+            .unwrap()
+            .state,
+        cgka_traits::message::MessageState::PeelDeferred
+    );
+    assert_eq!(retained_deferred(&factory), 1);
+    let history_file = tempfile::NamedTempFile::new().unwrap();
+    let h = history(history_file.reopen().unwrap());
+    let (before_redelivery, _) = projection::replay(&factory, &profile(&factory), &h, 0).unwrap();
+    assert!(before_redelivery.is_empty(), "{before_redelivery:?}");
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay.clone(),
+        "after-native-update",
+    )
+    .await
+    .unwrap();
+    // Exact relay redelivery retains a NEW ingress/content binding and can
+    // project the genuine early application without rewriting its original
+    // native PeelDeferred row or its retained opaque Deferred outcome.
+    assert!(factory.ingest(early.clone()).await.unwrap().is_none());
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .storage
+            .get_message(&early.id)
+            .unwrap()
+            .state,
+        cgka_traits::message::MessageState::PeelDeferred
+    );
+    let (redelivered, _) = projection::replay(&factory, &profile(&factory), &h, 0).unwrap();
+    assert_eq!(redelivered.len(), 1);
+    assert_eq!(redelivered[0]["message"]["message_id_hex"], early_app.id);
+    assert_eq!(redelivered[0]["message"]["text"], early_app.content);
+    let app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1501,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "new chat after commit",
+    );
+    let SendResult::ApplicationMessage { msg: later, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: factory.receiver.group.clone(),
+            payload: app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native later chat")
+    };
+    assert!(factory.ingest(later).await.unwrap().is_none());
+    assert_eq!(retained_deferred(&factory), 1);
+    assert!(factory.receiver.authority_blocked);
+    assert!(!factory.receiver.authority_available());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let h = history(file.reopen().unwrap());
+    let (messages, _) = projection::replay(&factory, &profile(&factory), &h, 0).unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0]["message"]["message_id_hex"], early_app.id);
+    assert_eq!(messages[0]["message"]["text"], early_app.content);
+    assert_eq!(messages[1]["message"]["message_id_hex"], app.id);
+    assert_eq!(messages[1]["message"]["text"], app.content);
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay,
+        "after-genuine-redelivery",
+    )
+    .await
+    .unwrap();
+    assert!(!factory.held && !factory.receiver.latched);
+    assert!(!factory.receiver.authority_available());
+    assert_eq!(retained_deferred(&factory), 1);
+    let (reopened, _) = projection::replay(&factory, &profile(&factory), &h, 0).unwrap();
+    assert_eq!(reopened, messages);
+}
