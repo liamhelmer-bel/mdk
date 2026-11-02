@@ -111,6 +111,34 @@ impl OwnedChild {
         )
     }
 
+    pub(crate) fn serving(
+        executable: &File,
+        descriptors: &[(RawFd, &File)],
+        lease: File,
+    ) -> Result<Self> {
+        if descriptors.len() != 14 || !(3..=16).all(|n| descriptors.iter().any(|(fd, _)| *fd == n))
+        {
+            return Err(Error::Hold);
+        }
+        Self::launch(
+            executable,
+            descriptors,
+            lease,
+            &[CString::new("heterodyne-protected-receiver").unwrap()],
+            19,
+            Some(899),
+        )
+    }
+    /// Retain the exact lifetime lease until actual PID namespace cessation.
+    /// Serving has no automatic restart or effect timeout/adoption path.
+    pub(crate) fn wait_serving(mut self) -> Result<Cessation> {
+        let status = self.reap()?;
+        Ok(Cessation {
+            status,
+            lease: self.lease.take().ok_or(Error::Hold)?,
+        })
+    }
+
     fn launch(
         executable: &File,
         descriptors: &[(RawFd, &File)],
@@ -691,6 +719,21 @@ mod tests {
         output.read_exact_at(&mut raw, 0).unwrap();
         assert_eq!(&raw, b"done");
         drop(stopped.into_lease());
+        independent.try_lock().unwrap();
+    }
+    #[test]
+    #[ignore = "actual root PID namespace qualification"]
+    fn serving_wait_reaps_namespace_and_retains_original_ofd() {
+        let (child, output, independent, _dir) = fixture("printf served >&3");
+        assert!(independent.try_lock().is_err());
+        let ceased = child.wait_serving().unwrap();
+        assert!(libc::WIFEXITED(ceased.status));
+        assert_eq!(libc::WEXITSTATUS(ceased.status), 0);
+        assert!(independent.try_lock().is_err());
+        let mut raw = [0; 6];
+        output.read_exact_at(&mut raw, 0).unwrap();
+        assert_eq!(&raw, b"served");
+        drop(ceased);
         independent.try_lock().unwrap();
     }
     #[test]

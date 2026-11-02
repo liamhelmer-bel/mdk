@@ -402,7 +402,7 @@ async fn qualify_owned_exchange(
 
 // Current profile, actual Schnorr account proof signer and NIP-59/445 peeler.
 // Journal enrollment below is disposable test evidence, not host custody.
-async fn current_routed_fixture() -> (
+pub(super) async fn current_routed_fixture() -> (
     SemanticFactory<SqliteAccountStorage>,
     Engine<SqliteAccountStorage>,
     tempfile::TempDir,

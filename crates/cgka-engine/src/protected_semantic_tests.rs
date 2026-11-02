@@ -16,7 +16,7 @@ use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 pub(super) struct Relay {
     pub(super) wires: Mutex<Vec<TransportMessage>>,
     pub(super) subscriptions: Mutex<Vec<NostrSubscription>>,
-    fail_at: Mutex<Option<usize>>,
+    pub(super) fail_at: Mutex<Option<usize>>,
 }
 #[async_trait::async_trait]
 impl NostrRelayClient for Relay {

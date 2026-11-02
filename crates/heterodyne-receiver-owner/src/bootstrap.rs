@@ -205,12 +205,12 @@ pub(crate) fn entry() -> Result<()> {
     validate_entry()?;
     // Claim original initializer descriptors before consuming the sealed nonce.
     let originals = original_inputs()?;
-    run(originals, Some(Publication::inherited()?))
+    run(originals, Some(Publication::inherited()?), None)
 }
 pub(crate) fn manual_entry() -> Result<()> {
     validate_entry()?;
     refuse_publication_descriptors()?;
-    run(original_inputs()?, None)
+    run(original_inputs()?, None, None)
 }
 fn refuse_publication_descriptors() -> Result<()> {
     for n in [8, 9, 13, 14, 15, 18] {
@@ -239,7 +239,11 @@ fn validate_entry() -> Result<()> {
     }
     Ok(())
 }
-fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
+fn run(
+    originals: [File; 5],
+    publication: Option<Publication>,
+    serving: Option<serving::Inputs>,
+) -> Result<()> {
     let [original, parent, ledger, lease, expiry] = originals;
     let lm = lease.metadata().map_err(|_| ())?;
     if !lm.is_file()
@@ -399,6 +403,29 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         return Err(());
     }
     record(&state, "04-enrolled.json", &enrolled)?;
+    if let Some(serving) = serving {
+        return serving::run(
+            serving,
+            &p,
+            enrollment,
+            transport_group,
+            &verified,
+            serving::Custody {
+                state: &state,
+                key: &key,
+                seed: &seed,
+                journal: &journal,
+                journals: &journals,
+                storage_lease: &storage_lease,
+                anchor: &anchor,
+                anchors: &anchors,
+                expiry: &expiry,
+                cache: &cache,
+                account: &account,
+                lease: &lease,
+            },
+        );
+    }
     let Some(Publication {
         host_channel,
         host_nonce,
@@ -595,4 +622,13 @@ mod manual_ingress_tests {
             assert_eq!(libc::WEXITSTATUS(status), 0);
         }
     }
+}
+
+#[path = "bootstrap_serving.rs"]
+mod serving;
+pub(crate) fn serving_entry() -> Result<()> {
+    validate_entry()?;
+    let originals = original_inputs()?;
+    let serving = serving::Inputs::inherited()?;
+    run(originals, None, Some(serving))
 }

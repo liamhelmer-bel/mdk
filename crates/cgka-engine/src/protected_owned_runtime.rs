@@ -105,6 +105,13 @@ pub(crate) fn entry() -> bool {
             return Err(ReceiverHold::Configuration);
         }
         let raw = read(&profile_file, 65536)?;
+        let schema: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
+        if schema.get("schema").and_then(serde_json::Value::as_str)
+            == Some("heterodyne-protected-receiver-serving.v1")
+        {
+            return serving::run_entry(profile_file, &raw);
+        }
         let profile: Profile = serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
         if profile.schema != "heterodyne-protected-receiver-process.v3"
             || profile.receiver_uid != unsafe { libc::geteuid() }
@@ -186,23 +193,6 @@ async fn run(
         peer_file,
         original_file,
     ] = files;
-    anchor_custody::check_descriptors(&anchor, &anchor_dir, &journal_dir, &account_dir)?;
-    let mut key = read(&key_file, 64)?;
-    let mut dbkey = read(&dbkey_file, 64)?;
-    if key.len() != 32 || dbkey.len() != 32 {
-        return Err(ReceiverHold::Configuration);
-    }
-    let keys = nostr::Keys::parse(&hex::encode(&key)).map_err(|_| ReceiverHold::Configuration)?;
-    key.fill(0);
-    if keys.public_key().to_hex() != profile.enrollment.account {
-        return Err(ReceiverHold::ChangedState);
-    }
-    let dir = account_dir
-        .metadata()
-        .map_err(|_| ReceiverHold::Configuration)?;
-    if !dir.is_dir() || dir.uid() != profile.receiver_uid || dir.mode() & 0o777 != 0o700 {
-        return Err(ReceiverHold::Configuration);
-    }
     let mut peer = checked_peer(peer_file, profile.consumer_uid)?;
     peer.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Configuration)?;
@@ -212,89 +202,36 @@ async fn run(
     peer.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Configuration)?;
     let original = read(&original_file, 32768)?;
-    let journal = Journal::reopen(
-        OwnedFiles {
-            journal: journal_file,
-            journal_directory: journal_dir,
-            storage_lease: lease,
-            anchor,
-            anchor_directory: anchor_dir,
-        },
+    let Opened {
+        mut factory,
+        sdk,
+        adapter,
+        relay_spool,
+        _custody,
+    } = open_receiver(
         &profile.enrollment,
-    )
-    .map_err(|_| ReceiverHold::Journal)?;
-    let journal_sha = journal
+        profile.receiver_uid,
+        profile.endpoints.clone(),
+        [
+            key_file,
+            dbkey_file,
+            journal_file,
+            journal_dir,
+            lease,
+            anchor,
+            anchor_dir,
+            expiry,
+            cache,
+            account_dir,
+        ],
+    )?;
+    let journal_sha = factory
+        .ordered()?
         .fresh_source_profile_hash()
         .map_err(|_| ReceiverHold::Journal)?;
-    // Fixed basename under the retained protected directory, never a packet path.
-    let db_path = PathBuf::from(format!(
-        "/proc/self/fd/{}/account.sqlite3",
-        account_dir.as_raw_fd()
-    ));
-    let sqlkey = SqlCipherKey::new(hex::encode(&dbkey)).map_err(|_| ReceiverHold::Configuration)?;
-    // Require an existing enrolled database. Never create a fresh account here.
-    let db_fd = unsafe {
-        libc::openat(
-            account_dir.as_raw_fd(),
-            c"account.sqlite3".as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if db_fd < 0 {
-        return Err(ReceiverHold::Configuration);
-    }
-    let db_file = unsafe { File::from_raw_fd(db_fd) };
-    let db_meta = db_file
-        .metadata()
-        .map_err(|_| ReceiverHold::Configuration)?;
-    if !db_meta.is_file()
-        || db_meta.nlink() != 1
-        || db_meta.uid() != profile.receiver_uid
-        || db_meta.mode() & 0o777 != 0o600
-    {
-        return Err(ReceiverHold::Configuration);
-    }
-    dbkey.fill(0);
-    let storage = SqliteAccountStorage::open_encrypted(&db_path, &sqlkey)
-        .map_err(|_| ReceiverHold::Engine)?;
-    let reopened = std::fs::metadata(&db_path).map_err(|_| ReceiverHold::ChangedState)?;
-    if reopened.dev() != db_meta.dev() || reopened.ino() != db_meta.ino() {
-        return Err(ReceiverHold::ChangedState);
-    }
-    let template = crate::protected_capability_policy::Template::from_policy(
-        &profile.enrollment.capability_template,
-        &profile.enrollment.capability_policy_sha256,
-    )
-    .map_err(|_| ReceiverHold::Configuration)?;
-    let engine = owned_routed_engine(storage, keys, template)?;
-    let group =
-        GroupId::new(hex::decode(&profile.enrollment.group).map_err(|_| ReceiverHold::Malformed)?);
-    let operators = profile
-        .enrollment
-        .operators
-        .iter()
-        .map(|s| {
-            hex::decode(s)
-                .map(MemberId::new)
-                .map_err(|_| ReceiverHold::Malformed)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let sdk = nostr_sdk::Client::builder().build();
-    let relay = NostrSdkRelayClient::new(sdk.clone());
-    let adapter = NostrTransportAdapter::new(Arc::new(relay.clone()));
-    let relay_spool = relay_spool::anonymous(&cache)?;
-    let mut factory = SemanticFactory::reopen(
-        engine,
-        group.clone(),
-        operators,
-        journal,
-        adapter.clone(),
-        profile.endpoints.clone(),
-        reopen::ReopenFiles { expiry, cache },
-    )?;
     let binding = owned_producer::GroupBinding::read(
         &factory.receiver.engine,
-        &group,
+        &factory.receiver.group,
         &profile.transport_group,
     )?;
     let producer = owned_producer::InstalledProducer {
@@ -346,7 +283,7 @@ async fn run(
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
     // factory and every original custody descriptor remain alive until shutdown.
     drop(factory);
-    drop((key_file, dbkey_file, account_dir, db_file, original_file));
+    drop((_custody, original_file));
     if shutdown.is_err() {
         return Err(ReceiverHold::Engine);
     }
@@ -1134,3 +1071,132 @@ mod whole_packet_qualification;
 #[cfg(test)]
 #[path = "protected_capability_policy_tests.rs"]
 mod capability_tests;
+
+#[path = "protected_owned_serving.rs"]
+pub(crate) mod serving;
+
+struct Opened {
+    factory: SemanticFactory<SqliteAccountStorage>,
+    sdk: nostr_sdk::Client,
+    adapter: NostrTransportAdapter,
+    relay_spool: File,
+    _custody: (File, File, File, File),
+}
+fn open_receiver(
+    enrollment: &Enrollment,
+    receiver_uid: u32,
+    endpoints: Vec<TransportEndpoint>,
+    files: [File; 10],
+) -> Result<Opened, ReceiverHold> {
+    let [
+        key_file,
+        dbkey_file,
+        journal_file,
+        journal_dir,
+        lease,
+        anchor,
+        anchor_dir,
+        expiry,
+        cache,
+        account_dir,
+    ] = files;
+    anchor_custody::check_descriptors(&anchor, &anchor_dir, &journal_dir, &account_dir)?;
+    let mut key = read(&key_file, 64)?;
+    let mut dbkey = read(&dbkey_file, 64)?;
+    if key.len() != 32 || dbkey.len() != 32 {
+        return Err(ReceiverHold::Configuration);
+    }
+    let keys = nostr::Keys::parse(&hex::encode(&key)).map_err(|_| ReceiverHold::Configuration)?;
+    key.fill(0);
+    if keys.public_key().to_hex() != enrollment.account {
+        return Err(ReceiverHold::ChangedState);
+    }
+    let dir = account_dir
+        .metadata()
+        .map_err(|_| ReceiverHold::Configuration)?;
+    if !dir.is_dir() || dir.uid() != receiver_uid || dir.mode() & 0o777 != 0o700 {
+        return Err(ReceiverHold::Configuration);
+    }
+    let journal = Journal::reopen(
+        OwnedFiles {
+            journal: journal_file,
+            journal_directory: journal_dir,
+            storage_lease: lease,
+            anchor,
+            anchor_directory: anchor_dir,
+        },
+        enrollment,
+    )
+    .map_err(|_| ReceiverHold::Journal)?;
+    // Fixed basename under the retained protected directory, never a packet path.
+    let db_path = PathBuf::from(format!(
+        "/proc/self/fd/{}/account.sqlite3",
+        account_dir.as_raw_fd()
+    ));
+    let sqlkey = SqlCipherKey::new(hex::encode(&dbkey)).map_err(|_| ReceiverHold::Configuration)?;
+    // Require an existing enrolled database. Never create a fresh account here.
+    let db_fd = unsafe {
+        libc::openat(
+            account_dir.as_raw_fd(),
+            c"account.sqlite3".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if db_fd < 0 {
+        return Err(ReceiverHold::Configuration);
+    }
+    let db_file = unsafe { File::from_raw_fd(db_fd) };
+    let db_meta = db_file
+        .metadata()
+        .map_err(|_| ReceiverHold::Configuration)?;
+    if !db_meta.is_file()
+        || db_meta.nlink() != 1
+        || db_meta.uid() != receiver_uid
+        || db_meta.mode() & 0o777 != 0o600
+    {
+        return Err(ReceiverHold::Configuration);
+    }
+    dbkey.fill(0);
+    let storage = SqliteAccountStorage::open_encrypted(&db_path, &sqlkey)
+        .map_err(|_| ReceiverHold::Engine)?;
+    let reopened = std::fs::metadata(&db_path).map_err(|_| ReceiverHold::ChangedState)?;
+    if reopened.dev() != db_meta.dev() || reopened.ino() != db_meta.ino() {
+        return Err(ReceiverHold::ChangedState);
+    }
+    let template = crate::protected_capability_policy::Template::from_policy(
+        &enrollment.capability_template,
+        &enrollment.capability_policy_sha256,
+    )
+    .map_err(|_| ReceiverHold::Configuration)?;
+    let engine = owned_routed_engine(storage, keys, template)?;
+    let group = GroupId::new(hex::decode(&enrollment.group).map_err(|_| ReceiverHold::Malformed)?);
+    let operators = enrollment
+        .operators
+        .iter()
+        .map(|s| {
+            hex::decode(s)
+                .map(MemberId::new)
+                .map_err(|_| ReceiverHold::Malformed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let sdk = nostr_sdk::Client::builder().build();
+    let relay = NostrSdkRelayClient::new(sdk.clone());
+    let adapter = NostrTransportAdapter::new(Arc::new(relay.clone()));
+    let relay_spool = relay_spool::anonymous(&cache)?;
+    let factory = SemanticFactory::reopen(
+        engine,
+        group.clone(),
+        operators,
+        journal,
+        adapter.clone(),
+        endpoints,
+        reopen::ReopenFiles { expiry, cache },
+    )?;
+    Ok(Opened {
+        factory,
+        sdk,
+        adapter,
+        relay_spool,
+        _custody: (key_file, dbkey_file, account_dir, db_file),
+    })
+}

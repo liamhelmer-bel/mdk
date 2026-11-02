@@ -61,3 +61,8 @@ mod manual_custody;
 pub fn protected_manual_bootstrap_entry() -> bool {
     bootstrap::manual_entry().is_ok()
 }
+
+/// Fixed separately enrolled chat service; never adopts an existing generation.
+pub fn protected_serving_bootstrap_entry() -> bool {
+    bootstrap::serving_entry().is_ok()
+}
