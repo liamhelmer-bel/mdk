@@ -462,6 +462,14 @@ impl Builder<'_> {
         let schema = text(v, "schema")?;
         match schema {
             "receiver-enrollment.v1" => Ok(()),
+            "receiver-conversation-only.v1" => {
+                if self.mode != super::super::ReceiverMode::ConversationOnly
+                    || v != &self.journal.conversation_seal()
+                {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                Ok(())
+            }
             "receiver-wire.v1" => self.wire(v),
             "receiver-outcome.v1" => self.outcome(v, record),
             "semantic-original.v2" => self.original(v, record),

@@ -51,7 +51,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         mut engine: Engine<S>,
         group: GroupId,
         operators: Vec<MemberId>,
-        journal: Journal,
+        mut journal: Journal,
         mode: ReceiverMode,
     ) -> Result<Self, ReceiverHold> {
         engine
@@ -110,8 +110,19 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         let mut native = serde_json::to_value(&join.joined).map_err(|_| ReceiverHold::Malformed)?;
         let mut sequence = 0;
         let mut authority_blocked = false;
+        let mut conversation_sealed = false;
         while let Some(record) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
             let value = &record.body["value"];
+            if value["schema"] == "receiver-conversation-only.v1" {
+                if mode != ReceiverMode::ConversationOnly
+                    || conversation_sealed
+                    || value != &journal.conversation_seal()
+                {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                conversation_sealed = true;
+                continue;
+            }
             if value["schema"] != "receiver-outcome.v1" {
                 continue;
             }
@@ -171,6 +182,14 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .map_err(|_| ReceiverHold::ChangedState)?;
         if serde_json::to_value(current).map_err(|_| ReceiverHold::Malformed)? != native {
             return Err(ReceiverHold::ChangedState);
+        }
+        // Seal before returning any conversation capability or permitting
+        // semantic reconstruction/ingress. A later Authority opener must refuse
+        // this anchored source, even if the last chat resembles an approval.
+        if mode == ReceiverMode::ConversationOnly && !conversation_sealed {
+            journal
+                .record_source(journal.conversation_seal())
+                .map_err(|_| ReceiverHold::Journal)?;
         }
         Ok(Self {
             engine,

@@ -123,6 +123,7 @@ enum TransitionKind {
     Expired,
     NativeUpdate,
     Enrollment,
+    ConversationOnly,
     Consumed,
 }
 
@@ -676,11 +677,18 @@ impl Journal {
                 && enrollment.operators == operators && enrollment.initial_native_state_sha256 == native))
     }
 
+    /// A one-way capability downgrade bound to this anchored journal header.
+    /// This value is source-owned and never grants authority on deserialization.
+    pub(super) fn conversation_seal(&self) -> serde_json::Value {
+        serde_json::json!({"schema":"receiver-conversation-only.v1", "header_sha256":self.header_hash()})
+    }
+
     /// Fixed source schemas only. This chains original bytes; it is not a semantic
     /// recovery validator and cannot turn a supplied decoded object into authority.
     pub(super) fn record_source(&mut self, value: serde_json::Value) -> Result<()> {
         let transition = match value.get("schema").and_then(|v| v.as_str()) {
             Some("receiver-enrollment.v1") => TransitionKind::Enrollment,
+            Some("receiver-conversation-only.v1") => TransitionKind::ConversationOnly,
             Some("receiver-wire.v1") => TransitionKind::Wire,
             Some("receiver-outcome.v1") => TransitionKind::Outcome,
             Some("semantic-original.v1" | "semantic-original.v2") => TransitionKind::Original,

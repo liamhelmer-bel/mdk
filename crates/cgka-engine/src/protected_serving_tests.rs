@@ -794,3 +794,95 @@ async fn conversation_catalog_accepts_edits_removals_and_relevant_replies_live_a
             .all(|ask| ask.receipt.is_none() && !ask.consumed)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn conversation_seal_refuses_authority_reopen_before_classifying_chat() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_REACTION};
+    for kind in [MARMOT_APP_EVENT_KIND_REACTION, MARMOT_APP_EVENT_KIND_EDIT] {
+        let (mut factory, mut operator, root, relay) =
+            super::super::super::tests::fresh_recovery_factory().await;
+        let ask = super::super::super::tests::finite_original("ask3", &factory.receiver.group);
+        factory.post(ask).await.unwrap();
+        let target = factory.asks["ask3"].app_ids[0].clone();
+        factory = super::super::super::tests::restart_factory_for_mode(
+            factory,
+            root.path(),
+            relay.clone(),
+            "sealed-chat-entry",
+            CONVERSATION_MODE,
+        )
+        .await
+        .unwrap();
+        let seal = factory.ordered().unwrap().conversation_seal();
+        let mut cursor = factory.ordered().unwrap().source_cursor().unwrap();
+        let mut seals = 0;
+        while let Some(record) = cursor.next().unwrap() {
+            if record.body["value"] == seal {
+                seals += 1;
+            }
+        }
+        assert_eq!(seals, 1);
+        drop(cursor);
+        let app = MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1300,
+            kind,
+            vec![vec!["e".into(), target]],
+            if kind == MARMOT_APP_EVENT_KIND_REACTION {
+                "👍"
+            } else {
+                "edited"
+            },
+        );
+        let SendResult::ApplicationMessage { msg: wire, .. } = operator
+            .send(SendIntent::AppMessage {
+                group_id: factory.receiver.group.clone(),
+                payload: app.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("actual native app message")
+        };
+        assert!(factory.ingest(wire).await.unwrap().is_none());
+        factory = super::super::super::tests::restart_factory(
+            factory,
+            root.path(),
+            relay.clone(),
+            "sealed-chat-reopen",
+        )
+        .await
+        .unwrap();
+        assert!(!factory.receiver.authority_available());
+        assert!(
+            factory
+                .asks
+                .values()
+                .all(|ask| ask.receipt.is_none() && !ask.consumed)
+        );
+        let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+        let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+        let result = super::super::super::tests::restart_factory_for_mode(
+            factory,
+            root.path(),
+            relay,
+            "forbidden-authority-reopen",
+            super::super::super::super::ReceiverMode::Authority,
+        )
+        .await;
+        assert!(matches!(result, Err(ReceiverHold::ChangedState)));
+        assert_eq!(
+            std::fs::read(root.path().join("receiver/journal")).unwrap(),
+            journal
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+            anchor
+        );
+    }
+}
