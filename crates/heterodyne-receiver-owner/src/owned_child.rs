@@ -21,6 +21,7 @@ pub(crate) struct OwnedChild {
     pidfd: File,
     lease: Option<File>,
     reaped: bool,
+    diagnostic: File,
 }
 pub(crate) struct Cessation {
     pub(crate) status: i32,
@@ -149,6 +150,13 @@ impl OwnedChild {
         let executable = duplicate(executable)?;
         let null = File::options().read(true).write(true).open("/dev/null")?;
         let null = duplicate(&null)?;
+        let mut pipe = [-1; 2];
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        let diagnostic = unsafe { File::from_raw_fd(pipe[0]) };
+        let diagnostic_writer = unsafe { File::from_raw_fd(pipe[1]) };
+        let diagnostic_writer = duplicate(&diagnostic_writer)?;
         let mut argv: Vec<_> = arguments.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
         let empty = c"";
@@ -188,10 +196,13 @@ impl OwnedChild {
                 if libc::poll(&mut parent_poll, 1, 0) != 0 {
                     libc::_exit(125);
                 }
-                for target in 0..=2 {
+                for target in 0..=1 {
                     if libc::dup2(null.as_raw_fd(), target) < 0 {
                         libc::_exit(125);
                     }
+                }
+                if libc::dup2(diagnostic_writer.as_raw_fd(), 2) < 0 {
+                    libc::_exit(125);
                 }
                 for (target, file) in &retained {
                     if libc::dup2(file.as_raw_fd(), *target) < 0 {
@@ -246,7 +257,41 @@ impl OwnedChild {
             pidfd: unsafe { File::from_raw_fd(pidfd) },
             lease: Some(lease),
             reaped: false,
+            diagnostic,
         })
+    }
+
+    /// Failure-only observation. Kill/reap the entire owned namespace first,
+    /// preserving the original lease until cessation; never interpret a stage
+    /// token or an exit status as evidence of enrollment or permission to retry.
+    pub(crate) fn failure_diagnostic(mut self) -> serde_json::Value {
+        self.kill();
+        let status = self.reap().ok();
+        let stage = self.observed_stage();
+        serde_json::json!({
+            "schema":"heterodyne-owned-child-diagnostic.v1",
+            "last_stage": stage,
+            "exit_code":status.filter(|s| libc::WIFEXITED(*s)).map(|s| libc::WEXITSTATUS(s)),
+            "signal":status.filter(|s| libc::WIFSIGNALED(*s)).map(|s| libc::WTERMSIG(s)),
+            "requires_reconciliation":true,"automatic_replay_forbidden":true,
+        })
+    }
+    pub(crate) fn observed_stage(&self) -> Option<String> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let _ = (&self.diagnostic).take(4096).read_to_end(&mut bytes);
+        diagnostic_stage(&bytes).map(str::to_owned)
+    }
+    fn kill(&self) {
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                libc::SIGKILL,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            );
+        }
     }
 
     fn reap(&mut self) -> Result<i32> {
@@ -276,24 +321,109 @@ impl Drop for OwnedChild {
     fn drop(&mut self) {
         if !self.reaped {
             // Killing PID1 tears down its descendants in this owned PIDns.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    self.pidfd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                );
-            }
+            self.kill();
             let _ = self.reap();
         }
     }
+}
+
+// Only source-fixed stage names survive. Discard all other child stderr, including
+// error payloads and arbitrary log lines. Diagnostics are not a transport frame.
+fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
+    const STAGES: &[&str] = &[
+        "entry",
+        "profile-read",
+        "profile-check",
+        "process-hardening",
+        "descriptor-claim",
+        "binding-check",
+        "runtime-create",
+        "anchor-check",
+        "storage-lease",
+        "account-directory",
+        "peer-check",
+        "secret-read",
+        "database-open",
+        "sqlcipher-open",
+        "engine-create",
+        "cache-device",
+        "durable-writable",
+        "fresh-account",
+        "peer-nonce",
+        "cache-spool",
+        "journal-prepare",
+        "intent-check",
+        "transport-create",
+        "transport-activate",
+        "welcome-wait",
+        "welcome-binding",
+        "welcome-native-join",
+        "enrollment-retain",
+        "success-frame",
+    ];
+    raw.split(|b| *b == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter_map(|line| line.strip_prefix("fresh-stage="))
+        .rfind(|stage| STAGES.contains(stage))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{os::unix::fs::FileExt, time::Instant};
+
+    #[test]
+    fn diagnostic_discards_error_payloads_and_unknown_tokens() {
+        assert_eq!(
+            diagnostic_stage(b"secret value\nfresh-stage=database-open\nfresh-stage=not-a-stage\n"),
+            Some("database-open")
+        );
+        assert_eq!(diagnostic_stage(b"fresh-stage=account-secret-123\n"), None);
+    }
+
+    #[test]
+    #[ignore = "actual root PID namespace and same-OFD failure custody"]
+    fn failed_child_stage_survives_null_stdout_and_is_not_a_success_receipt() {
+        let (child, _, independent, _dir) =
+            fixture("printf 'SECRET VALUE\nfresh-stage=database-open\n' >&2; exit 23");
+        crate::supervision::ready(&child.pidfd, Duration::from_secs(5)).unwrap();
+        assert!(independent.try_lock().is_err());
+        let value = child.failure_diagnostic();
+        assert_eq!(value["last_stage"], "database-open");
+        assert_eq!(value["exit_code"], 23);
+        assert_eq!(value["automatic_replay_forbidden"], true);
+        assert!(!value.to_string().contains("SECRET"));
+        independent.try_lock().unwrap();
+    }
+
+    #[test]
+    #[ignore = "actual root PID namespace and built fresh receiver executable"]
+    fn real_fresh_entry_failure_is_observed_before_any_native_state() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let path = std::env::var("HETERODYNE_DIAGNOSTIC_FRESH_BINARY").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("malformed-profile"))
+            .unwrap();
+        let lease = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("lease"))
+            .unwrap();
+        lease.try_lock().unwrap();
+        let descriptors = (3..=16).map(|fd| (fd, &input)).collect::<Vec<_>>();
+        let child =
+            OwnedChild::receiver(&File::open(path).unwrap(), &descriptors, lease, true).unwrap();
+        crate::supervision::ready(&child.pidfd, Duration::from_secs(10)).unwrap();
+        let value = child.failure_diagnostic();
+        assert_eq!(value["last_stage"], "profile-read");
+        assert_eq!(value["exit_code"], 2);
+        assert_eq!(input.metadata().unwrap().len(), 0);
+    }
 
     #[test]
     #[ignore = "actual root tmpfs, receiver UID899 and owned PID namespace"]

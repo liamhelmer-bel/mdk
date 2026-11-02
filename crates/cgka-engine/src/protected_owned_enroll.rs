@@ -120,11 +120,22 @@ impl FreshBinding {
     }
 }
 
+// Fixed diagnostic tokens only: no keys, paths, profile fields or native error text.
+// Stderr is a bounded private pipe in the owned launcher, never an authority channel.
+fn stage(name: &'static str) {
+    let _ = std::io::Write::write_all(
+        &mut std::io::stderr(),
+        format!("fresh-stage={name}\n").as_bytes(),
+    );
+}
+
 pub(super) fn entry() -> bool {
+    stage("entry");
     if std::env::args_os().count() != 1 {
         return false;
     }
     (|| {
+        stage("profile-read");
         let profile_file = inherited(3)?;
         if profile_file
             .metadata()
@@ -137,6 +148,7 @@ pub(super) fn entry() -> bool {
         let raw = read(&profile_file, 65536)?;
         let profile: FreshProfile =
             serde_json::from_slice(&raw).map_err(|_| ReceiverHold::Malformed)?;
+        stage("profile-check");
         profile.check()?;
         // The bounded factory remains available for native qualification; its
         // full receive/publication gate is not cleared for an installed generation.
@@ -146,13 +158,17 @@ pub(super) fn entry() -> bool {
         {
             return Err(ReceiverHold::Configuration);
         }
+        stage("process-hardening");
         anchor_custody::harden_process(profile.receiver_uid)?;
+        stage("descriptor-claim");
         let mut claimed = (4..=16).map(inherited).collect::<Result<Vec<_>, _>>()?;
         let expiry = claimed.pop().ok_or(ReceiverHold::Configuration)?;
         let files: [File; 12] = claimed
             .try_into()
             .map_err(|_| ReceiverHold::Configuration)?;
+        stage("binding-check");
         let binding = FreshBinding::new(profile_file, expiry, &profile, digest(&raw))?;
+        stage("runtime-create");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -303,6 +319,7 @@ async fn run(
         peer,
         cache_directory,
     ] = files;
+    stage("anchor-check");
     anchor_custody::check_descriptors(
         &anchor,
         &anchor_directory,
@@ -310,21 +327,25 @@ async fn run(
         &account_dir,
     )?;
     // Keep the original storage lease through account opening, join and shutdown.
+    stage("storage-lease");
     storage_lease
         .try_lock()
         .map_err(|_| ReceiverHold::Journal)?;
+    stage("account-directory");
     let dir = account_dir
         .metadata()
         .map_err(|_| ReceiverHold::Configuration)?;
     if !dir.is_dir() || dir.uid() != profile.receiver_uid || dir.mode() & 0o777 != 0o700 {
         return Err(ReceiverHold::Configuration);
     }
+    stage("peer-check");
     let mut peer = checked_peer(peer, profile.consumer_uid)?;
     peer.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Configuration)?;
     peer.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| ReceiverHold::Configuration)?;
     let mut nonce = [0; 32];
+    stage("secret-read");
     let key = zeroize::Zeroizing::new(read(&key_file, 64)?);
     let dbkey = zeroize::Zeroizing::new(read(&dbkey_file, 64)?);
     if key.len() != 32 || dbkey.len() != 32 {
@@ -338,6 +359,7 @@ async fn run(
     let sqlkey =
         SqlCipherKey::new(hex::encode(&*dbkey)).map_err(|_| ReceiverHold::Configuration)?;
     drop((key, dbkey));
+    stage("database-open");
     let fd = unsafe {
         libc::openat(
             account_dir.as_raw_fd(),
@@ -363,6 +385,7 @@ async fn run(
         "/proc/self/fd/{}/account.sqlite3",
         account_dir.as_raw_fd()
     ));
+    stage("sqlcipher-open");
     let storage =
         SqliteAccountStorage::open_encrypted(&path, &sqlkey).map_err(|_| ReceiverHold::Engine)?;
     let after = std::fs::metadata(&path).map_err(|_| ReceiverHold::ChangedState)?;
@@ -372,7 +395,9 @@ async fn run(
     // Keep the actual SQLCipher connection alive even if enrollment consumes and
     // drops the Engine on an error after the native Welcome committed.
     let retained_storage = storage.clone();
+    stage("engine-create");
     let mut engine = owned_routed_engine(storage, keys, profile.template()?)?;
+    stage("cache-device");
     check_cache_devices(
         &cache_directory,
         &[
@@ -386,13 +411,18 @@ async fn run(
             &db_file,
         ],
     )?;
+    stage("durable-writable");
     for file in [&journal, &anchor, &intent] {
         check_writable(file)?;
     }
+    stage("fresh-account");
     check_fresh_account(&engine, &profile)?;
+    stage("peer-nonce");
     peer.read_exact(&mut nonce)
         .map_err(|_| ReceiverHold::Configuration)?;
+    stage("cache-spool");
     let spool = relay_spool::anonymous(&cache_directory)?;
+    stage("journal-prepare");
     let files = Journal::prepare_fresh(OwnedFiles {
         journal,
         journal_directory,
@@ -405,18 +435,22 @@ async fn run(
         file: intent,
         directory: intent_directory,
     };
+    stage("intent-check");
     check_intent_alias(&files, &intent)?;
     let retained_locks = retain_lock_descriptions(&files)?;
+    stage("transport-create");
     let sdk = nostr_sdk::Client::builder().build();
     let adapter = NostrTransportAdapter::new(Arc::new(NostrSdkRelayClient::new(sdk.clone())));
     let forwarder = forward(sdk.clone(), adapter.clone(), spool);
     // Retain a committed receiver across every post-enrollment error until relay shutdown.
     let mut retained = None;
     let result = async {
+        stage("transport-activate");
         tokio::time::timeout(Duration::from_secs(30), adapter.activate_account(TransportAccountActivation {
             account_id: engine.self_id(), inbox_endpoints: profile.endpoints.clone(), group_subscriptions:vec![], since:None,
         })).await.map_err(|_| ReceiverHold::Engine)?.map_err(|_| ReceiverHold::Engine)?;
         let deadline = tokio::time::Instant::now()+Duration::from_secs(u64::from(profile.wait_seconds));
+        stage("welcome-wait");
         let evidence = loop {
             if forwarder.is_finished() || tokio::time::Instant::now() >= deadline { return Err(ReceiverHold::Engine); }
             let wait = deadline.min(tokio::time::Instant::now()+Duration::from_secs(1));
@@ -428,6 +462,7 @@ async fn run(
                 }
             }
         };
+        stage("enrollment-retain");
         retain_enrollment(&mut retained, engine, &profile, &profile_sha, files, evidence, &binding)?;
         let receiver = retained.as_ref().ok_or(ReceiverHold::Journal)?;
         // Enrollment is already durable; relay lifetime no longer determines it.
@@ -441,6 +476,7 @@ async fn run(
             "transport_group":transport_group,
             "header_record":header.body,"header_sha256":journal.header_digest().map_err(|_| ReceiverHold::Journal)?,"checkpoint":journal.checkpoint(),
         })).map_err(|_| ReceiverHold::Malformed)?;
+        stage("success-frame");
         write_frame(&mut peer,&output)?;
         // Receiver owns actual account/journal until after finite SDK shutdown.
         Ok(())
@@ -547,7 +583,9 @@ async fn attempt_welcome<S: StorageProvider + 'static>(
     {
         return Ok(None);
     }
+    stage("welcome-binding");
     binding.check()?;
+    stage("welcome-native-join");
     let attempt = JoinIntent {
         file: intent.file.try_clone().map_err(|_| ReceiverHold::Journal)?,
         directory: intent

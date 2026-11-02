@@ -355,10 +355,22 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
         true,
     )
     .map_err(|_| ())?;
-    let response = peer
-        .result(crate::supervision::receiver(p.wait_seconds)?)
-        .map_err(|_| ())?;
+    let response = match peer.result(crate::supervision::receiver(p.wait_seconds)?) {
+        Ok(response) => response,
+        Err(_) => {
+            let diagnostic = child.failure_diagnostic();
+            record(&state, "03-fresh-failed.json", &diagnostic)?;
+            return Err(());
+        }
+    };
     create(&state, "03-fresh-observed.json", 0, 0o400, &response)?;
+    record(
+        &state,
+        "03-fresh-stage.json",
+        &json!({
+            "last_stage":child.observed_stage(), "diagnostic_only":true,
+        }),
+    )?;
     let _fresh_cessation = positive(child, crate::supervision::CESSATION)?;
     let enrolled = frame(&response, &nonce, "heterodyne-owned-fresh-enrollment.v3")?;
     if enrolled
