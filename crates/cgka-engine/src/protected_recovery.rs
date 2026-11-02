@@ -456,6 +456,7 @@ impl Journal {
     pub(super) fn verify_pending(
         &self,
         pending: &[crate::protected_receiver::PendingApplicationProjection],
+        conversation_group: Option<&cgka_traits::types::GroupId>,
     ) -> Result<()> {
         use crate::protected_receiver::{RetainedOutcome, RetainedWire};
         io((&self.files.journal).seek(SeekFrom::Start(0)))?;
@@ -498,7 +499,8 @@ impl Journal {
                             cgka_traits::ingest::IngestOutcome::Processed
                                 | cgka_traits::ingest::IngestOutcome::Ignored { .. }
                                 | cgka_traits::ingest::IngestOutcome::Rejected { .. }
-                        )
+                        ) && !conversation_group
+                            .is_some_and(|group| outcome.is_opaque_deferred_for(group))
                     {
                         return Err(Hold::Changed);
                     }

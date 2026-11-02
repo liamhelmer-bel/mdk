@@ -146,7 +146,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         }
     }
     async fn post_inner(&mut self, original: OriginalAsk) -> Result<(), ReceiverHold> {
-        if self.held || self.receiver.latched || self.receiver.authority_blocked {
+        if self.held || self.receiver.latched || !self.receiver.authority_available() {
             return Err(ReceiverHold::Latched);
         }
         #[cfg(target_os = "linux")]
@@ -335,6 +335,14 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             self.sync_catalog()?;
             return Ok(None);
         };
+        // Conversation candidates remain journal presentation data. Never feed
+        // them into semantic classification, including an old retained ask.
+        if self.receiver.mode == super::ReceiverMode::ConversationOnly {
+            self.held = false;
+            #[cfg(target_os = "linux")]
+            self.sync_catalog()?;
+            return Ok(None);
+        }
         #[cfg(target_os = "linux")]
         if !self.hydrate_candidate(&candidate)? {
             return Ok(None);
@@ -416,7 +424,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         // not impose a global latch on unrelated asks.
         // After opaque contrary history, relevant candidates may only retain a
         // scoped conflict. Never create a semantic approval/denial receipt.
-        let supported_reaction = !self.receiver.authority_blocked
+        let supported_reaction = self.receiver.authority_available()
             && app.kind == MARMOT_APP_EVENT_KIND_REACTION
             && targets.len() == 1
             && matches.len() == 1;
@@ -580,7 +588,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         ask_id: &str,
         expected_operation_sha256: &str,
     ) -> Result<&SemanticReceipt, ReceiverHold> {
-        if self.held || self.receiver.latched || self.receiver.authority_blocked {
+        if self.held || self.receiver.latched || !self.receiver.authority_available() {
             return Err(ReceiverHold::Latched);
         }
         #[cfg(target_os = "linux")]

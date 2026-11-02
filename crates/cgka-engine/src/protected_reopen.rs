@@ -40,10 +40,19 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
     /// history but deliberately leaves pending plaintext intact until semantic
     /// catalog/profile reconstruction has also succeeded.
     pub(super) fn reopen_ordered(
+        engine: Engine<S>,
+        group: GroupId,
+        operators: Vec<MemberId>,
+        journal: Journal,
+    ) -> Result<Self, ReceiverHold> {
+        Self::reopen_ordered_for_mode(engine, group, operators, journal, ReceiverMode::Authority)
+    }
+    pub(super) fn reopen_ordered_for_mode(
         mut engine: Engine<S>,
         group: GroupId,
         operators: Vec<MemberId>,
         journal: Journal,
+        mode: ReceiverMode,
     ) -> Result<Self, ReceiverHold> {
         engine
             .hydrate_all_stored_groups()
@@ -100,20 +109,26 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         }
         let mut native = serde_json::to_value(&join.joined).map_err(|_| ReceiverHold::Malformed)?;
         let mut sequence = 0;
+        let mut authority_blocked = false;
         while let Some(record) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
             let value = &record.body["value"];
             if value["schema"] != "receiver-outcome.v1" {
                 continue;
             }
-            // An opaque retained input can conceal contrary authority. Its journal
-            // evidence permanently vetoes clean reopening, even if native
-            // maintenance has since removed its unresolved message row.
+            // Authority-capable reopening remains strict. Dedicated chat can
+            // retain opaque inputs across restart because its source-selected
+            // capability permanently denies every approval operation.
             let retained: RetainedOutcome = decode(value)?;
             if matches!(
                 retained.outcome,
                 cgka_traits::ingest::IngestOutcome::TransportDeferred { .. }
             ) {
-                return Err(ReceiverHold::ChangedState);
+                if mode != ReceiverMode::ConversationOnly
+                    || !retained.is_opaque_deferred_for(&group)
+                {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                authority_blocked = true;
             }
             sequence = value["sequence"]
                 .as_u64()
@@ -164,7 +179,8 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             journal: ReceiverJournal::Ordered(journal),
             sequence,
             latched: false,
-            authority_blocked: false,
+            authority_blocked,
+            mode,
         })
     }
     /// Validate all actual pending native data before semantic reconstruction
@@ -200,7 +216,10 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             projections.push(projection);
         }
         journal
-            .verify_pending(&projections)
+            .verify_pending(
+                &projections,
+                (self.mode == ReceiverMode::ConversationOnly).then_some(&self.group),
+            )
             .map_err(|_| ReceiverHold::ChangedState)?;
         for event in &self.engine.events_buf {
             if join.matches(event) && pending.iter().any(|p| join.matches(p)) {

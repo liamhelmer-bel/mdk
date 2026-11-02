@@ -7,6 +7,7 @@ use std::fs::File;
 pub(super) struct ReopenFiles {
     pub(super) expiry: File,
     pub(super) cache: File,
+    pub(super) mode: super::super::ReceiverMode,
 }
 
 impl<S: StorageProvider + 'static> SemanticFactory<S> {
@@ -27,7 +28,9 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         endpoints: Vec<TransportEndpoint>,
         files: ReopenFiles,
     ) -> Result<Self, ReceiverHold> {
-        let receiver = ProtectedReceiver::reopen_ordered(engine, group, operators, journal)?;
+        let receiver = ProtectedReceiver::reopen_ordered_for_mode(
+            engine, group, operators, journal, files.mode,
+        )?;
         let pending = receiver.check_reopened_pending()?;
         let mut factory =
             Self::new(receiver, transport, endpoints)?.with_expiry_profile(files.expiry)?;

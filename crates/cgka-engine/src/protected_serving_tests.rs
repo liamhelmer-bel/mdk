@@ -567,8 +567,11 @@ async fn serving_deferred_cipher_preserves_barrier_and_projects_next_native_chat
     }
     use cgka_traits::MessageStorage;
     use nostr::{EventBuilder, Kind, Tag, TagKind};
-    let (mut factory, mut operator, _root, _) =
-        super::super::whole_packet_qualification::current_routed_fixture().await;
+    let (mut factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = crate::protected_receiver::ReceiverMode::ConversationOnly;
+    assert!(!factory.receiver.authority_available());
+    assert!(!factory.receiver.authority_blocked);
     let p = profile(&factory);
     let file = tempfile::NamedTempFile::new().unwrap();
     let h = history(file.reopen().unwrap());
@@ -612,6 +615,19 @@ async fn serving_deferred_cipher_preserves_barrier_and_projects_next_native_chat
         .unwrap();
     assert!(factory.ingest(unresolved.clone()).await.unwrap().is_none());
     assert!(factory.receiver.authority_blocked);
+    assert!(!factory.held && !factory.receiver.latched);
+    // Reopen the actual persisted native account and protected journal. No row
+    // is deleted or relabelled Processed to make this continuation pass.
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay.clone(),
+        "chat-deferred-reopen",
+    )
+    .await
+    .unwrap();
+    assert!(factory.receiver.authority_blocked);
+    assert!(!factory.receiver.authority_available());
     assert!(!factory.held && !factory.receiver.latched);
     let (before, cursor) = projection::replay(&factory, &p, &h, 0).unwrap();
     assert!(before.is_empty());

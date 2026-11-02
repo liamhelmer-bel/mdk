@@ -976,7 +976,7 @@ fn recovery_owned_files(root: &std::path::Path) -> crate::protected_recovery::Ow
     }
 }
 #[cfg(target_os = "linux")]
-async fn fresh_recovery_factory() -> (
+pub(super) async fn fresh_recovery_factory() -> (
     SemanticFactory<SqliteAccountStorage>,
     Engine<SqliteAccountStorage>,
     tempfile::TempDir,
@@ -1101,6 +1101,7 @@ pub(super) async fn restart_factory(
     let group = f.receiver.group.clone();
     let operators = f.receiver.operators.clone();
     let enrollment = f.ordered().unwrap().enrollment().unwrap();
+    let mode = f.receiver.mode;
     drop(f);
     // Real Engine rehydration from the same actual SQLite account state. Fixture
     // signer/peeler identities are synthetic; no production custody is asserted.
@@ -1128,6 +1129,7 @@ pub(super) async fn restart_factory(
         super::reopen::ReopenFiles {
             expiry: std::fs::File::open(root.join("profile")).unwrap(),
             cache: cache(root, cache_name),
+            mode,
         },
     )
 }

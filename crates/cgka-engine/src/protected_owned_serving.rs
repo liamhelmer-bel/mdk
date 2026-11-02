@@ -182,6 +182,7 @@ async fn run(
         profile.endpoints.clone(),
         reopening,
         material,
+        crate::protected_receiver::ReceiverMode::ConversationOnly,
     )?;
     stage("group-binding");
     owned_producer::GroupBinding::read(

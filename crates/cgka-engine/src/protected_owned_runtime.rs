@@ -224,6 +224,7 @@ async fn run(
         profile.endpoints.clone(),
         reopening,
         material,
+        crate::protected_receiver::ReceiverMode::Authority,
     )?;
     let journal_sha = factory
         .ordered()?
@@ -362,7 +363,7 @@ async fn exchange_inner<S: StorageProvider + 'static>(
         return Err(ReceiverHold::ChangedState);
     }
     let ask_id = ask.ask_id.clone();
-    if factory.receiver.authority_blocked {
+    if !factory.receiver.authority_available() {
         return Err(ReceiverHold::ChangedState);
     }
     let operation_sha = digest(&ask.operation);
@@ -425,7 +426,7 @@ async fn exchange_inner<S: StorageProvider + 'static>(
                 }
                 // Approval exchange stops at any unresolved native transport. Ordinary
                 // serving may continue, but this factory cannot consume authority.
-                if factory.receiver.authority_blocked {
+                if !factory.receiver.authority_available() {
                     return Err(ReceiverHold::ChangedState);
                 }
                 inspect = true;
@@ -884,6 +885,63 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn conversation_mode_denies_authority_before_ingress_and_after_clean_reopen() {
+        if !crate::protected_recovery::root_expiry_fixture_available() {
+            return;
+        }
+        let (mut factory, _, root, relay) = super::super::tests::fresh_recovery_factory().await;
+        factory.receiver.mode = crate::protected_receiver::ReceiverMode::ConversationOnly;
+        for reopen in [false, true] {
+            if reopen {
+                factory = super::super::tests::restart_factory(
+                    factory,
+                    root.path(),
+                    relay.clone(),
+                    "chat-clean-reopen",
+                )
+                .await
+                .unwrap();
+            }
+            assert!(!factory.receiver.authority_blocked);
+            assert!(!factory.receiver.authority_available());
+            let before = factory.receiver.journal.length().unwrap();
+            let asks_before = factory.asks.len();
+            let subscriptions_before = relay.subscriptions.lock().unwrap().len();
+            let wires_before = relay.wires.lock().unwrap().len();
+            let ask = super::super::tests::finite_original("ask3", &factory.receiver.group);
+            assert_eq!(factory.post(ask.clone()).await, Err(ReceiverHold::Latched));
+            assert!(matches!(
+                factory.consume("ask3", &super::super::digest(&ask.operation)),
+                Err(ReceiverHold::Latched)
+            ));
+            let adapter = factory.transport.clone();
+            let (_tx, rx) = tokio::sync::broadcast::channel(2);
+            let forwarder =
+                forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
+            let (mut receiver, _consumer) = UnixStream::pair().unwrap();
+            assert_eq!(
+                exchange_inner(
+                    &mut factory,
+                    &adapter,
+                    &forwarder,
+                    &mut receiver,
+                    session(ask)
+                )
+                .await,
+                Err(ReceiverHold::ChangedState)
+            );
+            forwarder.abort();
+            assert_eq!(factory.receiver.journal.length().unwrap(), before);
+            assert_eq!(factory.asks.len(), asks_before);
+            assert_eq!(relay.wires.lock().unwrap().len(), wires_before);
+            assert_eq!(
+                relay.subscriptions.lock().unwrap().len(),
+                subscriptions_before
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn deferred_transport_retains_authority_hold_and_allows_next_valid_conversation() {
         if !crate::protected_recovery::root_expiry_fixture_available() {
             return;
@@ -1204,6 +1262,7 @@ fn open_receiver(
     endpoints: Vec<TransportEndpoint>,
     files: [File; 10],
     material: ReopenMaterial,
+    mode: crate::protected_receiver::ReceiverMode,
 ) -> Result<Opened, ReceiverHold> {
     let [
         key_file,
@@ -1299,7 +1358,11 @@ fn open_receiver(
         journal,
         adapter.clone(),
         endpoints,
-        reopen::ReopenFiles { expiry, cache },
+        reopen::ReopenFiles {
+            expiry,
+            cache,
+            mode,
+        },
     )?;
     Ok(Opened {
         factory,

@@ -142,6 +142,18 @@ pub(super) struct RetainedOutcome {
     pub(super) native_merge: Option<serde_json::Value>,
 }
 
+impl RetainedOutcome {
+    /// Opaque ingress may be retained as conversation history only when it
+    /// produced no native evidence, plaintext projection, or authority candidate.
+    pub(super) fn is_opaque_deferred_for(&self, group: &GroupId) -> bool {
+        matches!(&self.outcome, IngestOutcome::TransportDeferred { group_id, .. } if group_id == group)
+            && self.candidate.is_none()
+            && self.pending_application_ids.is_empty()
+            && self.pending_application_projections.is_empty()
+            && self.native_merge.is_none()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReceiverHold {
     Configuration,
@@ -171,6 +183,15 @@ impl ReceiverJournal {
     }
 }
 
+/// Source-selected capability, never decoded from a request or a serving profile.
+/// Conversation serving permanently lacks approval authority, even before any
+/// opaque transport input and after a clean reopen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverMode {
+    Authority,
+    ConversationOnly,
+}
+
 /// No injectable engine trait, observer callback, plaintext ingress or authority deserializer.
 /// No restart/reopen path: an interrupted journal requires explicit reconciliation.
 pub(crate) struct ProtectedReceiver<S: StorageProvider + 'static> {
@@ -183,9 +204,14 @@ pub(crate) struct ProtectedReceiver<S: StorageProvider + 'static> {
     // Opaque native transport remains unresolved. Conversation ingress may
     // continue, but this process can never produce approval authority again.
     authority_blocked: bool,
+    mode: ReceiverMode,
 }
 
 impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
+    fn authority_available(&self) -> bool {
+        self.mode == ReceiverMode::Authority && !self.authority_blocked
+    }
+
     /// Private source seam, not an authenticated factory. Existing buffered events refuse.
     pub(crate) fn new(
         mut engine: Engine<S>,
@@ -214,6 +240,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             sequence: 0,
             latched: false,
             authority_blocked: false,
+            mode: ReceiverMode::Authority,
         })
     }
 
@@ -293,6 +320,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             sequence: 0,
             latched: false,
             authority_blocked: false,
+            mode: ReceiverMode::Authority,
         })
     }
 
@@ -339,6 +367,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             sequence: 0,
             latched: false,
             authority_blocked: false,
+            mode: ReceiverMode::Authority,
         })
     }
 
@@ -360,7 +389,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .collect::<Option<Vec<_>>>()
             .ok_or(ReceiverHold::ChangedState)?;
         journal
-            .verify_pending(&projections)
+            .verify_pending(&projections, None)
             .map_err(|_| ReceiverHold::ChangedState)?;
         let ids = pending
             .iter()
