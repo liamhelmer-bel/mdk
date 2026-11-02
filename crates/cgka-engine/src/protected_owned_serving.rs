@@ -377,6 +377,8 @@ fn finish_replay(
         Ok(())
     }
 }
+#[path = "protected_serving_convergence.rs"]
+mod convergence;
 #[path = "protected_serving_dispatch.rs"]
 mod dispatch;
 use dispatch::dispatch;

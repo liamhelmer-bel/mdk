@@ -78,7 +78,9 @@ async fn serving_native_lost_ack_reuses_exact_wire_and_distinct_operations_remai
         return;
     }
     let (mut factory, mut operator, _root, relay) =
-        super::super::whole_packet_qualification::current_routed_fixture().await;
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
     let p = profile(&factory);
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut h = history(file.reopen().unwrap());
@@ -184,7 +186,9 @@ async fn serving_replay_requires_authenticated_native_journal_and_restores_reply
         return;
     }
     let (mut factory, mut operator, _root, _relay) =
-        super::super::whole_packet_qualification::current_routed_fixture().await;
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
     let p = profile(&factory);
     let file = tempfile::NamedTempFile::new().unwrap();
     let h = history(file.reopen().unwrap());
@@ -1165,4 +1169,197 @@ async fn conversation_genuine_future_epoch_retains_while_new_chat_continues() {
     assert_eq!(retained_deferred(&factory), 1);
     let (reopened, _) = projection::replay(&factory, &profile(&factory), &h, 0).unwrap();
     assert_eq!(reopened, messages);
+}
+
+#[tokio::test]
+async fn conversation_genuine_prejoin_history_settles_before_first_outbound_intent() {
+    use cgka_traits::MessageStorage;
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, relay, old) =
+        super::super::super::tests::fresh_recovery_factory_with_history(96).await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    for wire in &old {
+        factory.ingest(wire.clone()).await.unwrap();
+        assert_eq!(
+            factory
+                .receiver
+                .engine
+                .storage
+                .get_message(&wire.id)
+                .unwrap()
+                .state,
+            cgka_traits::message::MessageState::PeelDeferred
+        );
+    }
+    let p = profile(&factory);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    // A native epoch-pinned send reproduces the exact real first-send error.
+    let event = MarmotAppEvent::new(
+        p.enrollment.account.clone(),
+        1234,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "offline reproduction",
+    );
+    let expected = factory
+        .receiver
+        .engine
+        .group_authority(&factory.receiver.group)
+        .unwrap()
+        .facts
+        .epoch;
+    assert!(matches!(
+        factory
+            .receiver
+            .engine
+            .send(SendIntent::AppMessage {
+                group_id: factory.receiver.group.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: Some(expected),
+            })
+            .await,
+        Err(cgka_traits::EngineError::AppMessageEpochUnsettled { .. })
+    ));
+    assert!(h.outbound.is_empty());
+    assert!(
+        !convergence::bounded::<_, 1>(&mut factory, &mut h)
+            .await
+            .unwrap()
+    );
+    assert!(!factory.held && !factory.receiver.latched);
+    assert!(h.outbound.is_empty());
+    let (tx, rx) = mpsc::sync_channel(1);
+    assert!(finish_call(&factory, tx, Err(ReceiverHold::Engine)).is_ok());
+    assert!(matches!(rx.recv().unwrap(), Err(ReceiverHold::Engine)));
+    let info = json!({"type":"group_info","id":"ready", "marmot_agent_control":PROTOCOL,
+        "account_id_hex":p.enrollment.account,"group_id_hex":p.enrollment.group});
+    let ready = dispatch(&mut factory, &p, &mut h, info).await.unwrap();
+    assert_eq!(ready["type"], "group_info");
+    assert!(!factory.held && !factory.receiver.latched);
+    assert!(h.outbound.is_empty());
+    let response = dispatch(
+        &mut factory,
+        &p,
+        &mut h,
+        request(&p, "first-real-send", "hello after history"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["type"], "final_sent");
+    assert!(h.outbound["final:first-real-send"].published);
+    assert_eq!(relay.wires.lock().unwrap().len(), 1);
+    operator
+        .ingest(relay.wires.lock().unwrap()[0].clone())
+        .await
+        .unwrap();
+    for wire in &old {
+        assert_eq!(
+            factory
+                .receiver
+                .engine
+                .storage
+                .get_message(&wire.id)
+                .unwrap()
+                .state,
+            cgka_traits::message::MessageState::PeelDeferred
+        );
+    }
+    assert!(!factory.receiver.authority_available());
+}
+
+#[test]
+fn conversation_interrupted_convergence_cannot_reopen_or_write_outbound() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    h.append(store::Record::ConvergenceStarted).unwrap();
+    assert!(
+        h.append(store::Record::Intent {
+            key: "unissued".into(),
+            content: json!({}),
+            epoch: 1
+        })
+        .is_err()
+    );
+    drop(h);
+    let before = std::fs::read(file.path()).unwrap();
+    assert!(store::Store::open(file.reopen().unwrap(), &"1".repeat(64), &"2".repeat(64)).is_err());
+    assert_eq!(std::fs::read(file.path()).unwrap(), before);
+}
+
+#[tokio::test]
+async fn conversation_maintenance_retains_unexpected_genuine_delayed_plaintext_and_holds() {
+    use cgka_traits::MessageStorage;
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native update");
+    };
+    operator.confirm_published(pending).await.unwrap();
+    let event = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1234,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "genuine delayed app",
+    );
+    let SendResult::ApplicationMessage { msg: future, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: group,
+            payload: event.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native app");
+    };
+    factory.ingest(future).await.unwrap();
+    factory.ingest(commit).await.unwrap();
+    assert!(
+        factory
+            .receiver
+            .engine
+            .storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    assert!(convergence::ready(&mut factory, &mut h).await.is_err());
+    assert!(factory.held);
+    assert!(h.outbound.is_empty());
+    assert!(!factory.receiver.engine.events_buf.is_empty());
+    assert!(
+        !factory
+            .receiver
+            .engine
+            .storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+    drop(h);
+    assert!(store::Store::open(file.reopen().unwrap(), &"1".repeat(64), &"2".repeat(64)).is_err());
+    assert!(!factory.receiver.authority_available());
 }

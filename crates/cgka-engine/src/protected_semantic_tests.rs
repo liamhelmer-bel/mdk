@@ -1003,6 +1003,18 @@ pub(super) async fn fresh_recovery_factory() -> (
     tempfile::TempDir,
     Arc<Relay>,
 ) {
+    let (factory, operator, root, relay, _) = fresh_recovery_factory_with_history(0).await;
+    (factory, operator, root, relay)
+}
+pub(super) async fn fresh_recovery_factory_with_history(
+    count: usize,
+) -> (
+    SemanticFactory<SqliteAccountStorage>,
+    Engine<SqliteAccountStorage>,
+    tempfile::TempDir,
+    Arc<Relay>,
+    Vec<TransportMessage>,
+) {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut operator = client(b"semantic-operator");
     let mut controller = client(b"semantic-controller");
@@ -1010,12 +1022,22 @@ pub(super) async fn fresh_recovery_factory() -> (
     kp.source = Some(cgka_traits::engine::KeyPackageSource {
         event_id: cgka_traits::types::MessageId::new(vec![4; 32]),
     });
+    let initial_kp = if count == 0 {
+        kp.clone()
+    } else {
+        let mut old_member = client(b"historical-member");
+        let mut initial = old_member.fresh_key_package().await.unwrap();
+        initial.source = Some(cgka_traits::engine::KeyPackageSource {
+            event_id: cgka_traits::types::MessageId::new(vec![5; 32]),
+        });
+        initial
+    };
     let route = NostrRoutingV1::new([7; 32], vec!["wss://semantic.invalid".into()]).unwrap();
     let (group, created) = operator
         .create_group(CreateGroupRequest {
             name: "recovery".into(),
             description: String::new(),
-            members: vec![kp],
+            members: vec![initial_kp],
             required_features: vec![],
             app_components: vec![AppComponentData {
                 component_id: NOSTR_ROUTING_COMPONENT_ID,
@@ -1033,6 +1055,48 @@ pub(super) async fn fresh_recovery_factory() -> (
         panic!("fixture")
     };
     operator.confirm_published(pending).await.unwrap();
+    let mut historical = Vec::new();
+    for index in 0..count {
+        let event = cgka_traits::MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1234 + index as u64,
+            cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "genuine before new member joined",
+        );
+        let SendResult::ApplicationMessage { msg, .. } = operator
+            .send(SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("native historical app");
+        };
+        historical.push(msg);
+    }
+    if count > 0 {
+        let SendResult::GroupEvolution {
+            pending,
+            welcomes: added,
+            ..
+        } = operator
+            .send(SendIntent::Invite {
+                group_id: group.clone(),
+                key_packages: vec![kp],
+                initial_admins: vec![],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("native late member invite");
+        };
+        operator.confirm_published(pending).await.unwrap();
+        welcomes = added;
+    }
+
     operator.drain_events();
     controller.drain_events();
     let root = tempfile::tempdir().unwrap();
@@ -1109,7 +1173,7 @@ pub(super) async fn fresh_recovery_factory() -> (
     factory
         .enable_catalog(cache(root.path(), "initial-cache"))
         .unwrap();
-    (factory, operator, root, relay)
+    (factory, operator, root, relay, historical)
 }
 #[cfg(target_os = "linux")]
 pub(super) async fn restart_factory(

@@ -26,6 +26,10 @@ pub(super) enum Record {
     Published {
         key: String,
     },
+    ConvergenceStarted,
+    ConvergenceFinished {
+        settled: bool,
+    },
 }
 #[derive(Clone)]
 pub(super) struct Outbound {
@@ -38,6 +42,7 @@ pub(super) struct Store {
     file: File,
     pub outbound: BTreeMap<String, Outbound>,
     binding: Option<(String, String)>,
+    convergence_pending: bool,
 }
 impl Store {
     pub fn open(file: File, generation: &str, enrollment: &str) -> Result<Self, ReceiverHold> {
@@ -61,6 +66,7 @@ impl Store {
             file,
             outbound: BTreeMap::new(),
             binding: None,
+            convergence_pending: false,
         };
         loop {
             let mut raw = Vec::new();
@@ -87,17 +93,20 @@ impl Store {
                 enrollment_sha256: enrollment.into(),
             })?,
         }
+        if s.convergence_pending {
+            return Err(ReceiverHold::ChangedState);
+        }
         Ok(s)
     }
     fn apply(&mut self, record: Record) -> Result<(), ReceiverHold> {
+        self.validate(&record)?;
         match record {
+            Record::ConvergenceStarted => self.convergence_pending = true,
+            Record::ConvergenceFinished { .. } => self.convergence_pending = false,
             Record::Binding {
                 generation,
                 enrollment_sha256,
             } => {
-                if self.binding.is_some() || !self.outbound.is_empty() {
-                    return Err(ReceiverHold::ChangedState);
-                }
                 self.binding = Some((generation, enrollment_sha256));
             }
             Record::Intent {
@@ -105,9 +114,6 @@ impl Store {
                 content,
                 epoch,
             } => {
-                if self.binding.is_none() || key.is_empty() || self.outbound.contains_key(&key) {
-                    return Err(ReceiverHold::ChangedState);
-                }
                 self.outbound.insert(
                     key,
                     Outbound {
@@ -123,30 +129,27 @@ impl Store {
                 message_id,
                 wire,
             } => {
-                let p = self
-                    .outbound
+                self.outbound
                     .get_mut(&key)
-                    .ok_or(ReceiverHold::ChangedState)?;
-                if p.prepared.is_some() || message_id.is_empty() {
-                    return Err(ReceiverHold::ChangedState);
-                }
-                p.prepared = Some((message_id, wire));
+                    .ok_or(ReceiverHold::ChangedState)?
+                    .prepared = Some((message_id, wire));
             }
             Record::Published { key } => {
-                let p = self
-                    .outbound
+                self.outbound
                     .get_mut(&key)
-                    .ok_or(ReceiverHold::ChangedState)?;
-                if p.prepared.is_none() || p.published {
-                    return Err(ReceiverHold::ChangedState);
-                }
-                p.published = true;
+                    .ok_or(ReceiverHold::ChangedState)?
+                    .published = true;
             }
         }
         Ok(())
     }
     fn validate(&self, record: &Record) -> Result<(), ReceiverHold> {
+        if self.convergence_pending && !matches!(record, Record::ConvergenceFinished { .. }) {
+            return Err(ReceiverHold::ChangedState);
+        }
         let valid = match record {
+            Record::ConvergenceStarted => self.binding.is_some() && !self.convergence_pending,
+            Record::ConvergenceFinished { .. } => self.convergence_pending,
             Record::Binding { .. } => self.binding.is_none() && self.outbound.is_empty(),
             Record::Intent { key, .. } => {
                 self.binding.is_some() && !key.is_empty() && !self.outbound.contains_key(key)

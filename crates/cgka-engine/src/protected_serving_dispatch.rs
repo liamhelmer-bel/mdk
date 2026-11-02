@@ -1,4 +1,16 @@
 use super::*;
+use cgka_traits::EngineError;
+fn native_send_failure(error: EngineError) -> ReceiverHold {
+    stage(match error {
+        EngineError::AppMessageEpochUnsettled { .. } => "native-send-epoch-unsettled",
+        EngineError::AppMessageEpochMismatch { .. } => "native-send-epoch-mismatch",
+        EngineError::Storage(_) => "native-send-storage",
+        EngineError::Backend(_) => "native-send-backend",
+        EngineError::InvalidAppMessagePayload(_) => "native-send-invalid-payload",
+        _ => "native-send-refused",
+    });
+    ReceiverHold::Latched
+}
 fn required<'a>(v: &'a Value, key: &str, max: usize) -> Result<&'a str, ReceiverHold> {
     v.get(key)
         .and_then(Value::as_str)
@@ -40,6 +52,10 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
     let kind = checked(&request, profile)?;
     if factory.held || factory.receiver.latched {
         return Err(ReceiverHold::Latched);
+    }
+    if kind != "subscribe_inbound" && !convergence::ready(factory, history).await? {
+        stage("native-convergence-not-ready");
+        return Err(ReceiverHold::Engine);
     }
     let authority = factory
         .receiver
@@ -155,7 +171,7 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
                 expected_epoch: Some(authority.epoch),
             })
             .await
-            .map_err(|_| ReceiverHold::Latched)?;
+            .map_err(native_send_failure)?;
         let SendResult::ApplicationMessage {
             msg,
             app_event_id,
