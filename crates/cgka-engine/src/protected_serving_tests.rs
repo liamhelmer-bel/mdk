@@ -559,3 +559,99 @@ async fn serving_actual_sdk_activation_requires_inbox_relays() {
     .unwrap();
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn serving_deferred_cipher_preserves_barrier_and_projects_next_native_chat() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    use cgka_traits::MessageStorage;
+    use nostr::{EventBuilder, Kind, Tag, TagKind};
+    let (mut factory, mut operator, _root, _) =
+        super::super::whole_packet_qualification::current_routed_fixture().await;
+    let p = profile(&factory);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let h = history(file.reopen().unwrap());
+    let app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1234,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "actual chat after unresolved ciphertext",
+    );
+    let SendResult::ApplicationMessage { msg: valid, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: factory.receiver.group.clone(),
+            payload: app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("actual native app message")
+    };
+    let envelope: Value = serde_json::from_slice(&valid.payload).unwrap();
+    let route = envelope["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t[0] == "h")
+        .unwrap()[1]
+        .as_str()
+        .unwrap();
+    let outer = EventBuilder::new(
+        Kind::MlsGroupMessage,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    )
+    .tags([Tag::custom(TagKind::custom("h"), [route])])
+    .sign_with_keys(&nostr::Keys::generate())
+    .unwrap();
+    let unresolved = transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&outer)
+        .unwrap()
+        .to_transport_message()
+        .unwrap();
+    assert!(factory.ingest(unresolved.clone()).await.unwrap().is_none());
+    assert!(factory.receiver.authority_blocked);
+    assert!(!factory.held && !factory.receiver.latched);
+    let (before, cursor) = projection::replay(&factory, &p, &h, 0).unwrap();
+    assert!(before.is_empty());
+    factory.ingest(valid).await.unwrap();
+    let (after, _) = projection::replay(&factory, &p, &h, cursor).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0]["type"], "inbound_message");
+    assert_eq!(after[0]["message"]["message_id_hex"], app.id);
+    assert_eq!(after[0]["message"]["text"], app.content);
+    assert!(factory.receiver.authority_blocked);
+    assert!(matches!(
+        factory.consume("no-authority", &"0".repeat(64)),
+        Err(ReceiverHold::Latched)
+    ));
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .storage
+            .get_message(&unresolved.id)
+            .unwrap()
+            .state,
+        cgka_traits::message::MessageState::PeelDeferred
+    );
+    let mut cursor = factory.ordered().unwrap().source_cursor().unwrap();
+    let mut retained_deferred = 0;
+    while let Some(record) = cursor.next().unwrap() {
+        let v = &record.body["value"];
+        if v["schema"] == "receiver-outcome.v1" {
+            let outcome: crate::protected_receiver::RetainedOutcome =
+                serde_json::from_value(v.clone()).unwrap();
+            if matches!(
+                outcome.outcome,
+                cgka_traits::ingest::IngestOutcome::TransportDeferred { .. }
+            ) {
+                assert!(outcome.candidate.is_none());
+                assert!(outcome.pending_application_ids.is_empty());
+                retained_deferred += 1;
+            }
+        }
+    }
+    assert_eq!(retained_deferred, 1);
+}

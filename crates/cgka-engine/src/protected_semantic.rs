@@ -146,7 +146,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         }
     }
     async fn post_inner(&mut self, original: OriginalAsk) -> Result<(), ReceiverHold> {
-        if self.held || self.receiver.latched {
+        if self.held || self.receiver.latched || self.receiver.authority_blocked {
             return Err(ReceiverHold::Latched);
         }
         #[cfg(target_os = "linux")]
@@ -576,7 +576,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         ask_id: &str,
         expected_operation_sha256: &str,
     ) -> Result<&SemanticReceipt, ReceiverHold> {
-        if self.held || self.receiver.latched {
+        if self.held || self.receiver.latched || self.receiver.authority_blocked {
             return Err(ReceiverHold::Latched);
         }
         #[cfg(target_os = "linux")]

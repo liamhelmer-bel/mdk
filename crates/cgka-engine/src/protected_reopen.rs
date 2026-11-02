@@ -154,6 +154,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             journal: ReceiverJournal::Ordered(journal),
             sequence,
             latched: false,
+            authority_blocked: false,
         })
     }
     /// Validate all actual pending native data before semantic reconstruction

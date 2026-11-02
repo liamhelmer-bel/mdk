@@ -180,6 +180,9 @@ pub(crate) struct ProtectedReceiver<S: StorageProvider + 'static> {
     journal: ReceiverJournal,
     sequence: u64,
     latched: bool,
+    // Opaque native transport remains unresolved. Conversation ingress may
+    // continue, but this process can never produce approval authority again.
+    authority_blocked: bool,
 }
 
 impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
@@ -210,6 +213,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             journal: ReceiverJournal::Fresh(journal),
             sequence: 0,
             latched: false,
+            authority_blocked: false,
         })
     }
 
@@ -288,6 +292,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             journal: ReceiverJournal::Ordered(journal),
             sequence: 0,
             latched: false,
+            authority_blocked: false,
         })
     }
 
@@ -333,6 +338,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             journal: ReceiverJournal::Ordered(journal),
             sequence: 0,
             latched: false,
+            authority_blocked: false,
         })
     }
 
@@ -468,18 +474,30 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .take()
             .ok_or(ReceiverHold::ChangedState)?;
         let outcome = result.map_err(|_| ReceiverHold::Engine)?;
-        if !matches!(
-            outcome,
-            IngestOutcome::Processed
-                | IngestOutcome::Ignored { .. }
-                | IngestOutcome::Rejected { .. }
-        ) {
+        let deferred = matches!(&outcome, IngestOutcome::TransportDeferred { group_id, .. } if group_id == &self.group);
+        if !deferred
+            && !matches!(
+                outcome,
+                IngestOutcome::Processed
+                    | IngestOutcome::Ignored { .. }
+                    | IngestOutcome::Rejected { .. }
+            )
+        {
             return Err(ReceiverHold::ChangedState);
+        }
+        // Retain the exact native disposition, never classify opaque bytes as
+        // rejected or processed. This barrier is permanent for authority in
+        // this process even if native maintenance later releases its row.
+        if deferred {
+            self.authority_blocked = true;
         }
         let mut candidate = None;
         let mut pending_ids = Vec::new();
         let mut pending_projections = Vec::new();
         for event in self.engine.drain_events() {
+            if deferred {
+                return Err(ReceiverHold::ChangedState);
+            }
             let projection = PendingApplicationProjection::capture(&event);
             match event {
                 GroupEvent::MessageReceived {

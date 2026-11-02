@@ -489,9 +489,27 @@ impl Builder<'_> {
                 cgka_traits::ingest::IngestOutcome::Processed
                     | cgka_traits::ingest::IngestOutcome::Ignored { .. }
                     | cgka_traits::ingest::IngestOutcome::Rejected { .. }
+                    | cgka_traits::ingest::IngestOutcome::TransportDeferred { .. }
             )
         {
             return Err(ReceiverHold::ChangedState);
+        }
+        if let cgka_traits::ingest::IngestOutcome::TransportDeferred { group_id, .. } =
+            &outcome.outcome
+        {
+            if hex::encode(group_id.as_slice())
+                != self
+                    .journal
+                    .enrollment()
+                    .map_err(|_| ReceiverHold::Journal)?
+                    .group
+                || outcome.candidate.is_some()
+                || !outcome.pending_application_ids.is_empty()
+                || !outcome.pending_application_projections.is_empty()
+                || outcome.native_merge.is_some()
+            {
+                return Err(ReceiverHold::ChangedState);
+            }
         }
         if let Some(candidate) = &outcome.candidate {
             if !candidate.matches_retained(&original, &outcome.pending_application_projections) {

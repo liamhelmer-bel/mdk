@@ -420,6 +420,11 @@ async fn exchange_inner<S: StorageProvider + 'static>(
                     }
                     Err(error) => return Err(error),
                 }
+                // Approval exchange stops at any unresolved native transport. Ordinary
+                // serving may continue, but this factory cannot consume authority.
+                if factory.receiver.authority_blocked {
+                    return Err(ReceiverHold::ChangedState);
+                }
                 inspect = true;
                 if tokio::time::Instant::now() >= deadline {
                     return Err(ReceiverHold::Engine);
@@ -876,7 +881,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn genuine_route_undecryptable_wire_retains_unknown_and_reports_hold_without_replay() {
+    async fn deferred_transport_retains_authority_hold_and_allows_next_valid_conversation() {
         if !crate::protected_recovery::root_expiry_fixture_available() {
             return;
         }
@@ -891,6 +896,7 @@ mod tests {
         factory.post(ask.clone()).await.unwrap();
         let target = factory.asks["ask3"].app_ids[0].clone();
         let actual = super::super::tests::reaction(&mut operator, &factory, &target, "👍").await;
+        let valid_wire = actual.clone();
         let actual: serde_json::Value = serde_json::from_slice(&actual.payload).unwrap();
         let h = actual["tags"]
             .as_array()
@@ -928,7 +934,7 @@ mod tests {
                 &adapter,
                 &forwarder,
                 &mut receiver,
-                session(ask)
+                session(ask.clone())
             )
             .await,
             Err(ReceiverHold::ChangedState)
@@ -956,9 +962,17 @@ mod tests {
             cgka_traits::message::MessageState::PeelDeferred
         );
         let before = factory.receiver.journal.length().unwrap();
-        assert!(factory.held && factory.receiver.latched);
-        assert!(factory.ingest(wire.clone()).await.is_err());
-        assert_eq!(factory.receiver.journal.length().unwrap(), before);
+        assert!(!factory.held && !factory.receiver.latched);
+        assert!(factory.receiver.authority_blocked);
+        // The genuinely decryptable operator message still reaches the conversation
+        // projection, without replaying or deleting the unresolved outer event.
+        assert!(factory.ingest(valid_wire).await.unwrap().is_some());
+        assert!(factory.receiver.journal.length().unwrap() > before);
+        assert!(factory.receiver.authority_blocked);
+        assert!(matches!(
+            factory.consume("ask3", &super::super::digest(&ask.operation)),
+            Err(ReceiverHold::Latched)
+        ));
         assert_eq!(
             factory
                 .receiver

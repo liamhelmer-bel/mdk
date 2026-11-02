@@ -477,6 +477,14 @@ fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
         "transport-closed",
         "transport-activate-refused",
         "serve-loop",
+        "serve-failed-configuration",
+        "serve-failed-journal",
+        "serve-failed-capacity",
+        "serve-failed-latched",
+        "serve-failed-engine",
+        "serve-failed-changed-state",
+        "serve-failed-malformed",
+        "serve-shutdown-timeout",
     ];
     if let Some(stage) = std::str::from_utf8(raw)
         .ok()?
@@ -546,6 +554,14 @@ mod tests {
             "transport-subscription-refused",
             "transport-closed",
             "transport-activate-refused",
+            "serve-failed-configuration",
+            "serve-failed-journal",
+            "serve-failed-capacity",
+            "serve-failed-latched",
+            "serve-failed-engine",
+            "serve-failed-changed-state",
+            "serve-failed-malformed",
+            "serve-shutdown-timeout",
         ] {
             assert_eq!(
                 diagnostic_stage(format!("serving-stage={stage}").as_bytes()),

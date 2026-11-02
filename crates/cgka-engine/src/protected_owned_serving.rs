@@ -16,6 +16,18 @@ mod store;
 pub(super) fn stage(name: &'static str) {
     eprintln!("serving-stage={name}");
 }
+// Closed diagnostic vocabulary: no native error payload, identifiers or plaintext.
+fn failure_stage(error: &ReceiverHold) -> &'static str {
+    match error {
+        ReceiverHold::Configuration => "serve-failed-configuration",
+        ReceiverHold::Journal => "serve-failed-journal",
+        ReceiverHold::Capacity => "serve-failed-capacity",
+        ReceiverHold::Latched => "serve-failed-latched",
+        ReceiverHold::Engine => "serve-failed-engine",
+        ReceiverHold::ChangedState => "serve-failed-changed-state",
+        ReceiverHold::Malformed => "serve-failed-malformed",
+    }
+}
 const PROTOCOL: &str = "marmot.agent-control.v2";
 const MAX_FRAME: usize = 1024 * 1024;
 
@@ -191,12 +203,16 @@ async fn run(
         &installation,
     )
     .await;
+    if let Err(error) = &result {
+        stage(failure_stage(error));
+    }
     forwarder.abort();
     let _ = forwarder.await;
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
     // Exact originals and factory remain owned through transport shutdown.
     drop((factory, _custody));
     if shutdown.is_err() {
+        stage("serve-shutdown-timeout");
         return Err(ReceiverHold::Engine);
     }
     result
