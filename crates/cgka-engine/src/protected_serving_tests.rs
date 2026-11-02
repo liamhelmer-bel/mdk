@@ -1861,6 +1861,125 @@ async fn conversation_genuine_reordered_commits_idle_maintenance() {
 }
 
 #[tokio::test]
+async fn conversation_send_itself_advances_reordered_commit_epoch() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let mut commits = Vec::new();
+    for _ in 0..2 {
+        let SendResult::GroupEvolution { msg, pending, .. } = operator
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("native commit");
+        };
+        operator.confirm_published(pending).await.unwrap();
+        commits.push(msg);
+    }
+    factory.ingest(commits.pop().unwrap()).await.unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    convergence::maintain(&mut factory, &mut h).await.unwrap();
+    factory.ingest(commits.pop().unwrap()).await.unwrap();
+    let old_epoch = factory
+        .receiver
+        .engine
+        .group_authority(&group)
+        .unwrap()
+        .facts
+        .epoch;
+    let target_epoch = operator.group_authority(&group).unwrap().facts.epoch;
+    assert!(old_epoch < target_epoch);
+    assert!(h.outbound.is_empty());
+    // No owner maintenance after the real native quiet window: dispatch must
+    // perform the accepted advance and bind its intent to the resulting epoch.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let p = profile(&factory);
+    let call = request(
+        &p,
+        "send-drives-reordered-advance",
+        "send advances native commit epoch",
+    );
+    let mut result = None;
+    let mut send_advanced_epoch = false;
+    for _ in 0..30 {
+        let before_send = factory
+            .receiver
+            .engine
+            .group_authority(&group)
+            .unwrap()
+            .facts
+            .epoch;
+        let attempt = dispatch(&mut factory, &p, &mut h, call.clone()).await;
+        let after_send = factory
+            .receiver
+            .engine
+            .group_authority(&group)
+            .unwrap()
+            .facts
+            .epoch;
+        send_advanced_epoch |= before_send < after_send;
+        match attempt {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ReceiverHold::Engine) => assert!(h.outbound.is_empty()),
+            other => panic!("unexpected send-driven convergence result: {other:?}"),
+        }
+        assert!(!factory.held && !factory.receiver.latched);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(send_advanced_epoch, "only dispatch advanced native epoch");
+    let result = result.expect("send settles after native quiet window");
+    assert_eq!(result["type"], "final_sent");
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .group_authority(&group)
+            .unwrap()
+            .facts
+            .epoch,
+        target_epoch
+    );
+    let retained = h
+        .outbound
+        .get("final:send-drives-reordered-advance")
+        .unwrap();
+    assert_eq!(retained.epoch, target_epoch.0);
+    assert!(retained.prepared.is_some() && retained.published);
+    assert!(!factory.held && !factory.receiver.latched);
+    let retry = dispatch(&mut factory, &p, &mut h, call).await.unwrap();
+    assert_eq!(retry, result);
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay,
+        "send-driven-native-advance-clean-reopen",
+    )
+    .await
+    .unwrap();
+    assert!(!factory.receiver.authority_available());
+    assert!(convergence::settled(&mut factory).unwrap());
+    drop(h);
+    let reopened =
+        store::Store::open(file.reopen().unwrap(), &"1".repeat(64), &"2".repeat(64)).unwrap();
+    assert_eq!(
+        reopened.outbound["final:send-drives-reordered-advance"].epoch,
+        target_epoch.0
+    );
+}
+
+#[tokio::test]
 async fn conversation_delayed_admission_covers_native_row_cap() {
     if !crate::protected_recovery::root_expiry_fixture_available() {
         return;

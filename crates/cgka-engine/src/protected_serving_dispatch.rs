@@ -57,7 +57,7 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
         stage("native-convergence-not-ready");
         return Err(ReceiverHold::Engine);
     }
-    let authority = factory
+    let mut authority = factory
         .receiver
         .engine
         .group_authority(&factory.receiver.group)
@@ -123,6 +123,17 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
         if !convergence::ready(factory, history).await? {
             stage("native-convergence-not-ready");
             return Err(ReceiverHold::Engine);
+        }
+        // Maintenance can accept an authenticated native epoch advance. Bind
+        // both the new durable intent and send to authority read afterwards.
+        authority = factory
+            .receiver
+            .engine
+            .group_authority(&factory.receiver.group)
+            .map_err(|_| ReceiverHold::ChangedState)?
+            .facts;
+        if !authority.is_member {
+            return Err(ReceiverHold::ChangedState);
         }
         history.append(store::Record::Intent {
             key: key.clone(),
