@@ -414,8 +414,12 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         // A relevant unsupported reply/deletion or ambiguous target is a scoped
         // conflict, never silent permission to use an earlier approval. It does
         // not impose a global latch on unrelated asks.
-        let supported_reaction =
-            app.kind == MARMOT_APP_EVENT_KIND_REACTION && targets.len() == 1 && matches.len() == 1;
+        // After opaque contrary history, relevant candidates may only retain a
+        // scoped conflict. Never create a semantic approval/denial receipt.
+        let supported_reaction = !self.receiver.authority_blocked
+            && app.kind == MARMOT_APP_EVENT_KIND_REACTION
+            && targets.len() == 1
+            && matches.len() == 1;
         let decision = emoji_action(&app.content);
         if !supported_reaction
             || decision.is_none()

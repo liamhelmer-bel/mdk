@@ -490,6 +490,9 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         // this process even if native maintenance later releases its row.
         if deferred {
             self.authority_blocked = true;
+            if merge.direct.is_some() {
+                return Err(ReceiverHold::ChangedState);
+            }
         }
         let mut candidate = None;
         let mut pending_ids = Vec::new();

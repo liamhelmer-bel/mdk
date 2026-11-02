@@ -105,6 +105,16 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             if value["schema"] != "receiver-outcome.v1" {
                 continue;
             }
+            // An opaque retained input can conceal contrary authority. Its journal
+            // evidence permanently vetoes clean reopening, even if native
+            // maintenance has since removed its unresolved message row.
+            let retained: RetainedOutcome = decode(value)?;
+            if matches!(
+                retained.outcome,
+                cgka_traits::ingest::IngestOutcome::TransportDeferred { .. }
+            ) {
+                return Err(ReceiverHold::ChangedState);
+            }
             sequence = value["sequence"]
                 .as_u64()
                 .ok_or(ReceiverHold::ChangedState)?;

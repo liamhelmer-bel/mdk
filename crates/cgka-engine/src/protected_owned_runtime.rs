@@ -362,6 +362,9 @@ async fn exchange_inner<S: StorageProvider + 'static>(
         return Err(ReceiverHold::ChangedState);
     }
     let ask_id = ask.ask_id.clone();
+    if factory.receiver.authority_blocked {
+        return Err(ReceiverHold::ChangedState);
+    }
     let operation_sha = digest(&ask.operation);
     let expected_ask = serde_json::to_value(&ask).map_err(|_| ReceiverHold::Malformed)?;
 
@@ -921,8 +924,9 @@ mod tests {
         let (tx, rx) = tokio::sync::broadcast::channel(16);
         let forwarder = forward_notifications(rx, adapter.clone(), tempfile::tempfile().unwrap());
         let keepalive = tx.clone();
+        let driver_relay = relay.clone();
         let driver = tokio::spawn(async move {
-            while relay.subscriptions.lock().unwrap().is_empty() {
+            while driver_relay.subscriptions.lock().unwrap().is_empty() {
                 tokio::task::yield_now().await;
             }
             tx.send(notification(cipher)).unwrap();
@@ -966,7 +970,8 @@ mod tests {
         assert!(factory.receiver.authority_blocked);
         // The genuinely decryptable operator message still reaches the conversation
         // projection, without replaying or deleting the unresolved outer event.
-        assert!(factory.ingest(valid_wire).await.unwrap().is_some());
+        assert!(factory.ingest(valid_wire).await.unwrap().is_none());
+        assert!(factory.asks["ask3"].receipt.is_none());
         assert!(factory.receiver.journal.length().unwrap() > before);
         assert!(factory.receiver.authority_blocked);
         assert!(matches!(
@@ -984,6 +989,36 @@ mod tests {
             cgka_traits::message::MessageState::PeelDeferred
         );
         assert!(!factory.asks["ask3"].consumed);
+        // Test-only native maintenance releases the row. This must not erase
+        // the independently retained opaque-input authority veto on reopen.
+        factory
+            .receiver
+            .engine
+            .storage
+            .update_message_state(&wire.id, cgka_traits::message::MessageState::Processed)
+            .unwrap();
+        assert!(
+            factory
+                .receiver
+                .engine
+                .with_mls_group(&factory.receiver.group, |native| {
+                    factory
+                        .receiver
+                        .engine
+                        .receiver_group_quiet(&factory.receiver.group, native)
+                })
+                .unwrap()
+        );
+        assert!(matches!(
+            super::super::tests::restart_factory(
+                factory,
+                root.path(),
+                relay,
+                "deferred-reopen-cache"
+            )
+            .await,
+            Err(ReceiverHold::ChangedState)
+        ));
         drop(keepalive);
         forwarder.abort();
     }

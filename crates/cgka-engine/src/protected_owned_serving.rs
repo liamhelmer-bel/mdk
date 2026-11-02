@@ -212,7 +212,9 @@ async fn run(
     // Exact originals and factory remain owned through transport shutdown.
     drop((factory, _custody));
     if shutdown.is_err() {
-        stage("serve-shutdown-timeout");
+        if result.is_ok() {
+            stage("serve-shutdown-timeout");
+        }
         return Err(ReceiverHold::Engine);
     }
     result

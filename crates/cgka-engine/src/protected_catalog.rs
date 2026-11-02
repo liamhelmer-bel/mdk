@@ -496,8 +496,7 @@ impl Builder<'_> {
         }
         if let cgka_traits::ingest::IngestOutcome::TransportDeferred { group_id, .. } =
             &outcome.outcome
-        {
-            if hex::encode(group_id.as_slice())
+            && (hex::encode(group_id.as_slice())
                 != self
                     .journal
                     .enrollment()
@@ -506,10 +505,9 @@ impl Builder<'_> {
                 || outcome.candidate.is_some()
                 || !outcome.pending_application_ids.is_empty()
                 || !outcome.pending_application_projections.is_empty()
-                || outcome.native_merge.is_some()
-            {
-                return Err(ReceiverHold::ChangedState);
-            }
+                || outcome.native_merge.is_some())
+        {
+            return Err(ReceiverHold::ChangedState);
         }
         if let Some(candidate) = &outcome.candidate {
             if !candidate.matches_retained(&original, &outcome.pending_application_projections) {

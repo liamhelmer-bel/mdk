@@ -1091,7 +1091,7 @@ async fn fresh_recovery_factory() -> (
     (factory, operator, root, relay)
 }
 #[cfg(target_os = "linux")]
-async fn restart_factory(
+pub(super) async fn restart_factory(
     f: SemanticFactory<SqliteAccountStorage>,
     root: &std::path::Path,
     relay: Arc<Relay>,
