@@ -117,6 +117,7 @@ enum TransitionKind {
     Wire,
     Outcome,
     DelayedOutcome,
+    MaintenanceNativeUpdate,
     Outbound,
     Published,
     Decision,
@@ -534,6 +535,15 @@ impl Journal {
                     }
                     sequence = outcome.sequence;
                 }
+                TransitionKind::MaintenanceNativeUpdate => {
+                    if wire.is_some() {
+                        return Err(Hold::Changed);
+                    }
+                    let group = conversation_group.ok_or(Hold::Changed)?;
+                    let value = serde_json::from_slice(&bytes).map_err(|_| Hold::Encoding)?;
+                    crate::protected_receiver::delayed::validate_native_update(&value, group)
+                        .map_err(|_| Hold::Changed)?;
+                }
                 TransitionKind::DelayedOutcome => {
                     if wire.is_some() {
                         return Err(Hold::Changed);
@@ -712,6 +722,9 @@ impl Journal {
             Some("receiver-wire.v1") => TransitionKind::Wire,
             Some("receiver-outcome.v1") => TransitionKind::Outcome,
             Some("receiver-delayed-outcome.v1") => TransitionKind::DelayedOutcome,
+            Some("receiver-maintenance-native-update.v1") => {
+                TransitionKind::MaintenanceNativeUpdate
+            }
             Some("semantic-original.v1" | "semantic-original.v2") => TransitionKind::Original,
             Some("semantic-expired.v1") => TransitionKind::Expired,
             Some("semantic-outbound.v1") => TransitionKind::Outbound,

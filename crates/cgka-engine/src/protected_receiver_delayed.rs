@@ -5,6 +5,7 @@ use crate::protected_recovery::Journal;
 use std::collections::BTreeSet;
 
 pub(crate) const MAX_CAPTURES: usize = crate::message_processor::MAX_DEFERRED_ROWS_PER_SWEEP * 16;
+const MAX_ADMITTED: usize = crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP;
 
 pub(crate) struct Binding {
     pub(crate) wire_source: u64,
@@ -105,7 +106,7 @@ pub(crate) fn admit(
     group: &GroupId,
     ids: &[MessageId],
 ) -> Result<Capture, ReceiverHold> {
-    if ids.len() > MAX_CAPTURES {
+    if ids.len() > MAX_ADMITTED {
         return Err(ReceiverHold::Capacity);
     }
     let mut cursor = journal.source_cursor().map_err(|_| ReceiverHold::Journal)?;
@@ -169,6 +170,9 @@ pub(crate) fn projections<S: StorageProvider + 'static>(
     let mut seen = BTreeSet::new();
     let mut records = Vec::new();
     for event in &receiver.engine.events_buf {
+        if matches!(event,GroupEvent::EpochChanged {group_id,..} if group_id==&receiver.group) {
+            continue;
+        }
         let GroupEvent::MessageReceived {
             group_id,
             message_id,
@@ -236,15 +240,64 @@ pub(crate) fn projections<S: StorageProvider + 'static>(
             .storage
             .get_message(id)
             .map_err(|_| ReceiverHold::Engine)?;
+        // A native stored commit/proposal is durable convergence input, not
+        // pending application plaintext. Its exact native content identity and
+        // wire remain retained; no ACK, discard or presentation is performed.
+        let non_application = crate::openmls_projection::decode_openmls_wire_projection(
+            &native.payload,
+        )
+        .is_some_and(|(_, projection)| {
+            projection.kind != crate::openmls_projection::OpenMlsContentKind::Application
+        });
         if native.group_id != receiver.group
-            || !matches!(
-                native.state,
-                cgka_traits::message::MessageState::Processed
-                    | cgka_traits::message::MessageState::Sent
-            )
+            || (!non_application
+                && !matches!(
+                    native.state,
+                    cgka_traits::message::MessageState::Processed
+                        | cgka_traits::message::MessageState::Sent
+                ))
         {
             return Err(ReceiverHold::ChangedState);
         }
     }
     Ok(records)
+}
+
+/// Non-authoritative native policy-preserving epoch transition, distinct from
+/// direct-merge evidence. Only the trusted maintenance owner emits this proof.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedNativeUpdate {
+    schema: String,
+    group: GroupId,
+    pub(crate) before: crate::protected_merge::Projection,
+    pub(crate) after: crate::protected_merge::Projection,
+    epoch_events: Vec<(u64, u64)>,
+}
+pub(crate) fn validate_native_update(
+    value: &serde_json::Value,
+    group: &GroupId,
+) -> Result<RetainedNativeUpdate, ReceiverHold> {
+    let r: RetainedNativeUpdate =
+        serde_json::from_value(value.clone()).map_err(|_| ReceiverHold::Malformed)?;
+    if r.schema != "receiver-maintenance-native-update.v1"
+        || &r.group != group
+        || !r.before.same_policy(&r.after)
+        || r.before.epoch >= r.after.epoch
+        || r.epoch_events.is_empty()
+        || r.epoch_events.len() > MAX_CAPTURES
+    {
+        return Err(ReceiverHold::ChangedState);
+    }
+    let mut epoch = r.before.epoch;
+    for &(from, to) in &r.epoch_events {
+        if from != epoch || to <= from || to > r.after.epoch {
+            return Err(ReceiverHold::ChangedState);
+        }
+        epoch = to;
+    }
+    if epoch != r.after.epoch {
+        return Err(ReceiverHold::ChangedState);
+    }
+    Ok(r)
 }

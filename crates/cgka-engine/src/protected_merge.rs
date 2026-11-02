@@ -4,12 +4,13 @@ use cgka_traits::{
     types::{GroupId, MemberId, MessageId},
 };
 use openmls::group::MlsGroup;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as _;
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Projection {
-    epoch: u64,
+    pub(crate) epoch: u64,
     indexed_credentials: Vec<(u32, Vec<u8>)>,
     extensions: Vec<u8>,
 }

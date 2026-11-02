@@ -281,7 +281,9 @@ async fn serve(
     let (tx, rx) = mpsc::sync_channel(64);
     let active = Arc::new(AtomicUsize::new(0));
     let mut closure_checked = std::time::Instant::now();
-    let mut maintenance_checked = std::time::Instant::now() - Duration::from_secs(1);
+    let mut maintenance_checked = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         if forwarder.is_finished() {
             return Err(ReceiverHold::Engine);
@@ -331,10 +333,11 @@ async fn serve(
                     return Err(ReceiverHold::ChangedState);
                 }
                 match factory.ingest(delivery.message).await {
-                    Ok(_) => {
+                    Ok(_) if maintenance_checked.elapsed() >= Duration::from_secs(1) => {
                         convergence::maintain(factory, history).await?;
                         maintenance_checked = std::time::Instant::now();
                     }
+                    Ok(_) => (),
                     Err(ReceiverHold::Capacity) if !factory.held && !factory.receiver.latched => (),
                     Err(e) => return Err(e),
                 }

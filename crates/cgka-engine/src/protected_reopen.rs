@@ -123,6 +123,21 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                 conversation_sealed = true;
                 continue;
             }
+            if value["schema"] == "receiver-maintenance-native-update.v1" {
+                if mode != ReceiverMode::ConversationOnly || !conversation_sealed {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                let update =
+                    crate::protected_receiver::delayed::validate_native_update(value, &group)?;
+                if serde_json::to_value(&update.before).map_err(|_| ReceiverHold::Malformed)?
+                    != native
+                {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                native =
+                    serde_json::to_value(&update.after).map_err(|_| ReceiverHold::Malformed)?;
+                continue;
+            }
             if value["schema"] == "receiver-delayed-outcome.v1" {
                 if mode != ReceiverMode::ConversationOnly || !conversation_sealed {
                     return Err(ReceiverHold::ChangedState);

@@ -944,14 +944,20 @@ impl<S: StorageProvider> Engine<S> {
         // Rebind every downstream storage / convergence / fork-recovery row
         // and the in-memory dedup sets to this content-derived id.
         let content_id = content_dedup_id(&mls_bytes);
-        crate::protected_receiver::capture_receiver_content(
+        if let Err(error) = crate::protected_receiver::capture_receiver_content(
             &mut self.receiver_ingress_capture,
             &raw_msg_id,
             &content_id,
-        )?;
+        ) {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(error);
+        }
         #[cfg(unix)]
-        if let Some(capture) = &mut self.receiver_delayed_capture {
-            capture.capture(&group_id, &raw_msg_id, &content_id)?;
+        if let Some(capture) = &mut self.receiver_delayed_capture
+            && let Err(error) = capture.capture(&group_id, &raw_msg_id, &content_id)
+        {
+            self.return_unmodified_mls_group(&group_id, mls_group);
+            return Err(error);
         }
         if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
             // Peeling proved which durable content record this wrapper carries.

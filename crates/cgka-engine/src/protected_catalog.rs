@@ -476,7 +476,9 @@ impl Builder<'_> {
             }
             "receiver-wire.v1" => self.wire(v),
             "receiver-outcome.v1" => self.outcome(v, record),
-            "receiver-delayed-outcome.v1" => self.delayed(v, record),
+            "receiver-delayed-outcome.v1" | "receiver-maintenance-native-update.v1" => {
+                self.delayed(v, record)
+            }
             "semantic-original.v2" => self.original(v, record),
             "semantic-outbound.v1" => self.outbound(v),
             "semantic-published.v1" => self.published(v),
@@ -560,6 +562,10 @@ impl Builder<'_> {
         let group = cgka_traits::types::GroupId::new(
             hex::decode(enrollment.group).map_err(|_| ReceiverHold::Malformed)?,
         );
+        if v["schema"] == "receiver-maintenance-native-update.v1" {
+            crate::protected_receiver::delayed::validate_native_update(v, &group)?;
+            return Ok(());
+        }
         let delayed =
             crate::protected_receiver::delayed::validate(self.journal, v, record.sequence, &group)?;
         self.disk.unique(

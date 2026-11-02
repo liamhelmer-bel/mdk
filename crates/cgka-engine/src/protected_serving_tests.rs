@@ -2,6 +2,7 @@
 //! these tests do not claim installed process custody or live group enrollment.
 use super::*;
 use crate::Engine;
+use cgka_traits::{IngestOutcome, MessageId};
 use std::os::unix::fs::PermissionsExt;
 
 fn history(file: File) -> store::Store {
@@ -1754,4 +1755,308 @@ async fn conversation_delayed_negative_controls_retain_actual_native_plaintext()
         pending_before
     );
     assert!(!factory.receiver.authority_available());
+}
+
+#[tokio::test]
+async fn conversation_genuine_reordered_commits_idle_maintenance() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let mut commits = Vec::new();
+    for _ in 0..2 {
+        let SendResult::GroupEvolution { msg, pending, .. } = operator
+            .send(SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("native commit");
+        };
+        operator.confirm_published(pending).await.unwrap();
+        commits.push(msg);
+    }
+    let future = commits.pop().unwrap();
+    let earlier = commits.pop().unwrap();
+    factory.ingest(future).await.unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    convergence::maintain(&mut factory, &mut h).await.unwrap();
+    factory.ingest(earlier).await.unwrap();
+    let before = factory.receiver.engine.group_authority(&group).unwrap();
+    convergence::maintain(&mut factory, &mut h).await.unwrap();
+    let after = factory.receiver.engine.group_authority(&group).unwrap();
+    assert_eq!(
+        before, after,
+        "native ingest must already converge the deferred commit before maintenance"
+    );
+    assert!(!factory.held && !factory.receiver.latched);
+    for _ in 0..30 {
+        if convergence::ready(&mut factory, &mut h).await.unwrap() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(convergence::ready(&mut factory, &mut h).await.unwrap());
+    assert_eq!(
+        factory
+            .receiver
+            .engine
+            .group_authority(&group)
+            .unwrap()
+            .facts
+            .epoch,
+        operator.group_authority(&group).unwrap().facts.epoch
+    );
+    assert!(h.outbound.is_empty());
+    assert!(!factory.held && !factory.receiver.latched);
+    let mut cursor = factory.ordered().unwrap().source_cursor().unwrap();
+    let mut proof = None;
+    while let Some(record) = cursor.next().unwrap() {
+        if record.body["value"]["schema"] == "receiver-maintenance-native-update.v1" {
+            proof = Some(record.body["value"].clone());
+        }
+    }
+    drop(cursor);
+    let proof = proof.unwrap();
+    for field in ["indexed_credentials", "extensions"] {
+        let mut invalid = proof.clone();
+        invalid["after"][field] = json!([]);
+        assert!(
+            crate::protected_receiver::delayed::validate_native_update(&invalid, &group).is_err()
+        );
+    }
+    let mut invalid = proof.clone();
+    invalid["epoch_events"] = json!([]);
+    assert!(crate::protected_receiver::delayed::validate_native_update(&invalid, &group).is_err());
+    let p = profile(&factory);
+    let result = dispatch(
+        &mut factory,
+        &p,
+        &mut h,
+        request(
+            &p,
+            "after-reordered-commits",
+            "real send after native commit settlement",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["type"], "final_sent");
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay,
+        "reordered-native-commit-clean-reopen",
+    )
+    .await
+    .unwrap();
+    assert!(!factory.receiver.authority_available());
+    assert!(convergence::settled(&mut factory).unwrap());
+}
+
+#[tokio::test]
+async fn conversation_delayed_admission_covers_native_row_cap() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let SendResult::GroupEvolution { pending, .. } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("update");
+    };
+    operator.confirm_published(pending).await.unwrap();
+    let event = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1234,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "cap fixture",
+    );
+    let SendResult::ApplicationMessage { msg, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: event.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("app");
+    };
+    factory.ingest(msg.clone()).await.unwrap();
+    let mut cursor = factory.ordered().unwrap().source_cursor().unwrap();
+    let mut wire = None;
+    let mut outcome = None;
+    while let Some(record) = cursor.next().unwrap() {
+        let value = &record.body["value"];
+        if value["schema"] == "receiver-wire.v1" {
+            wire = Some(value.clone());
+        }
+        if value["schema"] == "receiver-outcome.v1" {
+            outcome = Some(value.clone());
+        }
+    }
+    drop(cursor);
+    let mut wire = wire.unwrap();
+    let mut outcome = outcome.unwrap();
+    let mut ids = vec![msg.id];
+    // Admission handles opaque/untrusted wire identities; these synthetic
+    // copies prove the count boundary, not 2048 authenticated native decrypts.
+    for i in 1..crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP {
+        let id = MessageId::new(Sha256::digest(i.to_be_bytes()).to_vec());
+        wire["sequence"] = serde_json::json!(i + 1);
+        wire["wire"]["id"] = serde_json::to_value(&id).unwrap();
+        outcome["sequence"] = serde_json::json!(i + 1);
+        outcome["message_id"] = serde_json::json!(hex::encode(id.as_slice()));
+        factory.receiver.record(&wire).unwrap();
+        factory.receiver.record(&outcome).unwrap();
+        ids.push(id);
+    }
+    let admitted =
+        crate::protected_receiver::delayed::admit(factory.ordered().unwrap(), &group, &ids)
+            .unwrap();
+    assert_eq!(
+        admitted.admitted.len(),
+        crate::message_processor::MAX_PEEL_DEFERRED_ROWS_PER_GROUP
+    );
+    ids.push(MessageId::new([42; 32]));
+    assert!(matches!(
+        crate::protected_receiver::delayed::admit(factory.ordered().unwrap(), &group, &ids),
+        Err(ReceiverHold::Capacity)
+    ));
+}
+#[tokio::test]
+async fn conversation_delayed_capture_refusal_returns_actual_mls_group() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    let group = factory.receiver.group.clone();
+    let before = factory.receiver.engine.group_authority(&group).unwrap();
+    factory.receiver.engine.receiver_delayed_capture =
+        Some(crate::protected_receiver::delayed::Capture {
+            group: group.clone(),
+            admitted: vec![],
+            peeled: vec![],
+        });
+    for i in 0..2 {
+        let event = MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1234 + i,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            "native cache return",
+        );
+        let SendResult::ApplicationMessage { msg, .. } = operator
+            .send(SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: event.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("app");
+        };
+        let result = factory.receiver.engine.ingest(msg).await;
+        if i == 0 {
+            assert!(result.is_err());
+            factory.receiver.engine.receiver_delayed_capture = None;
+        } else {
+            assert!(matches!(result, Ok(IngestOutcome::Processed)));
+        }
+        assert_eq!(
+            before,
+            factory.receiver.engine.group_authority(&group).unwrap()
+        );
+    }
+    assert_eq!(factory.receiver.engine.events_buf.len(), 1);
+}
+
+#[tokio::test]
+async fn conversation_reordered_native_policy_change_remains_hold() {
+    reordered_native_change_refuses(false).await;
+}
+#[tokio::test]
+async fn conversation_reordered_native_membership_change_remains_hold() {
+    reordered_native_change_refuses(true).await;
+}
+async fn reordered_native_change_refuses(remove_receiver: bool) {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let SendResult::GroupEvolution {
+        msg: earlier,
+        pending,
+        ..
+    } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("self update");
+    };
+    operator.confirm_published(pending).await.unwrap();
+    let intent = if remove_receiver {
+        SendIntent::RemoveMembers {
+            group_id: group.clone(),
+            members: vec![factory.receiver.engine.self_id()],
+        }
+    } else {
+        SendIntent::UpdateGroupData {
+            group_id: group.clone(),
+            name: Some("changed policy under convergence".into()),
+            description: None,
+        }
+    };
+    let SendResult::GroupEvolution {
+        msg: future,
+        pending,
+        ..
+    } = operator.send(intent).await.unwrap()
+    else {
+        panic!("policy update");
+    };
+    operator.confirm_published(pending).await.unwrap();
+    factory.ingest(future).await.unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    convergence::maintain(&mut factory, &mut h).await.unwrap();
+    factory.ingest(earlier).await.unwrap();
+    let mut refused = false;
+    for _ in 0..30 {
+        if convergence::maintain(&mut factory, &mut h).await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused && factory.held);
+    assert!(!factory.receiver.authority_available());
+    assert!(h.outbound.is_empty());
+    drop(h);
+    assert!(store::Store::open(file.reopen().unwrap(), &"1".repeat(64), &"2".repeat(64)).is_err());
 }
