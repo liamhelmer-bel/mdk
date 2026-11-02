@@ -949,6 +949,10 @@ impl<S: StorageProvider> Engine<S> {
             &raw_msg_id,
             &content_id,
         )?;
+        #[cfg(unix)]
+        if let Some(capture) = &mut self.receiver_delayed_capture {
+            capture.capture(&group_id, &raw_msg_id, &content_id)?;
+        }
         if let Some(outcome) = self.recorded_message_outcome(&content_id)? {
             // Peeling proved which durable content record this wrapper carries.
             // Remember the exact wrapper outside the bounded hostile-input

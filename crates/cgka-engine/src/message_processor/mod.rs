@@ -2893,6 +2893,29 @@ impl<S: StorageProvider> Engine<S> {
         Ok(normalization_pending.then_some(0).or(earliest))
     }
 
+    /// Owned conversation readiness uses the same native fingerprint decision
+    /// without lifecycle normalization, storage writes or consuming any input.
+    pub(crate) fn receiver_deferred_work_due(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, EngineError> {
+        if self.storage.deferred_peel_generation(group_id)?.is_some() {
+            return Ok(true);
+        }
+        let metadata = self.storage.list_deferred_message_metadata(group_id)?;
+        if metadata.is_empty() {
+            return Ok(false);
+        }
+        let fingerprint = self.deferred_peel_context_fingerprint(group_id)?;
+        let now = self.convergence_now();
+        Ok(metadata.iter().any(|m| {
+            m.deferred_peel.as_ref().is_none_or(|lifecycle| {
+                lifecycle.last_context_fingerprint != Some(fingerprint)
+                    || lifecycle.residence_deadline_monotonic_ms <= now.monotonic_ms
+            })
+        }))
+    }
+
     /// Fingerprint of everything that can change a deferred peel's outcome:
     /// the group's live epoch, the retained peel-snapshot set, and the stored
     /// commit graph the sweep's candidate branch contexts are derived from.

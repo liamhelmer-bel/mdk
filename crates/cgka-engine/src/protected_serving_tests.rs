@@ -1237,6 +1237,14 @@ async fn conversation_genuine_prejoin_history_settles_before_first_outbound_inte
     assert!(matches!(rx.recv().unwrap(), Err(ReceiverHold::Engine)));
     let info = json!({"type":"group_info","id":"ready", "marmot_agent_control":PROTOCOL,
         "account_id_hex":p.enrollment.account,"group_id_hex":p.enrollment.group});
+    // Readiness itself is read-only; the owner maintenance loop settles work.
+    let source_before = factory.ordered().unwrap().checkpoint();
+    assert!(matches!(
+        dispatch(&mut factory, &p, &mut h, info.clone()).await,
+        Err(ReceiverHold::Engine)
+    ));
+    assert_eq!(factory.ordered().unwrap().checkpoint(), source_before);
+    assert!(convergence::ready(&mut factory, &mut h).await.unwrap());
     let ready = dispatch(&mut factory, &p, &mut h, info).await.unwrap();
     assert_eq!(ready["type"], "group_info");
     assert!(!factory.held && !factory.receiver.latched);
@@ -1289,12 +1297,12 @@ fn conversation_interrupted_convergence_cannot_reopen_or_write_outbound() {
 }
 
 #[tokio::test]
-async fn conversation_maintenance_retains_unexpected_genuine_delayed_plaintext_and_holds() {
+async fn conversation_maintenance_binds_genuine_delayed_plaintext_and_reopens() {
     use cgka_traits::MessageStorage;
     if !crate::protected_recovery::root_expiry_fixture_available() {
         return;
     }
-    let (mut factory, mut operator, _root, _relay) =
+    let (mut factory, mut operator, root, relay) =
         super::super::super::tests::fresh_recovery_factory().await;
     factory.receiver.mode = CONVERSATION_MODE;
     factory.receiver.seal_conversation_only().unwrap();
@@ -1331,7 +1339,33 @@ async fn conversation_maintenance_retains_unexpected_genuine_delayed_plaintext_a
     else {
         panic!("native app");
     };
-    factory.ingest(future).await.unwrap();
+    factory.ingest(future.clone()).await.unwrap();
+    let deferred_sequence = factory.receiver.sequence;
+    // A different valid ephemeral outer signature carries the exact same MLS
+    // ciphertext. Both are retained before the commit, but only one app emits.
+    let wrapped: nostr::Event = serde_json::from_slice(&future.payload).unwrap();
+    let alias_event =
+        nostr::EventBuilder::new(nostr::Kind::MlsGroupMessage, wrapped.content.clone())
+            .tags(wrapped.tags.iter().cloned())
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+    let alias = transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&alias_event)
+        .unwrap()
+        .to_transport_message()
+        .unwrap();
+    assert_ne!(alias.id, future.id);
+    factory.ingest(alias.clone()).await.unwrap();
+    let mut cursor = factory.ordered().unwrap().source_cursor().unwrap();
+    let mut original = Vec::new();
+    while let Some(r) = cursor.next().unwrap() {
+        if r.body["value"]["schema"] == "receiver-wire.v1"
+            || r.body["value"]["schema"] == "receiver-outcome.v1"
+        {
+            original.push((r.sequence, r.body));
+        }
+    }
+    drop(cursor);
+    let old_cursor = factory.ordered().unwrap().checkpoint().0;
     factory.ingest(commit).await.unwrap();
     assert!(
         factory
@@ -1344,12 +1378,12 @@ async fn conversation_maintenance_retains_unexpected_genuine_delayed_plaintext_a
     );
     let file = tempfile::NamedTempFile::new().unwrap();
     let mut h = history(file.reopen().unwrap());
-    assert!(convergence::ready(&mut factory, &mut h).await.is_err());
-    assert!(factory.held);
+    assert!(convergence::ready(&mut factory, &mut h).await.unwrap());
+    assert!(!factory.held && !factory.receiver.latched);
     assert!(h.outbound.is_empty());
-    assert!(!factory.receiver.engine.events_buf.is_empty());
+    assert!(factory.receiver.engine.events_buf.is_empty());
     assert!(
-        !factory
+        factory
             .receiver
             .engine
             .storage
@@ -1357,7 +1391,367 @@ async fn conversation_maintenance_retains_unexpected_genuine_delayed_plaintext_a
             .unwrap()
             .is_empty()
     );
+    let p = profile(&factory);
+    let (events, next) = projection::replay(&factory, &p, &h, old_cursor).unwrap();
+    assert!(next > old_cursor);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["message"]["text"], "genuine delayed app");
+    let delayed_position = events[0]["journal_cursor"].as_u64().unwrap();
+    assert!(delayed_position > old_cursor);
+    let delayed = factory
+        .ordered()
+        .unwrap()
+        .source_at(delayed_position)
+        .unwrap();
+    assert_eq!(
+        delayed.body["value"]["schema"],
+        "receiver-delayed-outcome.v1"
+    );
+    assert!(
+        [deferred_sequence, deferred_sequence + 1].contains(
+            &delayed.body["value"]["candidate"]["sequence"]
+                .as_u64()
+                .unwrap()
+        )
+    );
+    assert!(
+        [
+            hex::encode(future.id.as_slice()),
+            hex::encode(alias.id.as_slice())
+        ]
+        .contains(
+            &delayed.body["value"]["outer_message_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        )
+    );
+    for (position, body) in original {
+        assert_eq!(
+            factory.ordered().unwrap().source_at(position).unwrap().body,
+            body
+        );
+    }
+    // Corruption controls reject missing original, sender/hash mismatch and foreign group.
+    let value = delayed.body["value"].clone();
+    let group = factory.receiver.group.clone();
+    for field in ["original_wire_sha256", "outer_message_id"] {
+        let mut bad = value.clone();
+        bad[field] = json!("0".repeat(64));
+        assert!(
+            crate::protected_receiver::delayed::validate(
+                factory.ordered().unwrap(),
+                &bad,
+                delayed_position,
+                &group
+            )
+            .is_err()
+        );
+    }
+    let mut bad = value.clone();
+    bad["candidate"]["source_epoch"] = json!(999);
+    assert!(
+        crate::protected_receiver::delayed::validate(
+            factory.ordered().unwrap(),
+            &bad,
+            delayed_position,
+            &group
+        )
+        .is_err()
+    );
+    assert!(
+        crate::protected_receiver::delayed::validate(
+            factory.ordered().unwrap(),
+            &value,
+            delayed_position,
+            &cgka_traits::types::GroupId::new(vec![0; 16])
+        )
+        .is_err()
+    );
+    let response = dispatch(
+        &mut factory,
+        &p,
+        &mut h,
+        request(&p, "after-delay", "send after delay"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["type"], "final_sent");
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay.clone(),
+        "delayed-clean-reopen",
+    )
+    .await
+    .unwrap();
+    assert!(!factory.receiver.authority_available());
+    let (reopened, _) = projection::replay(&factory, &p, &h, old_cursor).unwrap();
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0], events[0]);
+    // An identical second presentation is still forbidden by the derived catalog.
+    factory.receiver.record(value).unwrap();
+    assert!(factory.sync_catalog().is_err());
+}
+
+#[tokio::test]
+async fn conversation_delete_before_delayed_chat_suppresses_replay() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    late_chat_suppression(MARMOT_APP_EVENT_KIND_DELETE).await;
+}
+#[tokio::test]
+async fn conversation_edit_before_delayed_chat_suppresses_replay() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    late_chat_suppression(MARMOT_APP_EVENT_KIND_EDIT).await;
+}
+async fn late_chat_suppression(kind: u64) {
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native commit")
+    };
+    operator.confirm_published(pending).await.unwrap();
+    let chat = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1234,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "superseded secret excerpt",
+    );
+    let SendResult::ApplicationMessage { msg: future, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: chat.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native app")
+    };
+    factory.ingest(future).await.unwrap();
+    factory.ingest(commit).await.unwrap();
+    let change = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1235,
+        kind,
+        vec![vec!["e".into(), chat.id.clone()]],
+        "changed",
+    );
+    let SendResult::ApplicationMessage { msg: wire, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: change.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native change")
+    };
+    factory.ingest(wire).await.unwrap();
+    let before = factory.ordered().unwrap().checkpoint().0;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    assert!(convergence::ready(&mut factory, &mut h).await.unwrap());
+    let p = profile(&factory);
+    let (events, after) = projection::replay(&factory, &p, &h, before).unwrap();
+    assert!(after > before);
+    assert!(events.is_empty());
+    // A genuine later reaction resolves the deleted/edited original without text.
+    let reaction = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1236,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        vec![vec!["e".into(), chat.id]],
+        "👍",
+    );
+    let SendResult::ApplicationMessage { msg: wire, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: group,
+            payload: reaction.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native reaction")
+    };
+    factory.ingest(wire).await.unwrap();
+    let (events, _) = projection::replay(&factory, &p, &h, after).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["target"]["availability"], "deleted");
+    assert!(events[0]["target"]["text_excerpt"].is_null());
+    assert!(!factory.receiver.authority_available());
+}
+
+#[tokio::test]
+async fn conversation_delayed_negative_controls_retain_actual_native_plaintext() {
+    use crate::protected_receiver::delayed;
+    use cgka_traits::MessageStorage;
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    let (mut factory, mut operator, _root, _relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    factory.receiver.mode = CONVERSATION_MODE;
+    factory.receiver.seal_conversation_only().unwrap();
+    let group = factory.receiver.group.clone();
+    let SendResult::GroupEvolution {
+        msg: commit,
+        pending,
+        ..
+    } = operator
+        .send(SendIntent::SelfUpdate {
+            group_id: group.clone(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native commit")
+    };
+    operator.confirm_published(pending).await.unwrap();
+    for index in 0..2 {
+        let app = MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1234 + index,
+            MARMOT_APP_EVENT_KIND_CHAT,
+            vec![],
+            format!("actual delayed {index}"),
+        );
+        let SendResult::ApplicationMessage { msg: wire, .. } = operator
+            .send(SendIntent::AppMessage {
+                group_id: group.clone(),
+                payload: app.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("native app")
+        };
+        factory.ingest(wire).await.unwrap();
+    }
+    factory.ingest(commit).await.unwrap();
+    let ids: Vec<_> = factory
+        .receiver
+        .engine
+        .storage
+        .list_deferred_message_metadata(&group)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    let capture = delayed::admit(factory.ordered().unwrap(), &group, &ids).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut h = history(file.reopen().unwrap());
+    h.append(store::Record::ConvergenceStarted).unwrap();
+    factory.held = true;
+    factory.receiver.engine.receiver_delayed_capture = Some(capture);
+    for _ in 0..16 {
+        if factory
+            .receiver
+            .engine
+            .advance_convergence_inputs(&group)
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    let mut capture = factory
+        .receiver
+        .engine
+        .receiver_delayed_capture
+        .take()
+        .unwrap();
+    let records = delayed::projections(&factory.receiver, &capture).unwrap();
+    assert_eq!(records.len(), 2);
+    let pending_before = serde_json::to_value(
+        factory
+            .receiver
+            .engine
+            .storage
+            .list_pending_application_events()
+            .unwrap(),
+    )
+    .unwrap();
+    let events_before = factory.receiver.engine.events_buf.clone();
+    // No retained native peel: an emitted ID is never accepted on assertion alone.
+    let peeled = std::mem::take(&mut capture.peeled);
+    assert!(delayed::projections(&factory.receiver, &capture).is_err());
+    capture.peeled = peeled;
+    // Duplicate native emission and sender/payload mismatch are rejected as a
+    // whole set before any record, drain or native acknowledgment occurs.
+    factory
+        .receiver
+        .engine
+        .events_buf
+        .push_back(events_before[0].clone());
+    assert!(delayed::projections(&factory.receiver, &capture).is_err());
+    factory.receiver.engine.events_buf = events_before.clone();
+    if let cgka_traits::engine::GroupEvent::MessageReceived { payload, .. } =
+        factory.receiver.engine.events_buf.front_mut().unwrap()
+    {
+        payload.push(0);
+    }
+    assert!(delayed::projections(&factory.receiver, &capture).is_err());
+    factory.receiver.engine.events_buf = events_before;
+    assert_eq!(
+        serde_json::to_value(
+            factory
+                .receiver
+                .engine
+                .storage
+                .list_pending_application_events()
+                .unwrap()
+        )
+        .unwrap(),
+        pending_before
+    );
+    assert_eq!(factory.receiver.engine.events_buf.len(), 2);
+    assert!(h.outbound.is_empty());
+    // Simulate an interruption after source anchoring but before ACK: the
+    // native pending set remains, and the delivery Started barrier rejects reopen.
+    factory.receiver.record(records[0].clone()).unwrap();
+    factory.sync_catalog().unwrap();
+    assert!(
+        factory
+            .ordered()
+            .unwrap()
+            .verify_pending(&[], None)
+            .is_err()
+    );
     drop(h);
     assert!(store::Store::open(file.reopen().unwrap(), &"1".repeat(64), &"2".repeat(64)).is_err());
+    assert_eq!(
+        serde_json::to_value(
+            factory
+                .receiver
+                .engine
+                .storage
+                .list_pending_application_events()
+                .unwrap()
+        )
+        .unwrap(),
+        pending_before
+    );
     assert!(!factory.receiver.authority_available());
 }

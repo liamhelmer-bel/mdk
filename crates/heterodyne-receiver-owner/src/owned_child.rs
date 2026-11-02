@@ -439,6 +439,7 @@ fn retain_diagnostic(current: &mut Option<String>, value: &str) {
                 "native-convergence-refused"
                     | "native-convergence-unexpected-effects"
                     | "native-convergence-not-quiet"
+                    | "native-convergence-retained-binding"
             )
     });
     let generic_failure = value.starts_with("serve-failed-") || value == "serve-shutdown-timeout";
@@ -516,6 +517,7 @@ fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
         "native-convergence-unexpected-effects",
         "native-convergence-not-quiet",
         "native-convergence-not-ready",
+        "native-convergence-retained-binding",
     ];
     if let Some(stage) = std::str::from_utf8(raw)
         .ok()?
@@ -555,6 +557,19 @@ mod tests {
             retain_diagnostic(&mut current, diagnostic_stage(line.as_bytes()).unwrap());
         }
         assert_eq!(current.as_deref(), Some("native-send-epoch-unsettled"));
+        current = None;
+        for stage in [
+            "native-convergence-retained-binding",
+            "serve-failed-changed-state",
+            "serve-shutdown-timeout",
+        ] {
+            let line = format!("serving-stage={stage}");
+            retain_diagnostic(&mut current, diagnostic_stage(line.as_bytes()).unwrap());
+        }
+        assert_eq!(
+            current.as_deref(),
+            Some("native-convergence-retained-binding")
+        );
         current = None;
         for stage in [
             "native-convergence-not-ready",

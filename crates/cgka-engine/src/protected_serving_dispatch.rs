@@ -53,7 +53,7 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
     if factory.held || factory.receiver.latched {
         return Err(ReceiverHold::Latched);
     }
-    if kind != "subscribe_inbound" && !convergence::ready(factory, history).await? {
+    if kind == "group_info" && !convergence::settled(factory)? {
         stage("native-convergence-not-ready");
         return Err(ReceiverHold::Engine);
     }
@@ -120,6 +120,10 @@ pub(super) async fn dispatch<S: StorageProvider + 'static>(
             return Err(ReceiverHold::ChangedState);
         }
     } else {
+        if !convergence::ready(factory, history).await? {
+            stage("native-convergence-not-ready");
+            return Err(ReceiverHold::Engine);
+        }
         history.append(store::Record::Intent {
             key: key.clone(),
             content: content.clone(),

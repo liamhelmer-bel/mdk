@@ -64,6 +64,8 @@ enum Space {
     Ask,
     Target,
     Candidate,
+    DelayedOriginal,
+    DelayedContent,
     Removal,
     Checkpoint,
 }
@@ -73,6 +75,8 @@ impl Space {
             Self::Ask => "ask",
             Self::Target => "target",
             Self::Candidate => "candidate",
+            Self::DelayedOriginal => "delayed-original",
+            Self::DelayedContent => "delayed-content",
             Self::Removal => "removal",
             Self::Checkpoint => "checkpoint",
         }
@@ -472,6 +476,7 @@ impl Builder<'_> {
             }
             "receiver-wire.v1" => self.wire(v),
             "receiver-outcome.v1" => self.outcome(v, record),
+            "receiver-delayed-outcome.v1" => self.delayed(v, record),
             "semantic-original.v2" => self.original(v, record),
             "semantic-outbound.v1" => self.outbound(v),
             "semantic-published.v1" => self.published(v),
@@ -540,6 +545,48 @@ impl Builder<'_> {
             self.removal_retained = false;
         }
         self.receiver_sequence = outcome.sequence;
+        Ok(())
+    }
+
+    fn delayed(&mut self, v: &serde_json::Value, record: &SourceRecord) -> Result<()> {
+        self.finish_candidate()?;
+        if self.wire.is_some() || self.mode != super::super::ReceiverMode::ConversationOnly {
+            return Err(ReceiverHold::ChangedState);
+        }
+        let enrollment = self
+            .journal
+            .enrollment()
+            .map_err(|_| ReceiverHold::Journal)?;
+        let group = cgka_traits::types::GroupId::new(
+            hex::decode(enrollment.group).map_err(|_| ReceiverHold::Malformed)?,
+        );
+        let delayed =
+            crate::protected_receiver::delayed::validate(self.journal, v, record.sequence, &group)?;
+        self.disk.unique(
+            Space::DelayedOriginal,
+            &delayed.original_wire_source.to_string(),
+            &record.sequence,
+        )?;
+        self.disk.unique(
+            Space::DelayedContent,
+            &hex::encode(delayed.content_id.as_slice()),
+            &record.sequence,
+        )?;
+        if let Some(candidate) = delayed.candidate {
+            self.disk.unique(
+                Space::Candidate,
+                &candidate.message_id,
+                &CandidateReference {
+                    sequence: record.sequence,
+                    sha256: digest(
+                        &serde_json::to_vec(&v["candidate"])
+                            .map_err(|_| ReceiverHold::Malformed)?,
+                    ),
+                },
+            )?;
+            self.pending_candidate = Some(v["candidate"].clone());
+            self.removal_retained = false;
+        }
         Ok(())
     }
 
@@ -957,8 +1004,10 @@ fn validate_candidate(disk: &Disk, journal: &Journal, candidate: &serde_json::Va
     let source = journal
         .source_at(retained.sequence)
         .map_err(|_| ReceiverHold::Journal)?;
-    if source.body["value"]["schema"] != "receiver-outcome.v1"
-        || &source.body["value"]["candidate"] != candidate
+    if !matches!(
+        source.body["value"]["schema"].as_str(),
+        Some("receiver-outcome.v1" | "receiver-delayed-outcome.v1")
+    ) || &source.body["value"]["candidate"] != candidate
         || retained.sha256
             != digest(&serde_json::to_vec(candidate).map_err(|_| ReceiverHold::Malformed)?)
     {

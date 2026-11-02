@@ -123,6 +123,18 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
                 conversation_sealed = true;
                 continue;
             }
+            if value["schema"] == "receiver-delayed-outcome.v1" {
+                if mode != ReceiverMode::ConversationOnly || !conversation_sealed {
+                    return Err(ReceiverHold::ChangedState);
+                }
+                crate::protected_receiver::delayed::validate(
+                    &journal,
+                    value,
+                    record.sequence,
+                    &group,
+                )?;
+                continue;
+            }
             if value["schema"] != "receiver-outcome.v1" {
                 continue;
             }

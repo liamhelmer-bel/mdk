@@ -120,6 +120,10 @@ impl PendingApplicationProjection {
     }
 }
 
+#[cfg(unix)]
+#[path = "protected_receiver_delayed.rs"]
+pub(crate) mod delayed;
+
 /// Journal-owned wire/outcome decoding only; no external authority import API.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

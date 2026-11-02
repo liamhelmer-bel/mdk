@@ -188,6 +188,8 @@ pub struct Engine<S: StorageProvider> {
     pub(crate) last_ingest_left_object_unpersisted: bool,
     /// Private owned-receiver capture: exact outer input to peeled content ID.
     pub(crate) receiver_ingress_capture: Option<(MessageId, Option<MessageId>)>,
+    #[cfg(unix)]
+    pub(crate) receiver_delayed_capture: Option<crate::protected_receiver::delayed::Capture>,
     pub(crate) receiver_merge_capture: Option<crate::protected_merge::Capture>,
     #[cfg(unix)]
     pub(crate) receiver_join_capture: Option<crate::protected_join::Capture>,
@@ -640,6 +642,8 @@ impl<S: StorageProvider> EngineBuilder<S> {
             retryable_unpersisted_ingest_id: None,
             last_ingest_left_object_unpersisted: false,
             receiver_ingress_capture: None,
+            #[cfg(unix)]
+            receiver_delayed_capture: None,
             receiver_merge_capture: None,
             #[cfg(unix)]
             receiver_join_capture: None,

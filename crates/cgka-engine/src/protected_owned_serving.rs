@@ -281,6 +281,7 @@ async fn serve(
     let (tx, rx) = mpsc::sync_channel(64);
     let active = Arc::new(AtomicUsize::new(0));
     let mut closure_checked = std::time::Instant::now();
+    let mut maintenance_checked = std::time::Instant::now() - Duration::from_secs(1);
     loop {
         if forwarder.is_finished() {
             return Err(ReceiverHold::Engine);
@@ -318,13 +319,22 @@ async fn serve(
                 }
             }
         }
+        // Native maintenance is driven by the owner, never by a readiness
+        // probe. Bound idle attempts to avoid fsync loops on future-epoch input.
+        if maintenance_checked.elapsed() >= Duration::from_secs(1) {
+            convergence::maintain(factory, history).await?;
+            maintenance_checked = std::time::Instant::now();
+        }
         match tokio::time::timeout(Duration::from_millis(20), adapter.receive()).await {
             Ok(Ok(Some(delivery))) => {
                 if delivery.account_id != factory.receiver.engine.self_id() {
                     return Err(ReceiverHold::ChangedState);
                 }
                 match factory.ingest(delivery.message).await {
-                    Ok(_) => (),
+                    Ok(_) => {
+                        convergence::maintain(factory, history).await?;
+                        maintenance_checked = std::time::Instant::now();
+                    }
                     Err(ReceiverHold::Capacity) if !factory.held && !factory.receiver.latched => (),
                     Err(e) => return Err(e),
                 }

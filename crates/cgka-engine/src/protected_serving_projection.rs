@@ -2,6 +2,12 @@
 //! A RetainedCandidate is presentation data and cannot become semantic evidence.
 use super::*;
 use crate::protected_receiver::RetainedCandidate;
+fn candidate_schema(body: &Value) -> bool {
+    matches!(
+        body["schema"].as_str(),
+        Some("receiver-outcome.v1" | "receiver-delayed-outcome.v1")
+    )
+}
 fn actor(account: &str, profile: &ServingProfile) -> Value {
     json!({"account_id_hex":account,"is_self":account==profile.enrollment.account})
 }
@@ -49,7 +55,7 @@ fn context<S: StorageProvider + 'static>(
         .map_err(|_| ReceiverHold::Journal)?;
     while let Some(r) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
         let body = &r.body["value"];
-        if body["schema"] != "receiver-outcome.v1" || body["candidate"].is_null() {
+        if !candidate_schema(body) || body["candidate"].is_null() {
             continue;
         }
         let c = retained(&body["candidate"], profile)?;
@@ -57,11 +63,26 @@ fn context<S: StorageProvider + 'static>(
             let text = &c.application.content;
             result = json!({"message_id_hex":id,"availability":"available","sender":actor(&c.application.pubkey,profile),"recorded_at":c.application.created_at,"text_excerpt":text.chars().take(2000).collect::<String>(),"text_truncated":text.chars().count()>2000,"attachments":[],"attachments_truncated":false});
         }
+    }
+    // Resolve the original author first; later delayed records must not undo a
+    // deletion/edit encountered earlier in source order. Two bounded-memory scans.
+    let author = result["sender"]["account_id_hex"]
+        .as_str()
+        .map(str::to_owned);
+    let mut cursor = factory
+        .ordered()?
+        .source_cursor()
+        .map_err(|_| ReceiverHold::Journal)?;
+    while let Some(r) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
+        let body = &r.body["value"];
+        if !candidate_schema(body) || body["candidate"].is_null() {
+            continue;
+        }
+        let c = retained(&body["candidate"], profile)?;
         if [MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT].contains(&c.application.kind)
             && target_id(&c.application) == Some(id)
-            && result["sender"]["account_id_hex"].as_str() == Some(&c.application.pubkey)
+            && author.as_deref() == Some(&c.application.pubkey)
         {
-            // Do not expose a stale excerpt after authenticated edit/delete.
             result = json!({"message_id_hex":id,"availability":"deleted","text_truncated":false,"attachments":[],"attachments_truncated":false});
         }
     }
@@ -78,6 +99,9 @@ fn event<S: StorageProvider + 'static>(
     let app = &c.application;
     let mut out = match app.kind {
         MARMOT_APP_EVENT_KIND_CHAT => {
+            if context(factory, profile, history, &app.id)?["availability"] == "deleted" {
+                return Ok(None);
+            }
             let reply = match target_id(app) {
                 Some(id) => context(factory, profile, history, id)?,
                 None => Value::Null,
@@ -138,7 +162,7 @@ pub(super) fn replay<S: StorageProvider + 'static>(
         next = r.sequence;
         scanned += 1;
         let body = &r.body["value"];
-        if body["schema"] == "receiver-outcome.v1"
+        if candidate_schema(body)
             && !body["candidate"].is_null()
             && let Some(e) = event(factory, profile, history, &body["candidate"], r.sequence)?
         {
