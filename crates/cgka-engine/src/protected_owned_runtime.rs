@@ -193,14 +193,25 @@ async fn run(
         peer_file,
         original_file,
     ] = files;
-    let mut peer = checked_peer(peer_file, profile.consumer_uid)?;
-    peer.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| ReceiverHold::Configuration)?;
-    let mut nonce = [0u8; 32];
-    peer.read_exact(&mut nonce)
-        .map_err(|_| ReceiverHold::Configuration)?;
-    peer.set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|_| ReceiverHold::Configuration)?;
+    let reopening = [
+        key_file,
+        dbkey_file,
+        journal_file,
+        journal_dir,
+        lease,
+        anchor,
+        anchor_dir,
+        expiry,
+        cache,
+        account_dir,
+    ];
+    let (material, mut peer, nonce) = consumer_startup(
+        &profile.enrollment,
+        profile.receiver_uid,
+        &reopening,
+        peer_file,
+        profile.consumer_uid,
+    )?;
     let original = read(&original_file, 32768)?;
     let Opened {
         mut factory,
@@ -210,20 +221,9 @@ async fn run(
         _custody,
     } = open_receiver(
         &profile.enrollment,
-        profile.receiver_uid,
         profile.endpoints.clone(),
-        [
-            key_file,
-            dbkey_file,
-            journal_file,
-            journal_dir,
-            lease,
-            anchor,
-            anchor_dir,
-            expiry,
-            cache,
-            account_dir,
-        ],
+        reopening,
+        material,
     )?;
     let journal_sha = factory
         .ordered()?
@@ -1082,11 +1082,79 @@ struct Opened {
     relay_spool: File,
     _custody: (File, File, File, File),
 }
-fn open_receiver(
+struct ReopenMaterial {
+    receiver_uid: u32,
+    keys: nostr::Keys,
+    dbkey: Vec<u8>,
+}
+impl ReopenMaterial {
+    fn check(
+        enrollment: &Enrollment,
+        receiver_uid: u32,
+        files: &[File; 10],
+    ) -> Result<Self, ReceiverHold> {
+        let [
+            key_file,
+            dbkey_file,
+            _,
+            journal_dir,
+            _,
+            anchor,
+            anchor_dir,
+            _,
+            _,
+            account_dir,
+        ] = files;
+        anchor_custody::check_descriptors(anchor, anchor_dir, journal_dir, account_dir)?;
+        let mut key = read(key_file, 64)?;
+        let dbkey = read(dbkey_file, 64)?;
+        if key.len() != 32 || dbkey.len() != 32 {
+            return Err(ReceiverHold::Configuration);
+        }
+        let keys =
+            nostr::Keys::parse(&hex::encode(&key)).map_err(|_| ReceiverHold::Configuration)?;
+        key.fill(0);
+        if keys.public_key().to_hex() != enrollment.account {
+            return Err(ReceiverHold::ChangedState);
+        }
+        let dir = account_dir
+            .metadata()
+            .map_err(|_| ReceiverHold::Configuration)?;
+        if !dir.is_dir() || dir.uid() != receiver_uid || dir.mode() & 0o777 != 0o700 {
+            return Err(ReceiverHold::Configuration);
+        }
+        Ok(Self {
+            receiver_uid,
+            keys,
+            dbkey,
+        })
+    }
+}
+fn consumer_startup(
     enrollment: &Enrollment,
     receiver_uid: u32,
+    files: &[File; 10],
+    peer_file: File,
+    consumer_uid: u32,
+) -> Result<(ReopenMaterial, UnixStream, [u8; 32]), ReceiverHold> {
+    // Preserve the deployed order: reject changed anchor/key/directory material
+    // before authenticating or reading the consumer's one-use nonce.
+    let material = ReopenMaterial::check(enrollment, receiver_uid, files)?;
+    let mut peer = checked_peer(peer_file, consumer_uid)?;
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| ReceiverHold::Configuration)?;
+    let mut nonce = [0u8; 32];
+    peer.read_exact(&mut nonce)
+        .map_err(|_| ReceiverHold::Configuration)?;
+    peer.set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|_| ReceiverHold::Configuration)?;
+    Ok((material, peer, nonce))
+}
+fn open_receiver(
+    enrollment: &Enrollment,
     endpoints: Vec<TransportEndpoint>,
     files: [File; 10],
+    material: ReopenMaterial,
 ) -> Result<Opened, ReceiverHold> {
     let [
         key_file,
@@ -1100,23 +1168,11 @@ fn open_receiver(
         cache,
         account_dir,
     ] = files;
-    anchor_custody::check_descriptors(&anchor, &anchor_dir, &journal_dir, &account_dir)?;
-    let mut key = read(&key_file, 64)?;
-    let mut dbkey = read(&dbkey_file, 64)?;
-    if key.len() != 32 || dbkey.len() != 32 {
-        return Err(ReceiverHold::Configuration);
-    }
-    let keys = nostr::Keys::parse(&hex::encode(&key)).map_err(|_| ReceiverHold::Configuration)?;
-    key.fill(0);
-    if keys.public_key().to_hex() != enrollment.account {
-        return Err(ReceiverHold::ChangedState);
-    }
-    let dir = account_dir
-        .metadata()
-        .map_err(|_| ReceiverHold::Configuration)?;
-    if !dir.is_dir() || dir.uid() != receiver_uid || dir.mode() & 0o777 != 0o700 {
-        return Err(ReceiverHold::Configuration);
-    }
+    let ReopenMaterial {
+        receiver_uid,
+        keys,
+        mut dbkey,
+    } = material;
     let journal = Journal::reopen(
         OwnedFiles {
             journal: journal_file,

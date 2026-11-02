@@ -142,11 +142,12 @@ fn connection(
         .map_err(|_| ReceiverHold::Engine)?
     {
         Ok(payload) => write(&mut peer, &id, payload)?,
-        Err(_) => {
+        Err(error) => {
+            let retryable = matches!(error, ReceiverHold::Engine | ReceiverHold::Capacity);
             write(
                 &mut peer,
                 &id,
-                json!({"type":"error","code":"owned_receiver_hold","message":"request held","retryable":false}),
+                json!({"type":"error","code":"owned_receiver_hold","message":"request held","retryable":retryable}),
             )?;
             return Ok(());
         }

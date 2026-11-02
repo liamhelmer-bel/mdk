@@ -141,6 +141,19 @@ async fn run(
     listener
         .set_nonblocking(true)
         .map_err(|_| ReceiverHold::Configuration)?;
+    let reopening = [
+        key,
+        dbkey,
+        journal,
+        journal_dir,
+        lease,
+        anchor,
+        anchor_dir,
+        expiry,
+        cache,
+        account_dir,
+    ];
+    let material = ReopenMaterial::check(&profile.enrollment, profile.receiver_uid, &reopening)?;
     let Opened {
         mut factory,
         sdk,
@@ -149,20 +162,9 @@ async fn run(
         _custody,
     } = open_receiver(
         &profile.enrollment,
-        profile.receiver_uid,
         profile.endpoints.clone(),
-        [
-            key,
-            dbkey,
-            journal,
-            journal_dir,
-            lease,
-            anchor,
-            anchor_dir,
-            expiry,
-            cache,
-            account_dir,
-        ],
+        reopening,
+        material,
     )?;
     owned_producer::GroupBinding::read(
         &factory.receiver.engine,

@@ -299,3 +299,147 @@ fn serving_unix_channel_requires_peer_and_token_before_dispatch() {
     assert!(!run(uid, &"b".repeat(64)));
     assert!(!run(uid + 1, &"a".repeat(64)));
 }
+
+#[test]
+fn serving_channel_reports_only_recoverable_holds_as_retryable() {
+    use std::io::{BufRead, BufReader, Write};
+    for error in [
+        ReceiverHold::Engine,
+        ReceiverHold::Capacity,
+        ReceiverHold::ChangedState,
+        ReceiverHold::Journal,
+        ReceiverHold::Latched,
+        ReceiverHold::Malformed,
+        ReceiverHold::Configuration,
+    ] {
+        let expected = matches!(error, ReceiverHold::Engine | ReceiverHold::Capacity);
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (tx, rx) = mpsc::sync_channel(1);
+        channel::spawn(
+            server,
+            unsafe { libc::geteuid() },
+            "a".repeat(64),
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        writeln!(
+            client,
+            "{}",
+            json!({"id":"retry-test", "type":"send_final",
+            "marmot_agent_control":PROTOCOL,"auth_token":"a".repeat(64)})
+        )
+        .unwrap();
+        let Command::Call(call) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("call")
+        };
+        call.reply.send(Err(error)).unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["retryable"], expected);
+        assert_eq!(response["id"], "retry-test");
+    }
+}
+
+#[tokio::test]
+async fn serving_reopen_material_refuses_changes_before_reading_consumer_nonce() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    use std::io::{Read, Write};
+    use std::os::fd::IntoRawFd;
+    let (factory, _, _original_root, _) =
+        super::super::whole_packet_qualification::current_routed_fixture().await;
+    let mut enrollment = factory.ordered().unwrap().enrollment().unwrap();
+    let keys = nostr::Keys::generate();
+    enrollment.account = keys.public_key().to_hex();
+    let root = tempfile::tempdir().unwrap();
+    for name in ["anchor-dir", "journal-dir", "account-dir"] {
+        std::fs::create_dir(root.path().join(name)).unwrap();
+        std::fs::set_permissions(
+            root.path().join(name),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let key_path = root.path().join("key");
+    let dbkey_path = root.path().join("dbkey");
+    for (path, bytes) in [
+        (&key_path, keys.secret_key().to_secret_bytes()),
+        (&dbkey_path, [42; 32]),
+    ] {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).unwrap();
+    }
+    let anchor_path = root.path().join("anchor-dir/fixed-anchor");
+    let anchor = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&anchor_path)
+        .unwrap();
+    std::fs::set_permissions(&anchor_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let files = [
+        File::open(&key_path).unwrap(),
+        File::open(&dbkey_path).unwrap(),
+        File::open("/dev/null").unwrap(),
+        File::open(root.path().join("journal-dir")).unwrap(),
+        File::open("/dev/null").unwrap(),
+        anchor,
+        File::open(root.path().join("anchor-dir")).unwrap(),
+        File::open("/dev/null").unwrap(),
+        File::open("/dev/null").unwrap(),
+        File::open(root.path().join("account-dir")).unwrap(),
+    ];
+    for changed in ["key-length", "account-key", "directory", "anchor", "valid"] {
+        let mut e = enrollment.clone();
+        match changed {
+            "key-length" => std::fs::write(&key_path, [1; 31]).unwrap(),
+            "account-key" => e.account = "0".repeat(64),
+            "directory" => std::fs::set_permissions(
+                root.path().join("account-dir"),
+                std::fs::Permissions::from_mode(0o750),
+            )
+            .unwrap(),
+            "anchor" => {
+                std::fs::set_permissions(&anchor_path, std::fs::Permissions::from_mode(0o640))
+                    .unwrap()
+            }
+            _ => {}
+        }
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let mut observation = receiver.try_clone().unwrap();
+        observation
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        sender.write_all(&[77; 32]).unwrap();
+        let receiver = unsafe { File::from_raw_fd(receiver.into_raw_fd()) };
+        let result = consumer_startup(&e, unsafe { libc::geteuid() }, &files, receiver, unsafe {
+            libc::geteuid()
+        });
+        if changed == "valid" {
+            let (_, _peer, nonce) = result.unwrap();
+            assert_eq!(nonce, [77; 32]);
+            observation.set_nonblocking(true).unwrap();
+            assert_eq!(
+                observation.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        } else {
+            assert!(result.is_err(), "{changed}");
+            let mut untouched = [0; 32];
+            observation.read_exact(&mut untouched).unwrap();
+            assert_eq!(untouched, [77; 32], "{changed}");
+        }
+        std::fs::write(&key_path, keys.secret_key().to_secret_bytes()).unwrap();
+        std::fs::set_permissions(
+            root.path().join("account-dir"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&anchor_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
