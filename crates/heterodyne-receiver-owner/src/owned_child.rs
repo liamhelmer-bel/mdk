@@ -404,7 +404,7 @@ impl Diagnostic {
                                 && let Some(value) = diagnostic_stage(&line)
                                 && let Ok(mut current) = observed.lock()
                             {
-                                *current = Some(value.to_owned());
+                                retain_diagnostic(&mut current, value);
                             }
                             line.clear();
                             overflow = false;
@@ -431,6 +431,27 @@ impl Diagnostic {
 
 // Only source-fixed stage names survive. Discard all other child stderr, including
 // error payloads and arbitrary log lines. Diagnostics are not a transport frame.
+fn retain_diagnostic(current: &mut Option<String>, value: &str) {
+    let specific_failure = current.as_deref().is_some_and(|old| {
+        old.starts_with("native-send-")
+            || matches!(
+                old,
+                "native-convergence-refused"
+                    | "native-convergence-unexpected-effects"
+                    | "native-convergence-not-quiet"
+            )
+    });
+    let generic_failure = value.starts_with("serve-failed-") || value == "serve-shutdown-timeout";
+    let primary_failure = current
+        .as_deref()
+        .is_some_and(|old| old.starts_with("serve-failed-"));
+    if !(specific_failure && generic_failure
+        || primary_failure && value == "serve-shutdown-timeout")
+    {
+        *current = Some(value.to_owned());
+    }
+}
+
 fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
     const STAGES: &[&str] = &[
         "entry",
@@ -485,6 +506,16 @@ fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
         "serve-failed-changed-state",
         "serve-failed-malformed",
         "serve-shutdown-timeout",
+        "native-send-epoch-unsettled",
+        "native-send-epoch-mismatch",
+        "native-send-storage",
+        "native-send-backend",
+        "native-send-invalid-payload",
+        "native-send-refused",
+        "native-convergence-refused",
+        "native-convergence-unexpected-effects",
+        "native-convergence-not-quiet",
+        "native-convergence-not-ready",
     ];
     if let Some(stage) = std::str::from_utf8(raw)
         .ok()?
@@ -510,6 +541,33 @@ mod tests {
             Some("database-open")
         );
         assert_eq!(diagnostic_stage(b"fresh-stage=account-secret-123\n"), None);
+    }
+
+    #[test]
+    fn native_failure_survives_generic_terminal_and_shutdown_stages() {
+        let mut current = None;
+        for stage in [
+            "native-send-epoch-unsettled",
+            "serve-failed-latched",
+            "serve-shutdown-timeout",
+        ] {
+            let line = format!("serving-stage={stage}");
+            retain_diagnostic(&mut current, diagnostic_stage(line.as_bytes()).unwrap());
+        }
+        assert_eq!(current.as_deref(), Some("native-send-epoch-unsettled"));
+        current = None;
+        for stage in [
+            "native-convergence-not-ready",
+            "serve-failed-journal",
+            "serve-shutdown-timeout",
+        ] {
+            retain_diagnostic(&mut current, stage);
+        }
+        assert_eq!(current.as_deref(), Some("serve-failed-journal"));
+        assert_eq!(
+            diagnostic_stage(b"serving-stage=native-send-private-value"),
+            None
+        );
     }
 
     #[test]
