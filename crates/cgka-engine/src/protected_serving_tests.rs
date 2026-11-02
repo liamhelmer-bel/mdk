@@ -1252,10 +1252,8 @@ async fn conversation_genuine_prejoin_history_settles_before_first_outbound_inte
     assert_eq!(response["type"], "final_sent");
     assert!(h.outbound["final:first-real-send"].published);
     assert_eq!(relay.wires.lock().unwrap().len(), 1);
-    operator
-        .ingest(relay.wires.lock().unwrap()[0].clone())
-        .await
-        .unwrap();
+    let published_wire = relay.wires.lock().unwrap()[0].clone();
+    operator.ingest(published_wire).await.unwrap();
     for wire in &old {
         assert_eq!(
             factory
