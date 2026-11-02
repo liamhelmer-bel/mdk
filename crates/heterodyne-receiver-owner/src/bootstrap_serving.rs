@@ -17,6 +17,9 @@ pub(super) struct Inputs {
     hermes_uid: u32,
 }
 impl Inputs {
+    pub(super) fn into_files(self) -> Vec<File> {
+        vec![self.config, self.token, self.listener]
+    }
     pub(super) fn inherited() -> Result<Self> {
         let config = inherited(8)?;
         let token = inherited(9)?;
@@ -104,7 +107,7 @@ pub(super) struct Custody<'a> {
     pub lease: &'a File,
 }
 pub(super) fn run(
-    inputs: Inputs,
+    inputs: &Inputs,
     p: &input::Profile,
     enrollment: &Value,
     transport_group: &[Value],
@@ -162,11 +165,11 @@ pub(super) fn run(
     .map_err(|_| ())?;
     // Local variables in the caller retain ALL original OFDs for the entire
     // serving lifetime. Neither a socket nor exit zero is a readiness receipt.
-    let cessation = child.wait_serving().map_err(|_| ())?;
+    let (cessation, stage) = child.wait_serving().map_err(|_| ())?;
     record(
         state,
         "07-serving-ceased.json",
-        &json!({"status":cessation.status,
+        &json!({"status":cessation.status,"last_stage":stage,
         "requires_reconciliation":true,"automatic_replay_forbidden":true}),
     )?;
     drop(cessation);

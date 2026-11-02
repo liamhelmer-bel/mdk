@@ -1173,6 +1173,7 @@ fn open_receiver(
         keys,
         mut dbkey,
     } = material;
+    serving::stage("journal-reopen");
     let journal = Journal::reopen(
         OwnedFiles {
             journal: journal_file,
@@ -1213,6 +1214,7 @@ fn open_receiver(
         return Err(ReceiverHold::Configuration);
     }
     dbkey.fill(0);
+    serving::stage("sqlcipher-reopen");
     let storage = SqliteAccountStorage::open_encrypted(&db_path, &sqlkey)
         .map_err(|_| ReceiverHold::Engine)?;
     let reopened = std::fs::metadata(&db_path).map_err(|_| ReceiverHold::ChangedState)?;
@@ -1224,6 +1226,7 @@ fn open_receiver(
         &enrollment.capability_policy_sha256,
     )
     .map_err(|_| ReceiverHold::Configuration)?;
+    serving::stage("native-engine");
     let engine = owned_routed_engine(storage, keys, template)?;
     let group = GroupId::new(hex::decode(&enrollment.group).map_err(|_| ReceiverHold::Malformed)?);
     let operators = enrollment
@@ -1239,6 +1242,7 @@ fn open_receiver(
     let relay = NostrSdkRelayClient::new(sdk.clone());
     let adapter = NostrTransportAdapter::new(Arc::new(relay.clone()));
     let relay_spool = relay_spool::anonymous(&cache)?;
+    serving::stage("semantic-reopen");
     let factory = SemanticFactory::reopen(
         engine,
         group.clone(),

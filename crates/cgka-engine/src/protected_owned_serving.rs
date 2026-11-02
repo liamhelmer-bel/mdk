@@ -13,6 +13,9 @@ mod channel;
 mod projection;
 #[path = "protected_serving_store.rs"]
 mod store;
+pub(super) fn stage(name: &'static str) {
+    eprintln!("serving-stage={name}");
+}
 const PROTOCOL: &str = "marmot.agent-control.v2";
 const MAX_FRAME: usize = 1024 * 1024;
 
@@ -136,6 +139,7 @@ async fn run(
             .canonical_sha256()
             .map_err(|_| ReceiverHold::Configuration)?,
     )?;
+    stage("listener-check");
     channel::check_listener(&listener)?;
     let listener = UnixListener::from(OwnedFd::from(listener));
     listener
@@ -153,6 +157,7 @@ async fn run(
         cache,
         account_dir,
     ];
+    stage("material-check");
     let material = ReopenMaterial::check(&profile.enrollment, profile.receiver_uid, &reopening)?;
     let Opened {
         mut factory,
@@ -166,6 +171,7 @@ async fn run(
         reopening,
         material,
     )?;
+    stage("group-binding");
     owned_producer::GroupBinding::read(
         &factory.receiver.engine,
         &factory.receiver.group,
@@ -212,6 +218,7 @@ async fn serve(
         socket: listener,
         token,
     } = listener;
+    stage("transport-activate");
     tokio::time::timeout(
         Duration::from_secs(30),
         adapter.activate_account(TransportAccountActivation {
@@ -228,6 +235,7 @@ async fn serve(
     .await
     .map_err(|_| ReceiverHold::Engine)?
     .map_err(|_| ReceiverHold::Engine)?;
+    stage("serve-loop");
     let (tx, rx) = mpsc::sync_channel(64);
     let active = Arc::new(AtomicUsize::new(0));
     let mut closure_checked = std::time::Instant::now();

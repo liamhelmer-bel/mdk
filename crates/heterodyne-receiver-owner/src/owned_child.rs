@@ -131,12 +131,16 @@ impl OwnedChild {
     }
     /// Retain the exact lifetime lease until actual PID namespace cessation.
     /// Serving has no automatic restart or effect timeout/adoption path.
-    pub(crate) fn wait_serving(mut self) -> Result<Cessation> {
+    pub(crate) fn wait_serving(mut self) -> Result<(Cessation, Option<String>)> {
         let status = self.reap()?;
-        Ok(Cessation {
-            status,
-            lease: self.lease.take().ok_or(Error::Hold)?,
-        })
+        let stage = self.observed_stage();
+        Ok((
+            Cessation {
+                status,
+                lease: self.lease.take().ok_or(Error::Hold)?,
+            },
+            stage,
+        ))
     }
 
     fn launch(
@@ -178,9 +182,10 @@ impl OwnedChild {
         let executable = duplicate(executable)?;
         let null = File::options().read(true).write(true).open("/dev/null")?;
         let null = duplicate(&null)?;
-        // Only the source-fixed fresh receiver gets diagnostic capture. Other
-        // children retain /dev/null, including the permanent receiver.
-        let capture = arguments[0].as_c_str() == c"heterodyne-protected-receiver-enroll";
+        // Only fixed receiver entries get bounded stage capture. All raw
+        // stderr is discarded; unrelated children retain /dev/null.
+        let capture = arguments[0].as_c_str() == c"heterodyne-protected-receiver-enroll"
+            || arguments[0].as_c_str() == c"heterodyne-protected-receiver";
         let (diagnostic_reader, diagnostic_writer) = if capture {
             let mut pipe = [-1; 2];
             if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -458,6 +463,23 @@ fn diagnostic_stage(raw: &[u8]) -> Option<&str> {
         "enrollment-retain",
         "success-frame",
     ];
+    const SERVING: &[&str] = &[
+        "listener-check",
+        "material-check",
+        "journal-reopen",
+        "sqlcipher-reopen",
+        "native-engine",
+        "semantic-reopen",
+        "group-binding",
+        "transport-activate",
+        "serve-loop",
+    ];
+    if let Some(stage) = std::str::from_utf8(raw)
+        .ok()?
+        .strip_prefix("serving-stage=")
+    {
+        return SERVING.contains(&stage).then_some(stage);
+    }
     raw.split(|b| *b == b'\n')
         .filter_map(|line| std::str::from_utf8(line).ok())
         .filter_map(|line| line.strip_prefix("fresh-stage="))
@@ -511,6 +533,20 @@ mod tests {
         assert!(independent.try_lock().is_err());
         drop(child);
         independent.try_lock().unwrap();
+    }
+
+    #[test]
+    fn serving_diagnostics_accept_only_closed_source_stage_names() {
+        assert_eq!(
+            diagnostic_stage(b"serving-stage=journal-reopen"),
+            Some("journal-reopen")
+        );
+        assert_eq!(diagnostic_stage(b"serving-stage=secret-value"), None);
+        assert_eq!(
+            diagnostic_stage(b"serving-stage=journal-reopen extra"),
+            None
+        );
+        assert_eq!(diagnostic_stage(b"arbitrary secret stderr"), None);
     }
 
     #[test]
@@ -726,7 +762,7 @@ mod tests {
     fn serving_wait_reaps_namespace_and_retains_original_ofd() {
         let (child, output, independent, _dir) = fixture("printf served >&3");
         assert!(independent.try_lock().is_err());
-        let ceased = child.wait_serving().unwrap();
+        let (ceased, _) = child.wait_serving().unwrap();
         assert!(libc::WIFEXITED(ceased.status));
         assert_eq!(libc::WEXITSTATUS(ceased.status), 0);
         assert!(independent.try_lock().is_err());
@@ -734,6 +770,32 @@ mod tests {
         output.read_exact_at(&mut raw, 0).unwrap();
         assert_eq!(&raw, b"served");
         drop(ceased);
+        independent.try_lock().unwrap();
+    }
+    #[test]
+    #[ignore = "actual root PID namespace and paused failure custody"]
+    fn failed_serving_child_retains_stage_and_paused_original_ofd() {
+        let (child, output, independent, _dir) =
+            fixture("printf 'PRIVATE PAYLOAD\nserving-stage=journal-reopen\n' >&2; exit 2");
+        let (ceased, stage) = child.wait_serving().unwrap();
+        assert!(libc::WIFEXITED(ceased.status));
+        assert_eq!(libc::WEXITSTATUS(ceased.status), 2);
+        assert_eq!(stage.as_deref(), Some("journal-reopen"));
+        assert!(independent.try_lock().is_err());
+        let originals = vec![ceased.into_lease(), output];
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            crate::manual_custody::retain(originals);
+        }
+        drop(originals);
+        // The stopped namespace has been reaped; only the paused supervisor now
+        // retains the original OFD. No restart or reconstructed lease is used.
+        assert!(independent.try_lock().is_err());
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFSIGNALED(status));
         independent.try_lock().unwrap();
     }
     #[test]

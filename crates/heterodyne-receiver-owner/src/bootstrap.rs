@@ -404,8 +404,8 @@ fn run(
     }
     record(&state, "04-enrolled.json", &enrolled)?;
     if let Some(serving) = serving {
-        return serving::run(
-            serving,
+        let _outcome = serving::run(
+            &serving,
             &p,
             enrollment,
             transport_group,
@@ -425,6 +425,35 @@ fn run(
                 lease: &lease,
             },
         );
+        // A serving failure never authorizes replay and must not release the
+        // original generation. Keep every original OFD even when writing the
+        // bounded failure observation itself failed.
+        let mut originals = vec![
+            original,
+            parent,
+            ledger,
+            lease,
+            expiry,
+            root,
+            state,
+            account,
+            key,
+            seed,
+            _database,
+            storage_lease,
+            journals,
+            intents,
+            anchors,
+            cache,
+            journal,
+            intent,
+            anchor,
+            fresh_profile,
+            _same_root_lease,
+            _fresh_cessation,
+        ];
+        originals.extend(serving.into_files());
+        crate::manual_custody::retain(originals);
     }
     let Some(Publication {
         host_channel,
