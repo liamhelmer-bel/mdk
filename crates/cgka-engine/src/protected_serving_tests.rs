@@ -569,7 +569,15 @@ async fn serving_deferred_cipher_preserves_barrier_and_projects_next_native_chat
     use nostr::{EventBuilder, Kind, Tag, TagKind};
     let (mut factory, mut operator, root, relay) =
         super::super::super::tests::fresh_recovery_factory().await;
-    factory.receiver.mode = crate::protected_receiver::ReceiverMode::ConversationOnly;
+    factory = super::super::super::tests::restart_factory_for_mode(
+        factory,
+        root.path(),
+        relay.clone(),
+        "chat-entry-reopen",
+        CONVERSATION_MODE,
+    )
+    .await
+    .unwrap();
     assert!(!factory.receiver.authority_available());
     assert!(!factory.receiver.authority_blocked);
     let p = profile(&factory);
@@ -670,4 +678,119 @@ async fn serving_deferred_cipher_preserves_barrier_and_projects_next_native_chat
         }
     }
     assert_eq!(retained_deferred, 1);
+}
+
+#[tokio::test]
+async fn conversation_catalog_accepts_edits_removals_and_relevant_replies_live_and_on_reopen() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    use cgka_traits::app_event::{
+        MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_REMOVE,
+    };
+    let (mut factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    // Genuine retained ask predates this conversation-only incarnation.
+    let ask = super::super::super::tests::finite_original("ask3", &factory.receiver.group);
+    factory.post(ask.clone()).await.unwrap();
+    let target = factory.asks["ask3"].app_ids[0].clone();
+    factory = super::super::super::tests::restart_factory_for_mode(
+        factory,
+        root.path(),
+        relay.clone(),
+        "semantic-chat-entry",
+        CONVERSATION_MODE,
+    )
+    .await
+    .unwrap();
+    for (index, (kind, text)) in [
+        (MARMOT_APP_EVENT_KIND_EDIT, "edited"),
+        (MARMOT_APP_EVENT_KIND_DELETE, ""),
+        (MARMOT_APP_EVENT_KIND_REMOVE, ""),
+        (MARMOT_APP_EVENT_KIND_CHAT, "!answer ask3 A"),
+        (MARMOT_APP_EVENT_KIND_REACTION, "👍"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let app = MarmotAppEvent::new(
+            hex::encode(operator.self_id().as_slice()),
+            1234 + index as u64,
+            kind,
+            vec![vec!["e".into(), target.clone()]],
+            text,
+        );
+        let SendResult::ApplicationMessage { msg: wire, .. } = operator
+            .send(SendIntent::AppMessage {
+                group_id: factory.receiver.group.clone(),
+                payload: app.encode().unwrap(),
+                expected_epoch: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("actual native app message")
+        };
+        assert!(factory.ingest(wire).await.unwrap().is_none());
+        assert!(!factory.held && !factory.receiver.latched);
+        factory = super::super::super::tests::restart_factory(
+            factory,
+            root.path(),
+            relay.clone(),
+            &format!("semantic-chat-reopen-{index}"),
+        )
+        .await
+        .unwrap();
+        assert!(!factory.receiver.authority_available());
+        assert!(
+            factory
+                .asks
+                .values()
+                .all(|ask| ask.receipt.is_none() && !ask.consumed)
+        );
+        assert!(matches!(
+            factory.consume("ask3", &super::super::super::digest(&ask.operation)),
+            Err(ReceiverHold::Latched)
+        ));
+    }
+    // Actual journal/native restart with a candidate retained at native ingress,
+    // before live catalog projection. Reopen must not classify it into semantics.
+    let app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1240,
+        MARMOT_APP_EVENT_KIND_EDIT,
+        vec![vec!["e".into(), target]],
+        "interrupted edit",
+    );
+    let SendResult::ApplicationMessage { msg: wire, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: factory.receiver.group.clone(),
+            payload: app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("actual native app message")
+    };
+    factory.receiver.ingest(wire).await.unwrap();
+    let sequence = factory.ordered().unwrap().checkpoint().0;
+    factory = super::super::super::tests::restart_factory(
+        factory,
+        root.path(),
+        relay,
+        "semantic-chat-unprojected-reopen",
+    )
+    .await
+    .unwrap();
+    assert_eq!(factory.ordered().unwrap().checkpoint().0, sequence);
+    assert!(!factory.held && !factory.receiver.latched);
+    assert!(!factory.receiver.authority_available());
+    assert!(
+        factory
+            .asks
+            .values()
+            .all(|ask| ask.receipt.is_none() && !ask.consumed)
+    );
 }

@@ -890,7 +890,15 @@ mod tests {
             return;
         }
         let (mut factory, _, root, relay) = super::super::tests::fresh_recovery_factory().await;
-        factory.receiver.mode = crate::protected_receiver::ReceiverMode::ConversationOnly;
+        factory = super::super::tests::restart_factory_for_mode(
+            factory,
+            root.path(),
+            relay.clone(),
+            "chat-entry-reopen",
+            serving::CONVERSATION_MODE,
+        )
+        .await
+        .unwrap();
         for reopen in [false, true] {
             if reopen {
                 factory = super::super::tests::restart_factory(
@@ -942,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deferred_transport_retains_authority_hold_and_allows_next_valid_conversation() {
+    async fn deferred_transport_retains_strict_authority_hold_and_reopen_veto() {
         if !crate::protected_recovery::root_expiry_fixture_available() {
             return;
         }
@@ -1024,13 +1032,13 @@ mod tests {
             cgka_traits::message::MessageState::PeelDeferred
         );
         let before = factory.receiver.journal.length().unwrap();
-        assert!(!factory.held && !factory.receiver.latched);
+        assert!(factory.held && factory.receiver.latched);
         assert!(factory.receiver.authority_blocked);
-        // The genuinely decryptable operator message still reaches the conversation
-        // projection, without replaying or deleting the unresolved outer event.
-        assert!(factory.ingest(valid_wire).await.unwrap().is_none());
+        // Approval mode remains strictly held; only the dedicated conversation
+        // entry can continue subsequent native traffic after an opaque input.
+        assert_eq!(factory.ingest(valid_wire).await, Err(ReceiverHold::Latched));
         assert!(factory.asks["ask3"].receipt.is_none());
-        assert!(factory.receiver.journal.length().unwrap() > before);
+        assert_eq!(factory.receiver.journal.length().unwrap(), before);
         assert!(factory.receiver.authority_blocked);
         assert!(matches!(
             factory.consume("ask3", &super::super::digest(&ask.operation)),

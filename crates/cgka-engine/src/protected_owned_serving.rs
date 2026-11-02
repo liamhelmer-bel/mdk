@@ -182,7 +182,7 @@ async fn run(
         profile.endpoints.clone(),
         reopening,
         material,
-        crate::protected_receiver::ReceiverMode::ConversationOnly,
+        CONVERSATION_MODE,
     )?;
     stage("group-binding");
     owned_producer::GroupBinding::read(
@@ -212,10 +212,8 @@ async fn run(
     let shutdown = tokio::time::timeout(Duration::from_secs(5), sdk.shutdown()).await;
     // Exact originals and factory remain owned through transport shutdown.
     drop((factory, _custody));
-    if shutdown.is_err() {
-        if result.is_ok() {
-            stage("serve-shutdown-timeout");
-        }
+    if shutdown.is_err() && result.is_ok() {
+        stage("serve-shutdown-timeout");
         return Err(ReceiverHold::Engine);
     }
     result
@@ -226,6 +224,10 @@ struct Listener {
 }
 // The adapter always subscribes both the account inbox and the group. Both
 // routes use only the exact relays retained in the enrolled serving profile.
+// This entry's capability is source-selected and has no profile/request field.
+pub(super) const CONVERSATION_MODE: crate::protected_receiver::ReceiverMode =
+    crate::protected_receiver::ReceiverMode::ConversationOnly;
+
 fn activation(
     profile: &ServingProfile,
     account_id: MemberId,

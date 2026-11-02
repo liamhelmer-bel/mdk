@@ -611,6 +611,9 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             .storage
             .delete_pending_application_events(&pending_ids)
             .map_err(|_| ReceiverHold::Journal)?;
+        if deferred && self.mode == ReceiverMode::Authority {
+            return Err(ReceiverHold::ChangedState);
+        }
         self.latched = false;
         Ok(candidate)
     }

@@ -196,16 +196,18 @@ impl Catalog {
         directory: File,
         policy: &str,
         endpoints: &[TransportEndpoint],
+        mode: super::super::ReceiverMode,
     ) -> Result<Self> {
-        Self::rebuild_inner(journal, directory, policy, endpoints, false)
+        Self::rebuild_inner(journal, directory, policy, endpoints, false, mode)
     }
     pub(super) fn rebuild_for_reopen(
         journal: &Journal,
         directory: File,
         policy: &str,
         endpoints: &[TransportEndpoint],
+        mode: super::super::ReceiverMode,
     ) -> Result<Self> {
-        Self::rebuild_inner(journal, directory, policy, endpoints, true)
+        Self::rebuild_inner(journal, directory, policy, endpoints, true, mode)
     }
     fn rebuild_inner(
         journal: &Journal,
@@ -213,6 +215,7 @@ impl Catalog {
         policy: &str,
         endpoints: &[TransportEndpoint],
         recover_final: bool,
+        mode: super::super::ReceiverMode,
     ) -> Result<Self> {
         let mut builder = Builder {
             disk: Disk::fresh(directory)?,
@@ -226,6 +229,7 @@ impl Catalog {
             control: None,
             pending_candidate: None,
             removal_retained: false,
+            mode,
         };
         let mut cursor = journal.source_cursor().map_err(|_| ReceiverHold::Journal)?;
         while let Some(record) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
@@ -241,6 +245,7 @@ impl Catalog {
         journal: &Journal,
         policy: &str,
         endpoints: &[TransportEndpoint],
+        mode: super::super::ReceiverMode,
     ) -> Result<Self> {
         self.checkpoint_file()?;
         let mut cursor = journal
@@ -277,6 +282,7 @@ impl Catalog {
             control: None,
             pending_candidate: self.unprojected,
             removal_retained: false,
+            mode,
         };
         while let Some(record) = cursor.next().map_err(|_| ReceiverHold::Journal)? {
             builder.apply(&record)?;
@@ -405,6 +411,7 @@ struct Builder<'a> {
     control: Option<(String, bool, u64)>,
     pending_candidate: Option<serde_json::Value>,
     removal_retained: bool,
+    mode: super::super::ReceiverMode,
 }
 impl Builder<'_> {
     fn apply(&mut self, record: &SourceRecord) -> Result<()> {
@@ -502,10 +509,7 @@ impl Builder<'_> {
                     .enrollment()
                     .map_err(|_| ReceiverHold::Journal)?
                     .group
-                || outcome.candidate.is_some()
-                || !outcome.pending_application_ids.is_empty()
-                || !outcome.pending_application_projections.is_empty()
-                || outcome.native_merge.is_some())
+                || !outcome.is_opaque_deferred_for(group_id))
         {
             return Err(ReceiverHold::ChangedState);
         }
@@ -815,6 +819,12 @@ impl Builder<'_> {
         let Some(candidate) = self.pending_candidate.take() else {
             return Ok(());
         };
+        // Conversation-only source has no approval authority or semantic
+        // decision obligations. The candidate's native binding was already
+        // verified in outcome(); retaining it never grants a semantic receipt.
+        if self.mode == super::super::ReceiverMode::ConversationOnly {
+            return Ok(());
+        }
         let app = &candidate["application"];
         let kind = app["kind"].as_u64().ok_or(ReceiverHold::Malformed)?;
         if [
@@ -833,7 +843,7 @@ impl Builder<'_> {
         Ok(())
     }
     fn finish(mut self, offset: u64, recover_final: bool) -> Result<Catalog> {
-        let unprojected = if recover_final {
+        let unprojected = if recover_final && self.mode == super::super::ReceiverMode::Authority {
             self.pending_candidate.take()
         } else {
             None

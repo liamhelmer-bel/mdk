@@ -49,6 +49,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             directory,
             &self.policy()?,
             &self.endpoints,
+            self.receiver.mode,
         )?;
         self.install_catalog(catalog)
     }
@@ -58,11 +59,14 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
             directory,
             &self.policy()?,
             &self.endpoints,
+            self.receiver.mode,
         )?;
         let pending = catalog.unprojected.clone();
         self.install_catalog(catalog)?;
         self.expire()?;
-        if let Some(value) = pending {
+        if let Some(value) = pending
+            && self.receiver.mode == super::super::ReceiverMode::Authority
+        {
             let c: super::super::RetainedCandidate =
                 serde_json::from_value(value).map_err(|_| ReceiverHold::Malformed)?;
             let candidate = AuthenticatedCandidate {
@@ -95,7 +99,12 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
     pub(super) fn sync_catalog(&mut self) -> Result<(), ReceiverHold> {
         if let Some(catalog) = self.catalog.take() {
             self.held = true;
-            let next = catalog.advance(self.ordered()?, &self.policy()?, &self.endpoints)?;
+            let next = catalog.advance(
+                self.ordered()?,
+                &self.policy()?,
+                &self.endpoints,
+                self.receiver.mode,
+            )?;
             self.catalog = Some(next);
             self.held = false;
         }

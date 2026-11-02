@@ -849,9 +849,14 @@ async fn actual_semantics_rebuilds_terminal_lookup_candidates_and_conflict_witho
     let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
         panic!("ordered")
     };
-    let catalog =
-        catalog::Catalog::rebuild(journal, cache(root.path(), "cache1"), &policy, &f.endpoints)
-            .unwrap();
+    let catalog = catalog::Catalog::rebuild(
+        journal,
+        cache(root.path(), "cache1"),
+        &policy,
+        &f.endpoints,
+        f.receiver.mode,
+    )
+    .unwrap();
     assert!(catalog.unanswered.is_empty());
     assert_eq!(
         catalog.ask(journal, "ask3").unwrap().unwrap().disposition,
@@ -869,9 +874,14 @@ async fn actual_semantics_rebuilds_terminal_lookup_candidates_and_conflict_witho
         panic!("ordered")
     };
     assert!(catalog.ask(journal, "ask3").is_err()); // Stale derived checkpoint is never authority.
-    let catalog =
-        catalog::Catalog::rebuild(journal, cache(root.path(), "cache2"), &policy, &f.endpoints)
-            .unwrap();
+    let catalog = catalog::Catalog::rebuild(
+        journal,
+        cache(root.path(), "cache2"),
+        &policy,
+        &f.endpoints,
+        f.receiver.mode,
+    )
+    .unwrap();
     assert_eq!(
         catalog.ask(journal, "ask3").unwrap().unwrap().disposition,
         catalog::Disposition::Conflicted
@@ -901,8 +911,14 @@ async fn unprojected_actual_contrary_candidate_cannot_restore_earlier_approval()
         panic!("ordered")
     };
     assert!(
-        catalog::Catalog::rebuild(journal, cache(root.path(), "cache"), &policy, &f.endpoints)
-            .is_err()
+        catalog::Catalog::rebuild(
+            journal,
+            cache(root.path(), "cache"),
+            &policy,
+            &f.endpoints,
+            f.receiver.mode
+        )
+        .is_err()
     );
 }
 #[cfg(target_os = "linux")]
@@ -927,9 +943,14 @@ async fn actual_unrelated_removal_reconstructs_scoped_disk_tombstone() {
     let crate::protected_receiver::ReceiverJournal::Ordered(journal) = &f.receiver.journal else {
         panic!("ordered")
     };
-    let catalog =
-        catalog::Catalog::rebuild(journal, cache(root.path(), "cache"), &policy, &f.endpoints)
-            .unwrap();
+    let catalog = catalog::Catalog::rebuild(
+        journal,
+        cache(root.path(), "cache"),
+        &policy,
+        &f.endpoints,
+        f.receiver.mode,
+    )
+    .unwrap();
     assert!(
         catalog
             .removed(
@@ -1097,11 +1118,21 @@ pub(super) async fn restart_factory(
     relay: Arc<Relay>,
     cache_name: &str,
 ) -> Result<SemanticFactory<SqliteAccountStorage>, ReceiverHold> {
+    let mode = f.receiver.mode;
+    restart_factory_for_mode(f, root, relay, cache_name, mode).await
+}
+#[cfg(target_os = "linux")]
+pub(super) async fn restart_factory_for_mode(
+    f: SemanticFactory<SqliteAccountStorage>,
+    root: &std::path::Path,
+    relay: Arc<Relay>,
+    cache_name: &str,
+    mode: crate::protected_receiver::ReceiverMode,
+) -> Result<SemanticFactory<SqliteAccountStorage>, ReceiverHold> {
     let storage = f.receiver.engine.storage.clone();
     let group = f.receiver.group.clone();
     let operators = f.receiver.operators.clone();
     let enrollment = f.ordered().unwrap().enrollment().unwrap();
-    let mode = f.receiver.mode;
     drop(f);
     // Real Engine rehydration from the same actual SQLite account state. Fixture
     // signer/peeler identities are synthetic; no production custody is asserted.

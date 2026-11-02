@@ -66,6 +66,7 @@ fn terminal_history_above_ten_thousand_and_32mib_rebuilds_with_bounded_live_proj
         File::open(&path).unwrap(),
         &policy,
         &[TransportEndpoint::from("wss://mechanical.invalid")],
+        crate::protected_receiver::ReceiverMode::Authority,
     )
     .unwrap();
     assert!(catalog.unanswered.is_empty());
@@ -84,7 +85,8 @@ fn terminal_history_above_ten_thousand_and_32mib_rebuilds_with_bounded_live_proj
             &journal,
             File::open(&path).unwrap(),
             &policy,
-            &[TransportEndpoint::from("wss://mechanical.invalid")]
+            &[TransportEndpoint::from("wss://mechanical.invalid")],
+            crate::protected_receiver::ReceiverMode::Authority,
         )
         .is_err()
     );
