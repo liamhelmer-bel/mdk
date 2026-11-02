@@ -886,3 +886,84 @@ async fn conversation_seal_refuses_authority_reopen_before_classifying_chat() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn failed_conversation_reopen_keeps_unfinished_wire_unsealed_and_unchanged() {
+    if !crate::protected_recovery::root_expiry_fixture_available() {
+        return;
+    }
+    use nostr::{EventBuilder, Kind, Tag, TagKind};
+    let (mut factory, mut operator, root, relay) =
+        super::super::super::tests::fresh_recovery_factory().await;
+    let app = MarmotAppEvent::new(
+        hex::encode(operator.self_id().as_slice()),
+        1400,
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![],
+        "route fixture",
+    );
+    let SendResult::ApplicationMessage { msg: valid, .. } = operator
+        .send(SendIntent::AppMessage {
+            group_id: factory.receiver.group.clone(),
+            payload: app.encode().unwrap(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("native message")
+    };
+    let envelope: Value = serde_json::from_slice(&valid.payload).unwrap();
+    let route = envelope["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t[0] == "h")
+        .unwrap()[1]
+        .as_str()
+        .unwrap();
+    let outer = EventBuilder::new(
+        Kind::MlsGroupMessage,
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    )
+    .tags([Tag::custom(TagKind::custom("h"), [route])])
+    .sign_with_keys(&nostr::Keys::generate())
+    .unwrap();
+    let wire = transport_nostr_peeler::NostrTransportEvent::from_nostr_event(&outer)
+        .unwrap()
+        .to_transport_message()
+        .unwrap();
+    // Reproduce an actual interrupted old ingress: protected wire is durable,
+    // native engine retains PeelDeferred, but no receiver outcome was written.
+    factory
+        .receiver
+        .record(
+            serde_json::json!({"schema":"receiver-wire.v1", "sequence":1,
+        "received_at_unix_ms":factory.receiver.checked_now().unwrap(), "wire":wire}),
+        )
+        .unwrap();
+    assert!(matches!(
+        factory.receiver.engine.ingest(wire).await.unwrap(),
+        cgka_traits::ingest::IngestOutcome::TransportDeferred { .. }
+    ));
+    let journal = std::fs::read(root.path().join("receiver/journal")).unwrap();
+    let anchor = std::fs::read(root.path().join("consumer/anchor")).unwrap();
+    let result = super::super::super::tests::restart_factory_for_mode(
+        factory,
+        root.path(),
+        relay,
+        "failed-unfinished-chat",
+        CONVERSATION_MODE,
+    )
+    .await;
+    assert!(matches!(result, Err(ReceiverHold::ChangedState)));
+    assert_eq!(
+        std::fs::read(root.path().join("receiver/journal")).unwrap(),
+        journal
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("consumer/anchor")).unwrap(),
+        anchor
+    );
+}

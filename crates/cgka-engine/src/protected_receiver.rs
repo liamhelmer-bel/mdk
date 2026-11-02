@@ -205,6 +205,8 @@ pub(crate) struct ProtectedReceiver<S: StorageProvider + 'static> {
     // continue, but this process can never produce approval authority again.
     authority_blocked: bool,
     mode: ReceiverMode,
+    // A chat receiver cannot ingest until final reopen validation commits its seal.
+    conversation_sealed: bool,
 }
 
 impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
@@ -241,6 +243,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             latched: false,
             authority_blocked: false,
             mode: ReceiverMode::Authority,
+            conversation_sealed: false,
         })
     }
 
@@ -321,6 +324,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             latched: false,
             authority_blocked: false,
             mode: ReceiverMode::Authority,
+            conversation_sealed: false,
         })
     }
 
@@ -368,6 +372,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             latched: false,
             authority_blocked: false,
             mode: ReceiverMode::Authority,
+            conversation_sealed: false,
         })
     }
 
@@ -444,7 +449,9 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         &mut self,
         wire: TransportMessage,
     ) -> Result<Option<AuthenticatedCandidate>, ReceiverHold> {
-        if self.latched {
+        if self.latched
+            || (self.mode == ReceiverMode::ConversationOnly && !self.conversation_sealed)
+        {
             return Err(ReceiverHold::Latched);
         }
         let encoded = serde_json::to_vec(&wire).map_err(|_| ReceiverHold::Malformed)?;

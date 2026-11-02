@@ -51,7 +51,7 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         mut engine: Engine<S>,
         group: GroupId,
         operators: Vec<MemberId>,
-        mut journal: Journal,
+        journal: Journal,
         mode: ReceiverMode,
     ) -> Result<Self, ReceiverHold> {
         engine
@@ -183,14 +183,6 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
         if serde_json::to_value(current).map_err(|_| ReceiverHold::Malformed)? != native {
             return Err(ReceiverHold::ChangedState);
         }
-        // Seal before returning any conversation capability or permitting
-        // semantic reconstruction/ingress. A later Authority opener must refuse
-        // this anchored source, even if the last chat resembles an approval.
-        if mode == ReceiverMode::ConversationOnly && !conversation_sealed {
-            journal
-                .record_source(journal.conversation_seal())
-                .map_err(|_| ReceiverHold::Journal)?;
-        }
         Ok(Self {
             engine,
             group,
@@ -200,7 +192,23 @@ impl<S: StorageProvider + 'static> ProtectedReceiver<S> {
             latched: false,
             authority_blocked,
             mode,
+            conversation_sealed,
         })
+    }
+    /// Commit the one-way downgrade only after every semantic reopen check.
+    /// No unsealed chat receiver may ingest, and callers return the factory only
+    /// after this anchored write succeeds. A failed validation never seals it.
+    pub(super) fn seal_conversation_only(&mut self) -> Result<(), ReceiverHold> {
+        if self.mode == ReceiverMode::ConversationOnly && !self.conversation_sealed {
+            let ReceiverJournal::Ordered(journal) = &mut self.journal else {
+                return Err(ReceiverHold::Configuration);
+            };
+            journal
+                .record_source(journal.conversation_seal())
+                .map_err(|_| ReceiverHold::Journal)?;
+            self.conversation_sealed = true;
+        }
+        Ok(())
     }
     /// Validate all actual pending native data before semantic reconstruction
     /// can append any decision, conflict or expiry. This performs no deletion.

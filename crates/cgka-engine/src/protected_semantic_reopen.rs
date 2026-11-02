@@ -38,6 +38,7 @@ impl<S: StorageProvider + 'static> SemanticFactory<S> {
         factory.receiver.acknowledge_reopened_pending(&pending)?;
         factory.expire()?;
         factory.sync_catalog()?;
+        factory.receiver.seal_conversation_only()?;
         Ok(factory)
     }
     pub(super) fn enable_catalog(&mut self, directory: File) -> Result<(), ReceiverHold> {
