@@ -319,6 +319,10 @@ fn run(originals: [File; 5], publication: Option<Publication>) -> Result<()> {
     let anchors = directory(&state, "anchor", 0)?;
     let cache =
         crate::cache_mount::create(&[&account, &journals, &intents, &anchors]).map_err(|_| ())?;
+    // Cache creation cloned the mount namespace; retain the identical directory
+    // through its current private mount so SQLite's canonical pathname exists.
+    let account = crate::material_mount::current_generation(&account, &p.storage_generation)
+        .map_err(|_| ())?;
     let journal = create(&journals, "journal", 899, 0o600, &[])?;
     let intent = create(&intents, "intent", 899, 0o600, &[])?;
     let anchor = create(&anchors, "anchor", 0, 0o600, &[])?;

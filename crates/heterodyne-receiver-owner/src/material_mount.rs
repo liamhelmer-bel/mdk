@@ -99,6 +99,47 @@ pub(crate) fn bind(parent: &File, uid: u32) -> io::Result<File> {
     Ok(mapped)
 }
 
+/// A mount-namespace clone leaves inherited OFDs attached to the old mount.
+/// SQLite canonicalizes their /proc links, which can then name `/generation`.
+/// Reopen only the source-fixed private bind path and prove the original inode.
+pub(crate) fn current_generation(original: &File, generation: &str) -> io::Result<File> {
+    if unsafe { libc::geteuid() } != 0
+        || generation.len() != 64
+        || !generation
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(io::Error::other("generation path custody"));
+    }
+    let before = original.metadata()?;
+    let current = File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(format!("/mnt/heterodyne-receiver-material/{generation}"))?;
+    let after = current.metadata()?;
+    if !before.is_dir()
+        || before.uid() != 899
+        || before.gid() != 899
+        || before.mode() & 0o7777 != 0o700
+        || (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode(),
+        )
+    {
+        return Err(io::Error::other("generation mount identity"));
+    }
+    Ok(current)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +231,112 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+
+    #[test]
+    #[ignore = "actual root private cache/material mounts and receiver UID899"]
+    fn sqlcipher_reopen_after_cache_namespace_clone() {
+        use std::os::unix::process::CommandExt;
+        let key = storage_sqlite::SqlCipherKey::new("synthetic-disposable-reopen-key").unwrap();
+        if let Ok(mode) = std::env::var("OIZOH_SQLCIPHER_REOPEN") {
+            assert_eq!(unsafe { libc::geteuid() }, 899);
+            let path = std::path::Path::new("/proc/self/fd/13/account.sqlite3");
+            // Opening by the retained OFD itself still works in the broken case.
+            let inode = std::fs::metadata(path).unwrap().ino();
+            let result = storage_sqlite::SqliteAccountStorage::open_encrypted(path, &key);
+            if mode == "stale" {
+                assert!(
+                    result.is_err(),
+                    "old mount OFD must reproduce SQLite failure"
+                );
+                eprintln!("stale namespace SQLCipher error: {:?}", result.err());
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{mode} SQLCipher failed: {:?}",
+                    result.err()
+                );
+                assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            }
+            return;
+        }
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let root = tempfile::tempdir().unwrap();
+        let material = root.path().join("material");
+        std::fs::create_dir(&material).unwrap();
+        std::fs::set_permissions(&material, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let name = CString::new(material.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 899, 899) }, 0);
+        let parent = bind(&File::open(&material).unwrap(), 899).unwrap();
+        let generation = "ab".repeat(32);
+        let path = format!("/mnt/heterodyne-receiver-material/{generation}");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let name = CString::new(path).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 899, 899) }, 0);
+        let original = File::options()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(format!("/mnt/heterodyne-receiver-material/{generation}"))
+            .unwrap();
+        // Only the disposable fixture database is created; actual production
+        // receiver/seed/lease descriptors are never inspected or reconstructed.
+        File::create(format!(
+            "/mnt/heterodyne-receiver-material/{generation}/account.sqlite3"
+        ))
+        .unwrap();
+        let dbname = CString::new(format!(
+            "/mnt/heterodyne-receiver-material/{generation}/account.sqlite3"
+        ))
+        .unwrap();
+        assert_eq!(unsafe { libc::chown(dbname.as_ptr(), 899, 899) }, 0);
+        std::fs::set_permissions(
+            format!("/mnt/heterodyne-receiver-material/{generation}/account.sqlite3"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let probe = |mode: &str, file: &File| {
+            let fd = file.as_raw_fd();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "material_mount::tests::sqlcipher_reopen_after_cache_namespace_clone",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("OIZOH_SQLCIPHER_REOPEN", mode);
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(fd, 13) < 0
+                        || libc::fcntl(13, libc::F_SETFD, 0) < 0
+                        || libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setresgid(899, 899, 899) != 0
+                        || libc::setresuid(899, 899, 899) != 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            eprintln!("{mode}: {}", String::from_utf8_lossy(&output.stderr));
+        };
+        probe("initialize", &original);
+        let _cache = crate::cache_mount::create(&[&original, &parent]).unwrap();
+        probe("stale", &original);
+        let current = current_generation(&original, &generation).unwrap();
+        assert!(current_generation(&original, "../escape").is_err());
+        assert!(
+            current_generation(&parent, &generation).is_err(),
+            "different inode must refuse"
+        );
+        probe("current", &current);
     }
 }
